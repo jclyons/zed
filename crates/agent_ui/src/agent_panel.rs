@@ -436,6 +436,14 @@ pub enum ThreadTitleRegenerationResult {
     AlreadyGenerating,
 }
 
+/// Which command, if any, is written into a newly spawned terminal thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalInitCommand {
+    None,
+    FromSettings,
+    Explicit(String),
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 enum AgentPanelEntryKind {
     #[default]
@@ -2100,7 +2108,7 @@ impl AgentPanel {
             None,
             true,
             true,
-            true,
+            TerminalInitCommand::FromSettings,
             source,
             window,
             cx,
@@ -2154,7 +2162,7 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
-        run_init_command: bool,
+        init_command: TerminalInitCommand,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2165,7 +2173,7 @@ impl AgentPanel {
         // as empty and spawning a second, "initial" terminal on activation.
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = Self::terminal_init_command(init_command, cx);
         let terminal_task = self.create_terminal_shell(working_directory, cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
@@ -2238,11 +2246,15 @@ impl AgentPanel {
         })
     }
 
-    fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
-        run_init_command
-            .then(|| AgentSettings::get_global(cx).terminal_init_command.clone())
-            .flatten()
-            .filter(|command| !command.trim().is_empty())
+    fn terminal_init_command(init_command: TerminalInitCommand, cx: &App) -> Option<String> {
+        match init_command {
+            TerminalInitCommand::None => None,
+            TerminalInitCommand::FromSettings => {
+                AgentSettings::get_global(cx).terminal_init_command.clone()
+            }
+            TerminalInitCommand::Explicit(command) => Some(command),
+        }
+        .filter(|command| !command.trim().is_empty())
     }
 
     fn write_terminal_init_command(
@@ -2573,7 +2585,7 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            TerminalInitCommand::FromSettings,
             source,
             window,
             cx,
@@ -5316,7 +5328,7 @@ impl AgentPanel {
             None,
             true,
             false,
-            true,
+            TerminalInitCommand::FromSettings,
             source,
             window,
             cx,
@@ -5340,7 +5352,7 @@ impl AgentPanel {
             None,
             true,
             false,
-            true,
+            TerminalInitCommand::FromSettings,
             source,
             window,
             cx,
@@ -6697,6 +6709,43 @@ impl AgentPanel {
         key_context.add("AgentPanel");
         key_context
     }
+
+    /// Spawns a terminal thread for the CLI (`zed --agent-new`) and returns its id.
+    /// Selects the new terminal only when `focus` is set or the panel has no base view yet.
+    pub fn spawn_terminal_for_cli(
+        &mut self,
+        cwd: PathBuf,
+        command: Option<String>,
+        title: Option<SharedString>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<TerminalId> {
+        anyhow::ensure!(
+            self.supports_terminal(cx),
+            "terminal threads are not supported"
+        );
+        let select = focus || matches!(self.base_view, BaseView::Uninitialized);
+        let init_command = command.map_or(
+            TerminalInitCommand::FromSettings,
+            TerminalInitCommand::Explicit,
+        );
+        let terminal_id = TerminalId::new();
+        self.spawn_terminal(
+            terminal_id,
+            Some(cwd),
+            title,
+            None,
+            None,
+            select,
+            focus,
+            init_command,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        Ok(terminal_id)
+    }
 }
 
 impl Render for AgentPanel {
@@ -6958,7 +7007,7 @@ impl AgentPanel {
             None,
             focus,
             focus,
-            true,
+            TerminalInitCommand::FromSettings,
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -6995,7 +7044,7 @@ impl AgentPanel {
             Some(metadata.created_at),
             true,
             focus,
-            true,
+            TerminalInitCommand::FromSettings,
             source,
             window,
             cx,
@@ -7027,12 +7076,12 @@ impl AgentPanel {
         created_at: Option<DateTime<Utc>>,
         select: bool,
         focus: bool,
-        run_init_command: bool,
+        init_command: TerminalInitCommand,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = Self::terminal_init_command(init_command, cx);
         let terminal = self.build_display_only_terminal(cx);
         let terminal_for_init_command = terminal.clone();
         let terminal_view = cx.new(|cx| {
@@ -8056,7 +8105,7 @@ mod tests {
                 None,
                 true,
                 true,
-                true,
+                TerminalInitCommand::FromSettings,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
@@ -9815,7 +9864,7 @@ mod tests {
                     None,
                     true,
                     true,
-                    false,
+                    TerminalInitCommand::None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -10645,6 +10694,108 @@ mod tests {
 
         panel.read_with(&cx, |panel, _cx| {
             assert_eq!(panel.active_terminal_id(), Some(terminal_id));
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_spawn_terminal_for_cli_runs_explicit_command_once(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| {
+            let mut terminal_settings = TerminalSettings::get_global(cx).clone();
+            terminal_settings.shell = task::Shell::Program("/bin/sh".to_string());
+            TerminalSettings::override_global(terminal_settings, cx);
+        });
+
+        let cwd = std::env::temp_dir()
+            .canonicalize()
+            .expect("temp dir should exist");
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.spawn_terminal_for_cli(
+                    cwd.clone(),
+                    Some("printf 'cli_ran_%s\\n' 7".to_string()),
+                    None,
+                    false,
+                    window,
+                    cx,
+                )
+            })
+            .expect("terminal should be spawned");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let terminal = loop {
+            cx.run_until_parked();
+            let terminal = panel.read_with(&cx, |panel, cx| {
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|terminal| terminal.view.read(cx).terminal().clone())
+            });
+            if let Some(terminal) = &terminal
+                && terminal
+                    .read_with(&cx, |terminal, _| terminal.get_content())
+                    .contains("cli_ran_7")
+            {
+                break terminal.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "explicit command output never appeared"
+            );
+            cx.executor().timer(Duration::from_millis(50)).await;
+        };
+
+        panel.read_with(&cx, |panel, cx| {
+            let info = panel
+                .terminals(cx)
+                .into_iter()
+                .find(|info| info.id == terminal_id)
+                .expect("terminal should be listed");
+            assert_eq!(info.working_directory, Some(cwd.clone()));
+        });
+        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert_eq!(input_log, vec![b"printf 'cli_ran_%s\\n' 7\r".to_vec()]);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_spawn_terminal_for_cli_without_focus_keeps_active_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Existing", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+        let existing = panel.read_with(&cx, |panel, _| panel.active_terminal_id());
+        assert!(existing.is_some());
+
+        let new_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.spawn_terminal_for_cli(
+                    std::env::temp_dir(),
+                    Some("true".to_string()),
+                    None,
+                    false,
+                    window,
+                    cx,
+                )
+            })
+            .expect("terminal should be spawned");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !panel.read_with(&cx, |panel, _| panel.has_terminal(new_id)) {
+            cx.run_until_parked();
+            assert!(Instant::now() < deadline, "terminal never appeared");
+            cx.executor().timer(Duration::from_millis(50)).await;
+        }
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(panel.active_terminal_id(), existing);
         });
     }
 
