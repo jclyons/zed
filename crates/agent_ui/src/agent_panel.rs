@@ -439,6 +439,7 @@ pub enum ThreadTitleRegenerationResult {
 /// Which command, if any, is written into a newly spawned terminal thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalInitCommand {
+    #[cfg_attr(not(test), allow(dead_code))]
     None,
     FromSettings,
     Explicit(String),
@@ -10757,6 +10758,59 @@ mod tests {
         });
         let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
         assert_eq!(input_log, vec![b"printf 'cli_ran_%s\\n' 7\r".to_vec()]);
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_spawn_terminal_for_cli_explicit_command_overrides_settings(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command = Some("printf 'from_settings_%s\\n' 1".to_string());
+            AgentSettings::override_global(settings, cx);
+            let mut terminal_settings = TerminalSettings::get_global(cx).clone();
+            terminal_settings.shell = task::Shell::Program("/bin/sh".to_string());
+            TerminalSettings::override_global(terminal_settings, cx);
+        });
+
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.spawn_terminal_for_cli(
+                    std::env::temp_dir(),
+                    Some("printf 'explicit_%s\\n' 2".to_string()),
+                    None,
+                    false,
+                    window,
+                    cx,
+                )
+            })
+            .expect("terminal should be spawned");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let terminal = loop {
+            cx.run_until_parked();
+            let terminal = panel.read_with(&cx, |panel, cx| {
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|terminal| terminal.view.read(cx).terminal().clone())
+            });
+            if let Some(terminal) = &terminal
+                && terminal
+                    .read_with(&cx, |terminal, _| terminal.get_content())
+                    .contains("explicit_2")
+            {
+                break terminal.clone();
+            }
+            assert!(Instant::now() < deadline, "explicit output never appeared");
+            cx.executor().timer(Duration::from_millis(50)).await;
+        };
+
+        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert_eq!(input_log, vec![b"printf 'explicit_%s\\n' 2\r".to_vec()]);
     }
 
     #[cfg(unix)]
