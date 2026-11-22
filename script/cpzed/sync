@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# script/cpzed/sync: merge upstream Zed main into the fork and open a sync PR.
+#
+# Design: designs/cpzed-fork-update-install.md (Decision 2, ticket T3); docs/fork/SYNC.md.
+#
+# Behaviour
+#   - Fetches upstream (read-only) and the fork. Never pushes to the upstream remote.
+#   - No-op when fork/main already contains upstream/main, or when a sync branch/PR for
+#     this exact upstream commit already exists.
+#   - Otherwise creates branch cpzed-sync-<upstream7> from fork/main, runs
+#     `git merge --no-ff upstream/main` (a real merge commit, never squashed), pushes the
+#     branch to the fork remote only, and opens a PR on the fork repo.
+#   - On a conflict: lists the conflicting files, aborts the merge, deletes the temp branch,
+#     restores the worktree to where it started, exits 2. No half-merged state is left.
+#   - Never pushes `main`, never force-pushes, never squashes.
+#
+# Usage: script/cpzed/sync [options]
+#   --dry-run            fetch and report only; change nothing
+#   --no-pr              merge on a local branch but do not push or open a PR
+#   --upstream REMOTE    upstream remote name (default: origin)
+#   --fork REMOTE        fork remote name (default: fork)
+#   --branch NAME        base branch on both remotes (default: main)
+#   --repo OWNER/NAME    GitHub repo for the PR (default: jclyons/zed)
+#   -h, --help
+#
+# Exit codes: 0 up to date / PR opened / dry-run ok; 2 merge conflict (aborted); 1 error.
+# Env: CPZED_SYNC_GH overrides the `gh` command (used by tests).
+
+set -euo pipefail
+
+upstream_remote=origin
+fork_remote=fork
+base=main
+repo=jclyons/zed
+dry_run=false
+no_pr=false
+gh_cmd=${CPZED_SYNC_GH:-gh}
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+die() { echo "sync: error: $*" >&2; exit 1; }
+say() { echo "sync: $*"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry_run=true ;;
+    --no-pr) no_pr=true ;;
+    --upstream) upstream_remote=${2:?}; shift ;;
+    --fork) fork_remote=${2:?}; shift ;;
+    --branch) base=${2:?}; shift ;;
+    --repo) repo=${2:?}; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git worktree"
+cd "$(git rev-parse --show-toplevel)"
+
+# Safety: the push target must be the fork, never upstream.
+up_url=$(git remote get-url "$upstream_remote") || die "no remote $upstream_remote"
+fork_url=$(git remote get-url --push "$fork_remote") || die "no remote $fork_remote"
+[ "$up_url" != "$fork_url" ] || die "upstream and fork remotes point at the same URL"
+case "$fork_url" in
+  *zed-industries/zed*) die "fork remote '$fork_remote' points at zed-industries/zed; refusing" ;;
+esac
+case "$repo" in
+  zed-industries/*) die "refusing to target zed-industries" ;;
+esac
+
+# The worktree must be clean and not mid-operation.
+git_dir=$(git rev-parse --git-dir)
+for f in MERGE_HEAD rebase-merge rebase-apply CHERRY_PICK_HEAD; do
+  [ ! -e "$git_dir/$f" ] || die "worktree is mid-operation ($f); resolve it first"
+done
+[ -z "$(git status --porcelain --untracked-files=no)" ] || die "worktree has uncommitted changes"
+
+# Remember where we started so we can restore it.
+orig_branch=$(git symbolic-ref --quiet --short HEAD || true)
+orig_head=$(git rev-parse HEAD)
+branch=""
+restore() {
+  if [ -e "$(git rev-parse --git-dir)/MERGE_HEAD" ]; then
+    git merge --abort >/dev/null 2>&1 || git reset --hard "$orig_head" >/dev/null 2>&1 || true
+  fi
+  if [ "$(git rev-parse HEAD)" != "$orig_head" ] || [ -n "$branch" ]; then
+    if [ -n "$orig_branch" ]; then git switch --quiet "$orig_branch" 2>/dev/null || true
+    else git switch --quiet --detach "$orig_head" 2>/dev/null || true; fi
+  fi
+}
+cleanup_branch() {
+  if [ -n "$branch" ] && git show-ref --verify --quiet "refs/heads/$branch"; then
+    git branch -D "$branch" >/dev/null 2>&1 || true
+  fi
+}
+on_exit() { restore; if [ "${keep_branch:-false}" != true ]; then cleanup_branch; fi; }
+trap on_exit EXIT
+
+say "fetching $upstream_remote/$base (read-only) and $fork_remote/$base"
+git fetch --quiet --no-tags "$upstream_remote" "+refs/heads/$base:refs/remotes/$upstream_remote/$base"
+git fetch --quiet --no-tags "$fork_remote" "+refs/heads/$base:refs/remotes/$fork_remote/$base"
+up=$(git rev-parse "refs/remotes/$upstream_remote/$base")
+fk=$(git rev-parse "refs/remotes/$fork_remote/$base")
+up7=$(git rev-parse --short=10 "$up")
+
+if git merge-base --is-ancestor "$up" "$fk"; then
+  say "up to date: $fork_remote/$base ($(git rev-parse --short=10 "$fk")) already contains $upstream_remote/$base ($up7). Nothing to do."
+  exit 0
+fi
+
+mb=$(git merge-base "$up" "$fk")
+mb7=$(git rev-parse --short=10 "$mb")
+ncommits=$(git rev-list --count "$fk..$up")
+branch="cpzed-sync-$up7"
+title="CPZED sync: upstream $mb7..$up7 ($ncommits commits)"
+say "upstream has $ncommits new commits: $mb7..$up7"
+
+# Idempotency: a branch or open PR for this upstream commit already exists.
+if git ls-remote --exit-code --heads "$fork_remote" "refs/heads/$branch" >/dev/null 2>&1; then
+  say "branch $branch already exists on $fork_remote; a sync for $up7 is already open or was merged. Nothing to do."
+  branch=""
+  exit 0
+fi
+
+if $dry_run; then
+  say "dry run: would merge $upstream_remote/$base ($up7) into $fork_remote/$base ($(git rev-parse --short=10 "$fk"))"
+  say "dry run: would push $branch to $fork_remote and open: $title"
+  branch=""
+  exit 0
+fi
+
+git show-ref --verify --quiet "refs/heads/$branch" && die "local branch $branch already exists; delete or inspect it"
+git switch --quiet -c "$branch" "$fk"
+
+merge_msg="Merge upstream zed-industries/zed $base ($mb7..$up7) into fork
+
+$ncommits upstream commits. Upstream head: $up"
+if ! git merge --no-ff --no-edit -m "$merge_msg" "$up" >/dev/null 2>&1; then
+  conflicts=$(git diff --name-only --diff-filter=U || true)
+  echo "sync: CONFLICT merging $upstream_remote/$base ($up7) into $fork_remote/$base." >&2
+  echo "sync: conflicting files:" >&2
+  if [ -n "$conflicts" ]; then echo "$conflicts" | sed 's/^/  /' >&2; else echo "  (none listed; merge failed for another reason)" >&2; fi
+  git merge --abort >/dev/null 2>&1 || true
+  say "merge aborted; worktree restored. Hand this to a coder: see docs/fork/SYNC.md ('Conflicts')."
+  exit 2
+fi
+
+parents=$(git rev-list --parents -n1 HEAD | wc -w)
+[ "$parents" -eq 3 ] || die "expected a merge commit with 2 parents, got $((parents - 1))"
+merged=$(git rev-parse HEAD)
+say "merged cleanly: $(git rev-parse --short=10 "$merged")"
+
+if $no_pr; then
+  keep_branch=true
+  say "--no-pr: left local branch $branch at $(git rev-parse --short=10 "$merged"); not pushed"
+  exit 0
+fi
+
+# Push the sync branch only, to the fork, with an explicit refspec. Never main, never force.
+[ "$branch" != "$base" ] || die "internal: sync branch equals base"
+git push --quiet "$fork_remote" "refs/heads/$branch:refs/heads/$branch"
+say "pushed $branch to $fork_remote"
+
+body="Automated upstream sync (script/cpzed/sync).
+
+- Upstream range: \`$mb7..$up7\` ($ncommits commits), upstream head \`$up\`
+- Fork base: \`$fk\`
+- Merged head: \`$merged\`
+
+**Merge with a merge commit (\`gh pr merge --merge --match-head-commit $merged\`). NEVER squash or rebase this PR** (user exception, designs/DECISIONS.md item 2).
+
+Review: \`git show --remerge-diff $merged\`, then the drift checklist in docs/fork/SYNC.md.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+
+pr_url=$("$gh_cmd" pr create --repo "$repo" --base "$base" --head "$branch" --title "$title" --body "$body")
+say "opened PR: $pr_url"
+keep_branch=false
