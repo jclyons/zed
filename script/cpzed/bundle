@@ -22,7 +22,7 @@
 # --dry-run reports free disk but does not enforce the 100 GiB guard (a real build does, exit 6).
 # `bundle` probes with a 20 s test codesign and fails (exit 10) instead of hanging.
 # Exit codes: 3 no identity, 4 selfcheck, 5 dirty tree, 6 disk, 7 cargo running (retry),
-# 9 unsafe --out, 10 signing probe, 11 stale binary. --skip-build needs CPZED_TEST_SKIP_BUILD=1.
+# 9 unsafe --out, 10 signing probe, 11 stale zed binary, 13 invalid cli. --skip-build needs CPZED_TEST_SKIP_BUILD=1.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -125,6 +125,12 @@ verify_sha_embedded() { # binary sha
   grep -aqF -- "$2" "$1" || { echo "bundle: $1 does not embed commit $2 (stale build?); rebuild without --skip-build" >&2; return 1; }
 }
 
+# The macOS cli does not embed the commit; require an existing, executable Mach-O file.
+verify_cli() {
+  [[ -f "$1" && -x "$1" ]] || { echo "bundle: cli missing or not executable: $1" >&2; return 1; }
+  file -b "$1" | grep -q "Mach-O" || { echo "bundle: cli is not a Mach-O binary: $1" >&2; return 1; }
+}
+
 case "${1:-}" in
   check-out) [[ $# -ge 3 ]] || die "usage: bundle check-out <out> <target_dir> [repo_root]" 2; check_out "$2" "$3" "${4:-$repo}"; exit $? ;;
   verify-sha) [[ $# -eq 3 ]] || die "usage: bundle verify-sha <binary> <sha>" 2; verify_sha_embedded "$2" "$3"; exit $? ;;
@@ -215,7 +221,11 @@ if ! $skip_build; then
 fi
 
 echo "bundle: assembling"
-for bin in zed cli; do verify_sha_embedded "$target_dir/$triple/release/$bin" "$sha" || die "stale $bin binary" 11; done
+# zed proves "built from THIS commit". The macOS cli never embeds the SHA (only the Linux and
+# Windows modules read ZED_COMMIT_SHA; macOS takes the version from Info.plist), so it is
+# only checked to be an executable Mach-O.
+verify_sha_embedded "$target_dir/$triple/release/zed" "$sha" || die "stale zed binary" 11
+verify_cli "$target_dir/$triple/release/cli" || die "invalid cli binary" 13
 out=$(check_out "$out" "$target_dir") || die "unsafe --out" 9   # resolved path, as validated
 rm -rf -- "$out"; mkdir -p "$out"; touch "$out/.cpzed-bundle-out"
 cp crates/zed/Cargo.toml "$out/Cargo.toml.orig"
