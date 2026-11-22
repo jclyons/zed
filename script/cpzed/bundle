@@ -18,6 +18,8 @@
 # in a plain Terminal (not a Zed thread, not a Claude session) and types the login-keychain
 # password at security's own prompt; no -k, so it is never on a command line:
 #   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -l "CPZed Local Signing" ~/Library/Keychains/login.keychain-db
+# `bundle` only READS n (state.json or --n); `deploy` owns and increments state.json.
+# --dry-run reports free disk but does not enforce the 100 GiB guard (a real build does, exit 6).
 # `bundle` probes with a 20 s test codesign and fails (exit 10) instead of hanging.
 # Exit codes: 3 no identity, 4 selfcheck, 5 dirty tree, 6 disk, 7 cargo running (retry),
 # 9 unsafe --out, 10 signing probe, 11 stale binary. --skip-build needs CPZED_TEST_SKIP_BUILD=1.
@@ -28,6 +30,11 @@ repo=$(cd "$here/../.." && pwd)
 IDENTITY=${CPZED_IDENTITY:-CPZed Local Signing}
 STATE=${CPZED_STATE:-$HOME/Library/Application Support/CPZed/state.json}
 EXPLANATION=$("$here/selfcheck" explanation)
+
+# Test mode (CPZED_TEST_SKIP_BUILD=1, set only by test-bundle) enables --skip-build and the
+# CPZED_CODESIGN / CPZED_TEST_GIT_SHA256 overrides, and keeps stub dirs ahead on PATH.
+testmode=false; [[ "${CPZED_TEST_SKIP_BUILD:-}" == 1 ]] && testmode=true
+CODESIGN=/usr/bin/codesign; $testmode && CODESIGN=${CPZED_CODESIGN:-/usr/bin/codesign}
 
 die() { echo "bundle: $1" >&2; exit "${2:-1}"; }
 pb() { /usr/libexec/PlistBuddy "$@"; }
@@ -88,8 +95,14 @@ def git(*a):
     r = subprocess.run(["git", "-C", real(root)] + list(a), capture_output=True, text=True)
     if r.returncode != 0: die("git failed in repo root %s: %s" % (root, r.stderr.strip()))
     return r.stdout
+for label, path in (("target dir", real(tgt)), ("--out", real(out))):
+    rr_real = real(root); cur = path
+    while len(cur) > len(rr_real):   # lengths, not spelling: the FS is case-insensitive
+        if ".git" in cur[len(rr_real):].split("/"): die("%s is inside a .git dir: %s" % (label, path))
+        if os.path.lexists(os.path.join(cur, ".git")): die("%s is or contains a nested git repo: %s" % (label, cur))
+        cur = os.path.dirname(cur)
 for label, path, marker in (("target dir", real(tgt), ".metadata_never_index"), ("--out", real(out), ".cpzed-bundle-out")):
-    rel = os.path.relpath(path, real(root))
+    rel = path[len(real(root)):].lstrip("/") or "."   # allowlist above proved path is inside root (case-insensitively)
     if git("ls-files", "--", rel).strip(): die("%s contains tracked files: %s" % (label, path))
     if os.path.exists(path):
         if not os.path.isdir(path): die("%s is not a directory: %s" % (label, path))
@@ -121,7 +134,7 @@ while [[ $# -gt 0 ]]; do
     --skip-build)
       [[ "${CPZED_TEST_SKIP_BUILD:-}" == 1 ]] || die "--skip-build is for tests only; set CPZED_TEST_SKIP_BUILD=1" 2
       skip_build=true; shift ;;
-    -h|--help) sed -n 2,24p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,25p "$0"; exit 0 ;;
     *) die "unknown argument $1" 2 ;;
   esac
 done
@@ -155,7 +168,7 @@ $has_identity || die "signing identity '$IDENTITY' not in 'security find-identit
 # Unattended-signing probe: a self-signed key shows a keychain "allow" dialog unless its
 # partition list allows codesign. Probe with a timeout so we fail instead of hanging.
 probe=$(mktemp -d); cp /usr/bin/true "$probe/probe"
-if ! perl -e 'alarm 20; exec @ARGV' /usr/bin/codesign --force --sign "$IDENTITY" "$probe/probe" >/dev/null 2>&1; then
+if ! perl -e 'alarm 20; exec @ARGV' "$CODESIGN" --force --sign "$IDENTITY" "$probe/probe" >/dev/null 2>&1; then
   rm -rf "$probe"
   die "test codesign with '$IDENTITY' failed or hung (likely a keychain permission dialog). The USER must run once in Terminal, typing their login-keychain password themselves: see docs/fork/CPZED-SIGNING.md (bundle --help)." 10
 fi
@@ -164,9 +177,14 @@ if $dry; then echo "bundle: dry run OK (no build, nothing written)"; exit 0; fi
 (( free_gib >= 100 )) || die "only ${free_gib} GiB free; need >= 100 GiB for a release build" 6
 [[ -d "$target_dir" ]] || mkdir -p "$target_dir"
 touch "$target_dir/.metadata_never_index"
-pgrep -fl "cargo|rustc" >/dev/null 2>&1 && die "another cargo/rustc is running; wait and retry" 7
+# Only cargo/rustc processes that name OUR target dir count (sccache, other sessions' builds
+# and glider-ci's cargo must not). cargo's own target-dir lock serializes the rest.
+rt_dir=$(realpath_m "$target_dir")
+if ps -axo pid=,command= | awk -v me=$$ '$1 != me' | grep -E '(^| |/)(cargo|rustc)( |$)' | grep -qF -e "$target_dir" -e "${rt_dir#/private}"; then
+  die "a cargo/rustc using $target_dir is running; deploy should retry later" 7
+fi
 
-export PATH=$HOME/.cargo/bin:$PATH
+$testmode || export PATH=$HOME/.cargo/bin:$PATH
 export CARGO_TARGET_DIR=$target_dir CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4
 export ZED_RELEASE_CHANNEL=stable ZED_BUNDLE=true CARGO_BUNDLE_SKIP_BUILD=true
 export ZED_UPDATE_EXPLANATION="$EXPLANATION"   # compile-time lock (option_env!)
@@ -215,6 +233,7 @@ cp "$target_dir/$triple/release/cli" "$app/Contents/MacOS/cli"
 gv() { sed -n "s/^$1=\"\(.*\)\"/\1/p" script/bundle-mac | head -1; }
 GIT_VERSION=$(gv GIT_VERSION); GIT_SHA=$(gv GIT_VERSION_SHA)
 if [[ "$triple" == aarch64-apple-darwin ]]; then g_arch=arm64; g_sum=$(gv GIT_ARM64_SHA256); else g_arch=x64; g_sum=$(gv GIT_X64_SHA256); fi
+$testmode && g_sum=${CPZED_TEST_GIT_SHA256:-$g_sum}
 tmp=$(mktemp -d)
 curl --silent --fail --location --max-time 300 --retry 3 --retry-delay 2 --output "$tmp/git.tgz" "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_SHA}-macOS-${g_arch}.tar.gz"
 [[ "$(shasum -a 256 "$tmp/git.tgz" | cut -d' ' -f1)" == "$g_sum" ]] || die "bundled git SHA-256 mismatch"
@@ -234,15 +253,15 @@ PY
 # Signing: no provisioning profile (team-bound), so drop the associated-domains entitlement.
 ent="$out/zed.entitlements"
 sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements > "$ent"
-cs() { perl -e 'alarm 120; exec @ARGV' /usr/bin/codesign "$@"; }
+cs() { perl -e 'alarm 120; exec @ARGV' "$CODESIGN" "$@"; }
 # Same flow as script/bundle-mac: hardened runtime, entitlements on zed and the app.
 for b in cli git; do cs --deep --force --options runtime --sign "$IDENTITY" "$app/Contents/MacOS/$b" -v; done
 cs --deep --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app/Contents/MacOS/zed" -v
 cs --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app" -v
 
 echo "bundle: verifying"
-/usr/bin/codesign --verify --deep --strict "$app"
-dv=$(/usr/bin/codesign -dv "$app" 2>&1)
+"$CODESIGN" --verify --deep --strict "$app"
+dv=$("$CODESIGN" -dv "$app" 2>&1)
 grep -qF "Authority=$IDENTITY" <<<"$dv" || die "codesign -dv does not show '$IDENTITY'" 8
 grep -Eq 'flags=0x[0-9a-f]+\(.*runtime' <<<"$dv" || die "codesign -dv does not show the hardened runtime flag" 8
 "$here/selfcheck" app "$app"

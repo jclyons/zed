@@ -5,7 +5,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 fails=0
 t() { local name=$1 want=$2; shift 2; "$@" >/dev/null 2>&1; local rc=$?
-  if { [[ $want == ok && $rc -eq 0 ]] || [[ $want == fail && $rc -ne 0 ]]; }; then echo "pass: $name"; else echo "FAIL: $name (rc=$rc)"; fails=1; fi; }
+  if { [[ $want == ok && $rc -eq 0 ]] || [[ $want == fail && $rc -ne 0 ]]; }; then echo "pass: $name"; else echo "FAIL: $name (rc=$rc)"; fails=1; [[ -n "${LAST_OUT:-}" ]] && echo "$LAST_OUT" | tail -4 | sed "s/^/    | /"; fi; LAST_OUT=; }
 
 tgt=$T/target; mkdir -p "$tgt/inside"
 ln -s /Applications "$tgt/link-apps"; ln -s "$HOME" "$tgt/link-home"
@@ -47,7 +47,23 @@ mkdir -p "$tgt/prev"; touch "$tgt/prev/.cpzed-bundle-out" "$tgt/prev/file"
 t "out with our marker is ok"           ok   co "$tgt/prev" "$tgt" "$root"
 got=$(HOME=$FH "$here/bundle" check-out "$tgt/inside/../inside/o" "$tgt" "$root" 2>/dev/null); want=$(python3 -I -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$tgt/inside/o")
 t "N2 returns the resolved path (not the caller spelling)" ok test "$got" = "$want"
-t "--skip-build without env guard"  fail "$here/bundle" --skip-build --dry-run
+
+# LOW: .git targets, nested repos with a marker; B9: planted marker in a TRACKED dir; B10: ignored-only out.
+mkdir -p "$root/.git/x"
+t "target=repo/.git out=.git/x refused"  fail co "$root/.git/x" "$root/.git" "$root"
+mkdir -p "$tgt/nested/.git" "$tgt/nested/sub"; touch "$tgt/nested/.metadata_never_index" "$tgt/nested/sub/.cpzed-bundle-out"
+t "nested git repo with marker refused"  fail co "$tgt/nested/sub" "$tgt/nested" "$root"
+touch "$root/script/cpzed/.cpzed-bundle-out" "$root/script/.metadata_never_index"
+t "B9 planted markers in TRACKED dirs"   fail co "$root/script/cpzed" "$root/script" "$root"
+mkdir -p "$root/script/new"
+t "B9b out dir inside tracked target"    fail co "$root/script/new" "$root/script" "$root"
+# case-insensitivity: same dir spelled differently must still count as inside the root / home child
+mkdir -p "$FH/code/cpzed-sandbox/wt/target-install/x"
+t "ok: lowercase/uppercase spelling of the same target" ok co "$FH/CODE/cpzed-sandbox/WT/target-install/x/o" "$FH/code/cpzed-sandbox/wt/target-install" "$root"
+mkdir -p "$T/h/home/code"
+t "home child under a differently-cased HOME" fail env HOME="$T/h/HOME" "$here/bundle" check-out "$T/h/home/code/o" "$T/h/home/code" "$T/h/home"
+mkdir -p "$tgt/ign"; echo "ign-file" > "$tgt/ign/ignored.txt"; echo "target-install/ign/" >> "$root/.git/info/exclude"
+t "B10 ignored-only out, no marker"      fail co "$tgt/ign" "$tgt" "$root"
 
 sha=0123456789abcdef0123456789abcdef01234567
 printf 'binary %s end' "$sha" > "$T/fresh"; printf 'binary othersha end' > "$T/stale"
@@ -75,4 +91,100 @@ echo icns > "$app/Contents/Resources/Document.icns"
 t "selfcheck app good"              ok   "$here/selfcheck" app "$app"
 /usr/libexec/PlistBuddy -c 'Set :LSEnvironment:ZED_UPDATE_EXPLANATION "something else"' "$app/Contents/Info.plist"
 t "selfcheck LSEnvironment differs" fail "$here/selfcheck" app "$app"
+# selfcheck: every gate needle individually (C2) and a binary lacking the explanation (C3).
+python3 -I - "$repo/crates/auto_update/src/auto_update.rs" "$T" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+needles = ['if option_env!("ZED_UPDATE_EXPLANATION").is_none()', '&& env::var("ZED_UPDATE_EXPLANATION").is_err()',
+           '&& poll_for_updates', 'if let Some(message) = option_env!("ZED_UPDATE_EXPLANATION")',
+           '.or_else(|| env::var("ZED_UPDATE_EXPLANATION").ok())']
+for i, n in enumerate(needles):
+    assert n in src
+    open("%s/needle%d.rs" % (sys.argv[2], i), "w").write(src.replace(n, "/*removed*/"))
+PY
+for i in 0 1 2 3 4; do t "selfcheck needle $i doctored" fail "$here/selfcheck" source --file "$T/needle$i.rs"; done
+printf nothing > "$app/Contents/MacOS/zed"
+/usr/libexec/PlistBuddy -c "Set :LSEnvironment:ZED_UPDATE_EXPLANATION \"$("$here/selfcheck" explanation)\"" "$app/Contents/Info.plist"
+t "C3 binary lacks the explanation"      fail "$here/selfcheck" app "$app"
+
+# ---- end-to-end with stubs, in a throwaway fake repo (no real build, real repo untouched) ----
+H=$T/h/home; R=$H/code/wt; S=$T/stubs; mkdir -p "$S" "$R/script" "$R/crates/zed/resources" "$R/crates/auto_update/src"
+cp -R "$here" "$R/script/cpzed"; cp "$repo/script/bundle-mac" "$R/script/"
+cp "$repo/crates/auto_update/src/auto_update.rs" "$R/crates/auto_update/src/"
+cp "$repo/crates/zed/resources/"{Document.icns,app-icon-dev@2x.png,zed.entitlements} "$R/crates/zed/resources/"
+printf '[package]\nname = "zed"\nversion = "1.31.0"\n\n[package.metadata.bundle-stable]\nname = "Zed"\n' > "$R/crates/zed/Cargo.toml"
+[[ -n "${CPZED_MUTATE:-}" ]] && sed -i '' "$CPZED_MUTATE" "$R/script/cpzed/bundle"
+git -C "$R" init -q; echo "/target-install/" >> "$R/.git/info/exclude"
+git -C "$R" add -A; git -C "$R" -c user.name=t -c user.email=t@t commit -qm init
+sha=$(git -C "$R" rev-parse HEAD); triple=$(rustc --version --verbose | sed -n 's/^host: //p')
+bd=$R/target-install/$triple/release; mkdir -p "$bd"; touch "$R/target-install/.metadata_never_index"
+mkbins() { printf 'zed %s %s' "$1" "$("$here/selfcheck" explanation)" > "$bd/zed"; printf 'cli %s' "$1" > "$bd/cli"; }
+mkbins "$sha"
+mkdir -p "$T/gitpkg/bin"; echo '#!/bin/sh' > "$T/gitpkg/bin/git"; tar -czf "$S/git.tgz" -C "$T/gitpkg" bin/git
+cat > "$S/security" <<'X'
+#!/bin/bash
+[[ "${STUB_IDENTITY:-1}" == 1 ]] && echo '  1) ABCDEF "CPZed Local Signing"'; exit 0
+X
+cat > "$S/df" <<'X'
+#!/bin/bash
+echo "Filesystem 1G-blocks Used Available Capacity"; echo "x 900 1 ${STUB_FREE:-500} 1%"
+X
+cat > "$S/codesign" <<'X'
+#!/bin/bash
+echo "codesign $*" >> "$STUB_LOG"
+[[ -n "${STUB_PLANT_OUT:-}" && "$*" == *probe* ]] && { mkdir -p "$STUB_PLANT_OUT"; echo x > "$STUB_PLANT_OUT/plant"; }
+[[ "${STUB_CS_FAIL:-0}" == 1 ]] && exit 1
+if [[ "$1" == -dv ]]; then echo "Authority=CPZed Local Signing" >&2; [[ "${STUB_RUNTIME:-1}" == 1 ]] && echo "flags=0x10000(runtime)" >&2 || echo "flags=0x2(adhoc)" >&2; fi
+exit 0
+X
+cat > "$S/curl" <<'X'
+#!/bin/bash
+echo "curl $*" >> "$STUB_LOG"; while [[ $# -gt 0 ]]; do [[ $1 == --output ]] && cp "$STUB_GITPKG" "$2"; shift; done
+X
+cat > "$S/cargo" <<'X'
+#!/bin/bash
+echo "cargo $*" >> "$STUB_LOG"
+[[ "$1 $2" == "-q bundle" ]] && { echo "cargo-bundle v0.6.1-zed"; exit 0; }
+if [[ "$1" == bundle ]]; then a=$(cd ../.. && pwd)/target-install/app/Zed.app; mkdir -p "$a/Contents/MacOS" "$a/Contents/Resources"
+cat > "$a/Contents/Info.plist" <<'P'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>x</string><key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>zed</string></array></dict></array></dict></plist>
+P
+echo "$a"; fi
+X
+chmod +x "$S"/security "$S"/df "$S"/codesign "$S"/curl "$S"/cargo
+export STUB_LOG=$T/stub.log STUB_GITPKG=$S/git.tgz
+gsum=$(shasum -a 256 "$S/git.tgz" | cut -d' ' -f1)
+# rc/message runner: rrc <want-rc> <msg-grep|-> [VAR=val ...] -- args...
+rrc() { local want=$1 pat=$2; shift 2; local envs=(); while [[ $1 != -- ]]; do envs+=("$1"); shift; done; shift
+  : > "$STUB_LOG"; local o rc
+  o=$(cd "$R" && env HOME="$H" PATH="$S:$PATH" CPZED_STATE="$T/no-state.json" CPZED_TEST_SKIP_BUILD=1 CPZED_CODESIGN="$S/codesign" \
+      CPZED_TEST_GIT_SHA256="$gsum" ${envs[@]+"${envs[@]}"} script/cpzed/bundle "$@" 2>&1); rc=$?; LAST_OUT=$o
+  [[ $rc -eq $want && ( $pat == - || $o == *"$pat"* ) ]]; }
+t "E2E dry-run, no identity -> 3"        ok   rrc 3 "signing identity" STUB_IDENTITY=0 -- --dry-run
+t "E2E dry-run with identity -> 0"       ok   rrc 0 "dry run OK" -- --dry-run
+t "E2E --skip-build w/o guard -> 2"      ok   rrc 2 "tests only" CPZED_TEST_SKIP_BUILD=0 -- --skip-build
+echo x >> "$R/crates/zed/Cargo.toml"
+t "E2E dirty tree rc 5"                  ok   rrc 5 "must be clean" -- --skip-build
+git -C "$R" checkout -q crates/zed/Cargo.toml
+t "E2E low disk -> 6"                    ok   rrc 6 "need >= 100 GiB" STUB_FREE=50 -- --skip-build
+t "E2E signing probe fails -> 10"        ok   rrc 10 "keychain permission" STUB_CS_FAIL=1 -- --skip-build
+t "E2E stale binary -> 11"               ok   bash -c 'printf "stale" > "$1"' _ "$bd/zed"
+t "E2E stale binary rc 11"               ok   rrc 11 "stale zed binary" -- --skip-build
+mkbins "$sha"
+t "E2E out replaced between checks -> 9" ok   rrc 9 "unsafe --out" "STUB_PLANT_OUT=$R/target-install/cpzed-out" -- --skip-build
+rm -rf "$R/target-install/cpzed-out"
+t "E2E missing hardened runtime -> 8"    ok   rrc 8 "hardened runtime" STUB_RUNTIME=0 -- --skip-build
+# cargo/rustc detection: fake long-running processes
+mkdir -p "$T/fc"; printf '#!/bin/bash\nsleep 40\n' > "$T/fc/cargo"; printf '#!/bin/bash\nsleep 40\n' > "$T/fc/sccache"; chmod +x "$T/fc/"*
+"$T/fc/sccache" --server "$R/target-install" & p1=$!; "$T/fc/cargo" build --target-dir /somewhere/else/glider-ci & p2=$!
+sleep 1
+t "E2E sccache + unrelated cargo do not exit 7" ok rrc 0 "bundle: built" -- --skip-build
+t "E2E all 4 sign calls use the hardened runtime" ok test "$(grep -c -e "--force.*--options runtime" "$STUB_LOG")" = 4
+t "E2E curl has --max-time and --retry"  ok   grep -q -e "--max-time 300 --retry 3" "$STUB_LOG"
+t "E2E built plist has -cpzed.1"         ok   grep -q "1.31.0-cpzed.1" <(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$R/target-install/cpzed-out/CPZed.app/Contents/Info.plist")
+"$T/fc/cargo" build --target-dir "$R/target-install" & p3=$!
+sleep 1
+t "E2E cargo using our target dir -> 7"  ok   rrc 7 "using" -- --skip-build
+kill $p1 $p2 $p3 2>/dev/null; wait 2>/dev/null
 exit $fails
