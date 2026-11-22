@@ -55,6 +55,9 @@ mkdir -p "$tgt/nested/.git" "$tgt/nested/sub"; touch "$tgt/nested/.metadata_neve
 t "nested git repo with marker refused"  fail co "$tgt/nested/sub" "$tgt/nested" "$root"
 touch "$root/script/cpzed/.cpzed-bundle-out" "$root/script/.metadata_never_index"
 t "B9 planted markers in TRACKED dirs"   fail co "$root/script/cpzed" "$root/script" "$root"
+for v in SCRIPT/CPZED script/CPZED Script/Cpzed; do
+  t "C1 mis-cased tracked dir $v (markers planted)" fail co "$root/$v" "$root/${v%%/*}" "$root"
+done
 mkdir -p "$root/script/new"
 t "B9b out dir inside tracked target"    fail co "$root/script/new" "$root/script" "$root"
 # case-insensitivity: same dir spelled differently must still count as inside the root / home child
@@ -62,6 +65,11 @@ mkdir -p "$FH/code/cpzed-sandbox/wt/target-install/x"
 t "ok: lowercase/uppercase spelling of the same target" ok co "$FH/CODE/cpzed-sandbox/WT/target-install/x/o" "$FH/code/cpzed-sandbox/wt/target-install" "$root"
 mkdir -p "$T/h/home/code"
 t "home child under a differently-cased HOME" fail env HOME="$T/h/HOME" "$here/bundle" check-out "$T/h/home/code/o" "$T/h/home/code" "$T/h/home"
+t "C1 untracked work, wrong-case spelling"  fail co "$root/PLAIN/o" "$root/PLAIN" "$root"
+t "C1 untracked work, all-upper out spelling" fail co "$tgt/WORK" "$tgt" "$root"
+mkdir -p "$root/.GIT/x" "$root/.Git/x"
+t "N1 .GIT component refused"            fail co "$root/.GIT/x" "$root/.GIT" "$root"
+t "N1 .Git component refused"            fail co "$root/.Git/x" "$root/.Git" "$root"
 mkdir -p "$tgt/ign"; echo "ign-file" > "$tgt/ign/ignored.txt"; echo "target-install/ign/" >> "$root/.git/info/exclude"
 t "B10 ignored-only out, no marker"      fail co "$tgt/ign" "$tgt" "$root"
 
@@ -161,8 +169,8 @@ rrc() { local want=$1 pat=$2; shift 2; local envs=(); while [[ $1 != -- ]]; do e
   o=$(cd "$R" && env HOME="$H" PATH="$S:$PATH" CPZED_STATE="$T/no-state.json" CPZED_TEST_SKIP_BUILD=1 CPZED_CODESIGN="$S/codesign" \
       CPZED_TEST_GIT_SHA256="$gsum" ${envs[@]+"${envs[@]}"} script/cpzed/bundle "$@" 2>&1); rc=$?; LAST_OUT=$o
   [[ $rc -eq $want && ( $pat == - || $o == *"$pat"* ) ]]; }
-t "E2E dry-run, no identity -> 3"        ok   rrc 3 "signing identity" STUB_IDENTITY=0 -- --dry-run
-t "E2E dry-run with identity -> 0"       ok   rrc 0 "dry run OK" -- --dry-run
+t "E2E dry-run, no identity -> 3"        ok   rrc 3 "signing identity" STUB_IDENTITY=0 -- --skip-build --dry-run
+t "E2E dry-run with identity -> 0"       ok   rrc 0 "dry run OK" -- --skip-build --dry-run
 t "E2E --skip-build w/o guard -> 2"      ok   rrc 2 "tests only" CPZED_TEST_SKIP_BUILD=0 -- --skip-build
 echo x >> "$R/crates/zed/Cargo.toml"
 t "E2E dirty tree rc 5"                  ok   rrc 5 "must be clean" -- --skip-build
@@ -175,6 +183,16 @@ mkbins "$sha"
 t "E2E out replaced between checks -> 9" ok   rrc 9 "unsafe --out" "STUB_PLANT_OUT=$R/target-install/cpzed-out" -- --skip-build
 rm -rf "$R/target-install/cpzed-out"
 t "E2E missing hardened runtime -> 8"    ok   rrc 8 "hardened runtime" STUB_RUNTIME=0 -- --skip-build
+# S1: overrides fail closed in a production-mode run (no --skip-build); never read.
+rprod() { local want=$1 pat=$2; shift 2; local o rc
+  o=$(cd "$R" && env HOME="$H" PATH="$S:$PATH" CPZED_STATE="$T/no-state.json" STUB_IDENTITY=0 "$@" script/cpzed/bundle --dry-run 2>&1); rc=$?; LAST_OUT=$o
+  [[ $rc -eq $want && $o == *"$pat"* ]]; }
+t "S1 baseline production run (no overrides) -> 3" ok rprod 3 "signing identity"
+t "S1 CPZED_CODESIGN alone refused"          ok rprod 2 "not a test run" CPZED_CODESIGN="$S/codesign"
+t "S1 CPZED_TEST_GIT_SHA256 alone refused"   ok rprod 2 "not a test run" CPZED_TEST_GIT_SHA256=abc
+t "S1 CPZED_TEST_SKIP_BUILD=1 alone refused" ok rprod 2 "not a test run" CPZED_TEST_SKIP_BUILD=1
+t "S1 all three together refused"            ok rprod 2 "not a test run" CPZED_CODESIGN="$S/codesign" CPZED_TEST_GIT_SHA256=abc CPZED_TEST_SKIP_BUILD=1
+t "S1 flag without env var refused"          ok rrc 2 "tests only" CPZED_TEST_SKIP_BUILD= -- --skip-build --dry-run
 # cargo/rustc detection: fake long-running processes
 mkdir -p "$T/fc"; printf '#!/bin/bash\nsleep 40\n' > "$T/fc/cargo"; printf '#!/bin/bash\nsleep 40\n' > "$T/fc/sccache"; chmod +x "$T/fc/"*
 "$T/fc/sccache" --server "$R/target-install" & p1=$!; "$T/fc/cargo" build --target-dir /somewhere/else/glider-ci & p2=$!

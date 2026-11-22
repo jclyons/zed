@@ -31,10 +31,12 @@ IDENTITY=${CPZED_IDENTITY:-CPZed Local Signing}
 STATE=${CPZED_STATE:-$HOME/Library/Application Support/CPZed/state.json}
 EXPLANATION=$("$here/selfcheck" explanation)
 
-# Test mode (CPZED_TEST_SKIP_BUILD=1, set only by test-bundle) enables --skip-build and the
-# CPZED_CODESIGN / CPZED_TEST_GIT_SHA256 overrides, and keeps stub dirs ahead on PATH.
-testmode=false; [[ "${CPZED_TEST_SKIP_BUILD:-}" == 1 ]] && testmode=true
-CODESIGN=/usr/bin/codesign; $testmode && CODESIGN=${CPZED_CODESIGN:-/usr/bin/codesign}
+# Test mode needs BOTH the --skip-build flag and CPZED_TEST_SKIP_BUILD=1 (set only by
+# test-bundle); it enables the CPZED_CODESIGN / CPZED_TEST_GIT_SHA256 overrides and keeps
+# stub dirs ahead on PATH. It is decided after argument parsing; any other run refuses
+# to start if one of those variables is present (fail closed, never read them).
+testmode=false
+CODESIGN=/usr/bin/codesign
 
 die() { echo "bundle: $1" >&2; exit "${2:-1}"; }
 pb() { /usr/libexec/PlistBuddy "$@"; }
@@ -92,13 +94,16 @@ if not inside(ro, rt): die("--out (%s) must be strictly inside the target dir (%
 import subprocess
 real = os.path.realpath
 def git(*a):
-    r = subprocess.run(["git", "-C", real(root)] + list(a), capture_output=True, text=True)
+    # GIT_ICASE_PATHSPECS: pathspecs are case-sensitive even on a case-insensitive FS, so a
+    # mis-cased spelling of a tracked dir would otherwise match nothing.
+    r = subprocess.run(["git", "-C", real(root)] + list(a), capture_output=True, text=True,
+                       env=dict(os.environ, GIT_ICASE_PATHSPECS="1"))
     if r.returncode != 0: die("git failed in repo root %s: %s" % (root, r.stderr.strip()))
     return r.stdout
 for label, path in (("target dir", real(tgt)), ("--out", real(out))):
     rr_real = real(root); cur = path
     while len(cur) > len(rr_real):   # lengths, not spelling: the FS is case-insensitive
-        if ".git" in cur[len(rr_real):].split("/"): die("%s is inside a .git dir: %s" % (label, path))
+        if ".git" in [c.lower() for c in cur[len(rr_real):].split("/")]: die("%s is inside a .git dir: %s" % (label, path))
         if os.path.lexists(os.path.join(cur, ".git")): die("%s is or contains a nested git repo: %s" % (label, cur))
         cur = os.path.dirname(cur)
 for label, path, marker in (("target dir", real(tgt), ".metadata_never_index"), ("--out", real(out), ".cpzed-bundle-out")):
@@ -138,6 +143,15 @@ while [[ $# -gt 0 ]]; do
     *) die "unknown argument $1" 2 ;;
   esac
 done
+
+if $skip_build && [[ "${CPZED_TEST_SKIP_BUILD:-}" == 1 ]]; then testmode=true; fi
+if ! $testmode; then
+  for v in CPZED_CODESIGN CPZED_TEST_GIT_SHA256 CPZED_TEST_SKIP_BUILD; do
+    [[ -z "${!v+x}" ]] || die "$v is set but this is not a test run (needs --skip-build AND CPZED_TEST_SKIP_BUILD=1); refusing to start" 2
+  done
+else
+  CODESIGN=${CPZED_CODESIGN:-/usr/bin/codesign}
+fi
 
 cd "$repo"
 sha=$(git rev-parse HEAD)
