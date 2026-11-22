@@ -132,6 +132,10 @@ struct Args {
     /// (windows, displays, frame scheduling, cursor), for debugging.
     #[arg(long)]
     debug_state: bool,
+    /// Print the running Zed's agent threads as a JSON array (currently
+    /// terminal threads only), for scripts and orchestration.
+    #[arg(long)]
+    agent_list: bool,
     /// Open the project in a dev container.
     ///
     /// Automatically triggers "Reopen in Dev Container" if a `.devcontainer/`
@@ -690,6 +694,8 @@ fn run() -> Result<()> {
 
                 tx.send(if args.debug_state {
                     CliRequest::DebugState
+                } else if args.agent_list {
+                    CliRequest::ListAgentThreads
                 } else {
                     open_request
                 })?;

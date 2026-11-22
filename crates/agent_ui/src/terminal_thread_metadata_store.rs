@@ -220,6 +220,51 @@ impl TerminalThreadMetadataStore {
         self.terminals.values()
     }
 
+    /// A JSON snapshot of every known terminal thread, oldest first, for the
+    /// CLI (`zed --agent-list`). Kept here so callers outside this crate need
+    /// no access to `TerminalId` internals.
+    pub fn list_json(&self) -> serde_json::Value {
+        let mut entries: Vec<&TerminalThreadMetadata> = self.entries().collect();
+        entries.sort_by_cached_key(|metadata| {
+            (metadata.created_at, metadata.terminal_id.to_key_string())
+        });
+        serde_json::Value::Array(
+            entries
+                .into_iter()
+                .map(|metadata| {
+                    serde_json::json!({
+                        "id": metadata.terminal_id.to_key_string(),
+                        "kind": "terminal",
+                        "title": metadata.display_title().to_string(),
+                        "custom_title": metadata
+                            .custom_title
+                            .as_ref()
+                            .map(|title| title.to_string()),
+                        "created_at": metadata.created_at.to_rfc3339(),
+                        "folder_paths": metadata
+                            .folder_paths()
+                            .paths()
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>(),
+                        "working_directory": metadata
+                            .working_directory
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned()),
+                        "remote": metadata.remote_connection.is_some(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Like [`Self::list_json`], but `None` until the SQLite load has
+    /// succeeded, so callers never report an empty list for a store that
+    /// has not (or could not) load.
+    pub fn list_json_if_loaded(&self) -> Option<serde_json::Value> {
+        self.is_loaded.then(|| self.list_json())
+    }
+
     pub fn reload_task(&self) -> Shared<Task<()>> {
         self.reload_task
             .clone()
@@ -702,6 +747,114 @@ mod tests {
 
         metadata.title = "Thinking".into();
         assert_eq!(metadata.display_title().as_ref(), "Fix bug");
+    }
+
+    #[gpui::test]
+    async fn test_list_json_is_sorted_by_created_at_with_expected_fields(cx: &mut TestAppContext) {
+        init_test(cx);
+        let store = cx.update(|cx| TerminalThreadMetadataStore::global(cx));
+
+        let base = Utc::now();
+        let mut newer = metadata(
+            "Newer",
+            WorktreePaths::from_folder_paths(&PathList::new(&[Path::new("/projects/b")])),
+        );
+        newer.created_at = base;
+        newer.working_directory = Some(PathBuf::from("/projects/b/sub"));
+        let mut older = metadata(
+            "⠋ Thinking",
+            WorktreePaths::from_folder_paths(&PathList::new(&[Path::new("/projects/a")])),
+        );
+        older.created_at = base - chrono::Duration::seconds(60);
+        older.custom_title = Some("Fix bug".into());
+        let (older_id, newer_id) = (older.terminal_id, newer.terminal_id);
+
+        // Save newest first so the test fails if output follows insertion order.
+        store.update(cx, |store, cx| {
+            store.save(newer.clone(), cx);
+            store.save(older.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let json = store.read_with(cx, |store, _| store.list_json());
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "id": older_id.to_key_string(),
+                    "kind": "terminal",
+                    "title": "⠋ Fix bug",
+                    "custom_title": "Fix bug",
+                    "created_at": older.created_at.to_rfc3339(),
+                    "folder_paths": ["/projects/a"],
+                    "working_directory": null,
+                    "remote": false,
+                },
+                {
+                    "id": newer_id.to_key_string(),
+                    "kind": "terminal",
+                    "title": "Newer",
+                    "custom_title": null,
+                    "created_at": newer.created_at.to_rfc3339(),
+                    "folder_paths": ["/projects/b"],
+                    "working_directory": "/projects/b/sub",
+                    "remote": false,
+                },
+            ])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_list_json_breaks_created_at_ties_by_terminal_id(cx: &mut TestAppContext) {
+        init_test(cx);
+        let store = cx.update(|cx| TerminalThreadMetadataStore::global(cx));
+        let created_at = Utc::now();
+        let mut ids = Vec::new();
+        store.update(cx, |store, cx| {
+            for index in 0..8 {
+                let mut entry = metadata(
+                    &format!("T{index}"),
+                    WorktreePaths::from_folder_paths(&PathList::default()),
+                );
+                entry.created_at = created_at;
+                ids.push(entry.terminal_id.to_key_string());
+                store.save(entry, cx);
+            }
+        });
+        cx.run_until_parked();
+        ids.sort();
+        let json = store.read_with(cx, |store, _| store.list_json());
+        let listed: Vec<String> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(listed, ids);
+    }
+
+    #[gpui::test]
+    async fn test_list_json_if_loaded_requires_successful_load(cx: &mut TestAppContext) {
+        init_test(cx);
+        let store = cx.update(|cx| TerminalThreadMetadataStore::global(cx));
+
+        // Loaded: JSON (an empty list is a legitimate answer).
+        assert_eq!(
+            store.read_with(cx, |store, _| store.list_json_if_loaded()),
+            Some(serde_json::json!([]))
+        );
+
+        // Load not finished or failed (`is_loaded == false`): no answer.
+        store.update(cx, |store, _| store.is_loaded = false);
+        assert_eq!(
+            store.read_with(cx, |store, _| store.list_json_if_loaded()),
+            None
+        );
+
+        // A reload that succeeds flips it back.
+        store.update(cx, |store, cx| store.reload(cx));
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |store, _| store.list_json_if_loaded().is_some()));
     }
 
     #[gpui::test]
