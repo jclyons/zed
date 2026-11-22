@@ -747,14 +747,22 @@ pub async fn handle_cli_request(
             responses.send(response).log_err();
             responses.send(CliResponse::Exit { status }).log_err();
         }
-        // Placeholder until CPZED-10 implements the real handler.
-        CliRequest::NewAgentTerminal { .. } => {
-            responses
-                .send(CliResponse::Stderr {
-                    message: "agent-new is not implemented yet".to_string(),
-                })
-                .log_err();
-            responses.send(CliResponse::Exit { status: 1 }).log_err();
+        CliRequest::NewAgentTerminal {
+            cwd,
+            command,
+            title,
+            on_no_match,
+        } => {
+            crate::zed::cli_agent::handle_new_agent_terminal(
+                cwd,
+                command,
+                title,
+                on_no_match,
+                app_state,
+                responses.as_ref(),
+                cx,
+            )
+            .await;
         }
     }
 }

@@ -1,4 +1,5 @@
 mod app_menus;
+mod cli_agent;
 pub mod edit_prediction_registry;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
