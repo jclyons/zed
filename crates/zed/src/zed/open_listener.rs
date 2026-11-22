@@ -1,6 +1,7 @@
 use crate::handle_open_request;
 use crate::restore_or_create_workspace;
 use agent_ui::ExternalSourcePrompt;
+use agent_ui::terminal_thread_metadata_store::TerminalThreadMetadataStore;
 use anyhow::{Context as _, Result, anyhow};
 use cli::{CliRequest, CliResponse, CliResponseSink};
 use cli::{IpcHandshake, ipc};
@@ -713,21 +714,32 @@ pub async fn handle_cli_request(
         }
         CliRequest::ListAgentThreads => {
             // Read-only, like DebugState: do not activate the app.
-            let response = cx.update(|cx| {
-                match agent_ui::terminal_thread_metadata_store::TerminalThreadMetadataStore::try_global(cx) {
-                    Some(store) => {
-                        match serde_json::to_string_pretty(&store.read(cx).list_json()) {
+            let store = cx.update(|cx| TerminalThreadMetadataStore::try_global(cx));
+            let response = match store {
+                Some(store) => {
+                    // The store loads from SQLite asynchronously; on a cold
+                    // start (the CLI may have just launched Zed) it is empty
+                    // until that finishes. Wait, then refuse to report an
+                    // empty list for a store that failed to load.
+                    let reload_task = cx.update(|cx| store.read(cx).reload_task());
+                    reload_task.await;
+                    let list = cx.update(|cx| store.read(cx).list_json_if_loaded());
+                    match list {
+                        Some(list) => match serde_json::to_string_pretty(&list) {
                             Ok(message) => CliResponse::Stdout { message },
                             Err(error) => CliResponse::Stderr {
                                 message: format!("failed to serialize agent threads: {error}"),
                             },
-                        }
+                        },
+                        None => CliResponse::Stderr {
+                            message: "failed to load agent thread metadata".to_string(),
+                        },
                     }
-                    None => CliResponse::Stderr {
-                        message: "agent thread store is not initialized".to_string(),
-                    },
                 }
-            });
+                None => CliResponse::Stderr {
+                    message: "agent thread store is not initialized".to_string(),
+                },
+            };
             let status = match response {
                 CliResponse::Stdout { .. } => 0,
                 _ => 1,
