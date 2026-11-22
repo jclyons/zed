@@ -220,6 +220,38 @@ impl TerminalThreadMetadataStore {
         self.terminals.values()
     }
 
+    /// A JSON snapshot of every known terminal thread, oldest first, for the
+    /// CLI (`zed --agent-list`). Kept here so callers outside this crate need
+    /// no access to `TerminalId` internals.
+    pub fn list_json(&self) -> serde_json::Value {
+        let mut entries: Vec<&TerminalThreadMetadata> = self.entries().collect();
+        entries.sort_by_key(|metadata| metadata.created_at);
+        serde_json::Value::Array(
+            entries
+                .into_iter()
+                .map(|metadata| {
+                    serde_json::json!({
+                        "id": metadata.terminal_id.to_key_string(),
+                        "kind": "terminal",
+                        "title": metadata.display_title().to_string(),
+                        "created_at": metadata.created_at.to_rfc3339(),
+                        "folder_paths": metadata
+                            .folder_paths()
+                            .paths()
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>(),
+                        "working_directory": metadata
+                            .working_directory
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned()),
+                        "remote": metadata.remote_connection.is_some(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
     pub fn reload_task(&self) -> Shared<Task<()>> {
         self.reload_task
             .clone()
@@ -702,6 +734,59 @@ mod tests {
 
         metadata.title = "Thinking".into();
         assert_eq!(metadata.display_title().as_ref(), "Fix bug");
+    }
+
+    #[gpui::test]
+    async fn test_list_json_is_sorted_by_created_at_with_expected_fields(cx: &mut TestAppContext) {
+        init_test(cx);
+        let store = cx.update(|cx| TerminalThreadMetadataStore::global(cx));
+
+        let base = Utc::now();
+        let mut newer = metadata(
+            "Newer",
+            WorktreePaths::from_folder_paths(&PathList::new(&[Path::new("/projects/b")])),
+        );
+        newer.created_at = base;
+        newer.working_directory = Some(PathBuf::from("/projects/b/sub"));
+        let mut older = metadata(
+            "⠋ Thinking",
+            WorktreePaths::from_folder_paths(&PathList::new(&[Path::new("/projects/a")])),
+        );
+        older.created_at = base - chrono::Duration::seconds(60);
+        older.custom_title = Some("Fix bug".into());
+        let (older_id, newer_id) = (older.terminal_id, newer.terminal_id);
+
+        // Save newest first so the test fails if output follows insertion order.
+        store.update(cx, |store, cx| {
+            store.save(newer.clone(), cx);
+            store.save(older.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let json = store.read_with(cx, |store, _| store.list_json());
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "id": older_id.to_key_string(),
+                    "kind": "terminal",
+                    "title": "⠋ Fix bug",
+                    "created_at": older.created_at.to_rfc3339(),
+                    "folder_paths": ["/projects/a"],
+                    "working_directory": null,
+                    "remote": false,
+                },
+                {
+                    "id": newer_id.to_key_string(),
+                    "kind": "terminal",
+                    "title": "Newer",
+                    "created_at": newer.created_at.to_rfc3339(),
+                    "folder_paths": ["/projects/b"],
+                    "working_directory": "/projects/b/sub",
+                    "remote": false,
+                },
+            ])
+        );
     }
 
     #[gpui::test]

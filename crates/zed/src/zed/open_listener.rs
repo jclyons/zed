@@ -711,6 +711,30 @@ pub async fn handle_cli_request(
             responses.send(response).log_err();
             responses.send(CliResponse::Exit { status }).log_err();
         }
+        CliRequest::ListAgentThreads => {
+            // Read-only, like DebugState: do not activate the app.
+            let response = cx.update(|cx| {
+                match agent_ui::terminal_thread_metadata_store::TerminalThreadMetadataStore::try_global(cx) {
+                    Some(store) => {
+                        match serde_json::to_string_pretty(&store.read(cx).list_json()) {
+                            Ok(message) => CliResponse::Stdout { message },
+                            Err(error) => CliResponse::Stderr {
+                                message: format!("failed to serialize agent threads: {error}"),
+                            },
+                        }
+                    }
+                    None => CliResponse::Stderr {
+                        message: "agent thread store is not initialized".to_string(),
+                    },
+                }
+            });
+            let status = match response {
+                CliResponse::Stdout { .. } => 0,
+                _ => 1,
+            };
+            responses.send(response).log_err();
+            responses.send(CliResponse::Exit { status }).log_err();
+        }
     }
 }
 

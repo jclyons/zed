@@ -74,6 +74,9 @@ pub enum CliRequest {
     },
     /// Print a diagnostic snapshot of the app's GPUI and platform state.
     DebugState,
+    /// Print the running Zed's agent threads as JSON (currently terminal
+    /// threads only).
+    ListAgentThreads,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
