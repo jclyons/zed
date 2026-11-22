@@ -12,6 +12,10 @@
 //! the repo's sidebar group. A cwd that is neither inside an open root nor in
 //! an open repo is "no match" (exit 3 by default).
 //!
+//! The success reply is one JSON line: `id`, `kind`, `title` (the `--title`
+//! given, else null; never the live shell title), `working_directory`,
+//! `folder_paths`, `window_id`, `workspace_id`.
+//!
 //! Known limitation (tracked as a follow-up): when the CLI launches Zed
 //! itself, this handler can run before session restore has reopened the user's
 //! windows. A cwd inside a project that restore is about to bring back then
@@ -55,6 +59,8 @@ pub struct Timeouts {
     pub panel_load: Duration,
     /// Running `git rev-parse` for the linked-worktree fallback.
     pub git: Duration,
+    /// The `git` executable (overridable so tests can fake a hung git).
+    pub git_program: &'static str,
 }
 
 impl Default for Timeouts {
@@ -64,6 +70,7 @@ impl Default for Timeouts {
             metadata: Duration::from_secs(5),
             panel_load: Duration::from_secs(10),
             git: Duration::from_secs(5),
+            git_program: "git",
         }
     }
 }
@@ -174,7 +181,7 @@ async fn run(
     #[cfg(test)]
     let _probe = tests::ConcurrencyProbe::enter();
 
-    let target = resolve_target(&cwd, on_no_match, &app_state, timeouts.git, cx).await?;
+    let target = resolve_target(&cwd, on_no_match, &app_state, timeouts, cx).await?;
     let panel = wait_for_panel(&target, timeouts.panel_load, cx).await?;
     spawn_and_confirm(&target, &panel, cwd, command, title, timeouts, cx).await
 }
@@ -206,7 +213,7 @@ async fn resolve_target(
     cwd: &Path,
     on_no_match: NoMatchBehavior,
     app_state: &Arc<AppState>,
-    git_timeout: Duration,
+    timeouts: Timeouts,
     cx: &mut AsyncApp,
 ) -> Result<Target, Failure> {
     // Phase 1 (foreground, read-only): snapshot every open local workspace.
@@ -254,9 +261,13 @@ async fn resolve_target(
     if linked_match.is_none() {
         // Snapshots may not list linked worktrees (e.g. bare-repo layouts);
         // ask git directly and compare common dirs.
-        let git_result = bounded(git_toplevel_and_common_dir(&canonical_cwd), git_timeout, cx)
-            .await
-            .flatten();
+        let git_result = bounded(
+            git_toplevel_and_common_dir(timeouts.git_program, &canonical_cwd),
+            timeouts.git,
+            cx,
+        )
+        .await
+        .flatten();
         if let Some((toplevel, common_dir)) = git_result {
             let common_dir = canonical_or_self(&common_dir);
             if let Some(index) = pick_by_common_dir(&common_dir, &linked) {
@@ -424,8 +435,9 @@ async fn bounded<T>(
 
 /// `(--show-toplevel, --git-common-dir)` for `cwd`, or `None` when `cwd` is
 /// not inside a git work tree or git is unavailable.
-async fn git_toplevel_and_common_dir(cwd: &Path) -> Option<(PathBuf, PathBuf)> {
-    let output = util::command::new_command("git")
+async fn git_toplevel_and_common_dir(program: &str, cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let output = util::command::new_command(program)
+        .kill_on_drop(true)
         .args([
             "rev-parse",
             "--path-format=absolute",
@@ -570,6 +582,16 @@ async fn spawn_and_confirm(
     Ok(reply_json(target, panel, terminal_id, &cwd, timeouts, cx).await)
 }
 
+/// The reply's `title` is exactly the custom title given with `--title`, else
+/// `None`. Never the live terminal title: the shell sets that asynchronously,
+/// so reporting it would make the reply racy.
+fn reply_title(info: &agent_ui::AgentPanelTerminalInfo) -> Option<String> {
+    info.custom_title
+        .as_ref()
+        .map(|title| title.to_string())
+        .filter(|title| !title.is_empty())
+}
+
 async fn reply_json(
     target: &Target,
     panel: &Entity<AgentPanel>,
@@ -620,10 +642,7 @@ async fn reply_json(
         serde_json::json!({
             "id": terminal_id.to_string(),
             "kind": "terminal",
-            "title": info
-                .as_ref()
-                .map(|info| info.title.to_string())
-                .filter(|title| !title.is_empty()),
+            "title": info.as_ref().and_then(reply_title),
             "working_directory": info
                 .and_then(|info| info.working_directory)
                 .unwrap_or_else(|| cwd.to_path_buf())
@@ -1274,8 +1293,8 @@ mod tests {
             None,
             NoMatchBehavior::Error,
             Timeouts {
-                // Would exit 1 after this long if the check were not up front.
-                panel_load: Duration::from_secs(3600),
+                // Without the up-front check this exits 1 after 1s instead of 4.
+                panel_load: Duration::from_secs(1),
                 ..Timeouts::default()
             },
         )
@@ -1393,8 +1412,11 @@ mod tests {
     fn run_git(args: &[&str], cwd: &Path) {
         let mut command = util::command::new_command("git");
         command
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(args)
             .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "t")
@@ -1450,16 +1472,19 @@ mod tests {
         let dirs = TestDirs::new("git-fallback");
         let (bare, main_wt, feature_wt) = make_bare_layout(&dirs);
 
-        let (toplevel, common_dir) =
-            gpui::block_on(git_toplevel_and_common_dir(&feature_wt.join("crates")))
-                .expect("git should resolve the worktree");
+        let (toplevel, common_dir) = gpui::block_on(git_toplevel_and_common_dir(
+            "git",
+            &feature_wt.join("crates"),
+        ))
+        .expect("git should resolve the worktree");
         assert_eq!(canonical_or_self(&toplevel), canonical_or_self(&feature_wt));
         assert_eq!(canonical_or_self(&common_dir), canonical_or_self(&bare));
-        assert!(gpui::block_on(git_toplevel_and_common_dir(&dirs.root)).is_none());
+        assert!(gpui::block_on(git_toplevel_and_common_dir("git", &dirs.root)).is_none());
 
         // The fallback's common dir must match what an open workspace of the
         // main worktree reports (its repository's common dir).
-        let (_, main_common) = gpui::block_on(git_toplevel_and_common_dir(&main_wt)).unwrap();
+        let (_, main_common) =
+            gpui::block_on(git_toplevel_and_common_dir("git", &main_wt)).unwrap();
         let open = [RawLinked {
             linked_roots: vec![],
             common_dirs: vec![canonical_or_self(&main_common)],
@@ -1658,19 +1683,38 @@ mod tests {
         assert_eq!(terminal_count(cx, &linked_ws), 1);
     }
 
+    #[test]
+    fn test_reply_title_ignores_the_live_shell_title() {
+        let info = |title: &str, custom: Option<&str>| agent_ui::AgentPanelTerminalInfo {
+            id: TerminalId::test_new(),
+            title: title.to_string().into(),
+            created_at: chrono::Utc::now(),
+            has_notification: false,
+            custom_title: custom.map(|title| title.to_string().into()),
+            working_directory: None,
+        };
+        assert_eq!(reply_title(&info("zsh: live shell title", None)), None);
+        assert_eq!(reply_title(&info("zsh", Some(""))), None);
+        assert_eq!(
+            reply_title(&info("zsh: live shell title", Some("my agent"))),
+            Some("my agent".to_string())
+        );
+    }
+
     #[gpui::test]
-    async fn test_reply_title_is_null_unless_given(cx: &mut TestAppContext) {
+    async fn test_reply_title_is_the_given_title_else_null(cx: &mut TestAppContext) {
         let app_state = init_agent_test(cx);
         let dirs = TestDirs::new("title");
         let root = dirs.dir("project");
         insert_dirs(&app_state, &root, json!({})).await;
         let (_window, _workspace) = open_window(cx, &app_state, &root).await;
 
+        // The command sets the shell's live title; it must never be reported.
         let untitled = request(
             cx,
             &app_state,
             &root,
-            None,
+            Some("printf '\\033]0;live-shell-title\\007'"),
             NoMatchBehavior::Error,
             Timeouts::default(),
         )
@@ -1693,11 +1737,78 @@ mod tests {
         .await;
         let titled = Outcome::from(&sink);
         assert_eq!(titled.status, 0, "{titled:?}");
+        assert_eq!(titled.stdout.unwrap()["title"], "my agent");
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_hung_git_fallback_times_out_to_no_match(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let app_state = init_agent_test(cx);
+        let dirs = TestDirs::new("hung-git");
+        let (bare, main_wt, feature_wt) = make_bare_layout(&dirs);
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(
+            &main_wt,
+            json!({
+                ".git": format!("gitdir: {}", bare.join("worktrees/worktree-branch-main").display()),
+                "crates": {},
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            &bare.join("worktrees/worktree-branch-main"),
+            json!({ "commondir": "../..", "HEAD": "ref: refs/heads/main" }),
+        )
+        .await;
+        let (window, _main_ws) = open_window(cx, &app_state, &main_wt).await;
+        wait_for_repo_scan(cx).await;
+
+        let fake_git = dirs.root.join("fake-git");
+        std::fs::write(&fake_git, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program: &'static str =
+            Box::leak(fake_git.to_string_lossy().into_owned().into_boxed_str());
+
+        // Drive the handler by hand and advance the fake clock, so the
+        // timeout is what ends the wait, not the 30s sleep.
+        let started = std::time::Instant::now();
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        let mut handler = Box::pin(handle_new_agent_terminal_with_timeouts(
+            feature_wt.join("crates"),
+            None,
+            None,
+            NoMatchBehavior::Error,
+            app_state.clone(),
+            Timeouts {
+                git: Duration::from_millis(100),
+                git_program: program,
+                ..Timeouts::default()
+            },
+            &sink,
+            &mut async_cx,
+        ));
+        loop {
+            cx.executor().advance_clock(Duration::from_millis(200));
+            cx.run_until_parked();
+            if futures::poll!(handler.as_mut()).is_ready() {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "git timeout not applied"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(handler);
+        let outcome = Outcome::from(&sink);
+        assert_eq!(outcome.status, 3, "{outcome:?}");
         assert!(
-            titled.stdout.unwrap()["title"]
-                .as_str()
-                .is_some_and(|title| title.contains("my agent"))
+            started.elapsed() < Duration::from_secs(5),
+            "git timeout not applied"
         );
+        assert_eq!(workspace_count(cx, window), 1);
     }
 
     #[gpui::test]
