@@ -105,7 +105,6 @@ check_fork_url "$fork_url"
 # State for cleanup.
 tmpdir=""
 wt=""
-keep_branch=false
 branch=""
 cleanup() {
   if [ -n "$wt" ] && [ -d "$wt" ]; then
