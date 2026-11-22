@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# CPZed bundle builder (CPZED-22). Builds a stable-channel, locally signed CPZed.app.
+#
+#   bundle [--n N] [--out DIR] [--dry-run] [--skip-build]
+#   bundle patch-plist <App.app> <cargo-version> <sha> <n>   # plist edits only (testable)
+#
+# Run from the build worktree (worktree-branch-install). Never touches /Applications,
+# global npm, or tracked files (Cargo.toml is edited exactly as script/bundle-mac does
+# and restored by a trap). The updater locks: compile-time ZED_UPDATE_EXPLANATION,
+# Info.plist LSEnvironment, and script/cpzed/selfcheck before and after the build.
+#
+# Environment: CPZED_IDENTITY (default "CPZed Local Signing"), CPZED_STATE
+# (default ~/Library/Application Support/CPZed/state.json), CPZED_TARGET_DIR
+# (default <repo>/target-install).
+#
+# ONE-TIME USER STEP (unattended signing): a self-signed key triggers a keychain "allow"
+# dialog on every codesign unless its partition list permits codesign. The USER runs this
+# in a plain Terminal (not a Zed thread, not a Claude session) and types the login-keychain
+# password at security's own prompt; no -k, so it is never on a command line:
+#   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -l "CPZed Local Signing" ~/Library/Keychains/login.keychain-db
+# `bundle` only READS n (state.json or --n); `deploy` owns and increments state.json.
+# --dry-run reports free disk but does not enforce the 100 GiB guard (a real build does, exit 6).
+# `bundle` probes with a 20 s test codesign and fails (exit 10) instead of hanging.
+# Exit codes: 3 no identity, 4 selfcheck, 5 dirty tree, 6 disk, 7 cargo running (retry),
+# 9 unsafe --out, 10 signing probe, 11 stale binary. --skip-build needs CPZED_TEST_SKIP_BUILD=1.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+IDENTITY=${CPZED_IDENTITY:-CPZed Local Signing}
+STATE=${CPZED_STATE:-$HOME/Library/Application Support/CPZed/state.json}
+EXPLANATION=$("$here/selfcheck" explanation)
+
+# Test mode needs BOTH the --skip-build flag and CPZED_TEST_SKIP_BUILD=1 (set only by
+# test-bundle); it enables the CPZED_CODESIGN / CPZED_TEST_GIT_SHA256 overrides and keeps
+# stub dirs ahead on PATH. It is decided after argument parsing; any other run refuses
+# to start if one of those variables is present (fail closed, never read them).
+testmode=false
+CODESIGN=/usr/bin/codesign
+
+die() { echo "bundle: $1" >&2; exit "${2:-1}"; }
+pb() { /usr/libexec/PlistBuddy "$@"; }
+
+# Set a plist string key, adding it when absent.
+plist_set() { # plist key value
+  pb -c "Set :$2 \"$3\"" "$1" 2>/dev/null || pb -c "Add :$2 string \"$3\"" "$1"
+}
+
+patch_plist() { # app cargo_version sha n
+  local app=$1 ver=$2 sha=$3 n=$4 plist="$1/Contents/Info.plist"
+  [[ -f "$plist" ]] || die "no Info.plist in $app"
+  plist_set "$plist" CFBundleIdentifier dev.zed.Zed
+  plist_set "$plist" CFBundleName CPZed
+  plist_set "$plist" CFBundleDisplayName CPZed
+  plist_set "$plist" CFBundleShortVersionString "$ver-cpzed.$n"
+  plist_set "$plist" CFBundleVersion "${sha:0:7}"
+  # Backup lock: LaunchServices-launched processes get the explanation in their env.
+  pb -c "Delete :LSEnvironment" "$plist" 2>/dev/null || true
+  pb -c "Add :LSEnvironment dict" "$plist"
+  pb -c "Add :LSEnvironment:ZED_UPDATE_EXPLANATION string \"$EXPLANATION\"" "$plist"
+}
+
+if [[ "${1:-}" == patch-plist ]]; then
+  [[ $# -eq 5 ]] || die "usage: bundle patch-plist <App.app> <cargo-version> <sha> <n>" 2
+  patch_plist "$2" "$3" "$4" "$5"; exit 0
+fi
+
+# Resolve a path with symlinks and `..` collapsed; the leaf need not exist.
+realpath_m() { python3 -I -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
+
+# Allowlist (with a denylist as defense in depth). $1=out, $2=target_dir, $3=repo root.
+# Safe to rm -rf only if realpath(target) is strictly inside realpath(root) AND realpath(out)
+# is strictly inside realpath(target). All comparisons are lowercase because APFS is
+# case-insensitive and realpath keeps the caller's spelling.
+check_out() {
+  python3 -I - "$1" "$2" "${3:-$repo}" "$HOME" <<'PY'
+import os, sys
+out, tgt, root, home = sys.argv[1:5]
+def die(m): print("bundle: " + m, file=sys.stderr); sys.exit(1)
+for name, v in (("--out", out), ("target dir", tgt), ("repo root", root)):
+    if not v.startswith("/"): die("%s must be an absolute path: %s" % (name, v))
+rp = lambda p: os.path.realpath(p).lower().rstrip("/") or "/"
+ro, rt, rr, rh = rp(out), rp(tgt), rp(root), rp(home)
+inside = lambda child, parent: child.startswith(parent.rstrip("/") + "/")
+state = rh + "/library/application support/cpzed"
+for p in (ro, rt):
+    if p == "/" or any(p == d or inside(p, d) for d in ("/applications", "/system", "/usr", "/library", "/private/etc", "/private/var/db", "/bin", "/sbin", rh + "/library", state)):
+        die("refusing protected path " + p)
+    if p == rh or os.path.dirname(p) == rh:
+        die("refusing home or a direct child of home: " + p)
+if not inside(rt, rr): die("target dir (%s) must be strictly inside the repo root (%s)" % (rt, rr))
+if not inside(ro, rt): die("--out (%s) must be strictly inside the target dir (%s)" % (ro, rt))
+# Never delete source: neither path may contain tracked files or unmarked untracked work.
+import subprocess
+real = os.path.realpath
+def git(*a):
+    # GIT_ICASE_PATHSPECS: pathspecs are case-sensitive even on a case-insensitive FS, so a
+    # mis-cased spelling of a tracked dir would otherwise match nothing.
+    r = subprocess.run(["git", "-C", real(root)] + list(a), capture_output=True, text=True,
+                       env=dict(os.environ, GIT_ICASE_PATHSPECS="1"))
+    if r.returncode != 0: die("git failed in repo root %s: %s" % (root, r.stderr.strip()))
+    return r.stdout
+for label, path in (("target dir", real(tgt)), ("--out", real(out))):
+    rr_real = real(root); cur = path
+    while len(cur) > len(rr_real):   # lengths, not spelling: the FS is case-insensitive
+        if ".git" in [c.lower() for c in cur[len(rr_real):].split("/")]: die("%s is inside a .git dir: %s" % (label, path))
+        if os.path.lexists(os.path.join(cur, ".git")): die("%s is or contains a nested git repo: %s" % (label, cur))
+        cur = os.path.dirname(cur)
+for label, path, marker in (("target dir", real(tgt), ".metadata_never_index"), ("--out", real(out), ".cpzed-bundle-out")):
+    rel = path[len(real(root)):].lstrip("/") or "."   # allowlist above proved path is inside root (case-insensitively)
+    if git("ls-files", "--", rel).strip(): die("%s contains tracked files: %s" % (label, path))
+    if os.path.exists(path):
+        if not os.path.isdir(path): die("%s is not a directory: %s" % (label, path))
+        if os.listdir(path) and not os.path.exists(os.path.join(path, marker)):
+            if git("status", "--porcelain", "--untracked-files=all", "--", rel).strip():
+                die("%s has untracked work and no %s marker: %s" % (label, marker, path))
+            if label == "--out": die("--out is non-empty and lacks the %s marker, refusing to delete: %s" % (marker, path))
+print(real(out))
+PY
+}
+
+# The release binary must embed the full commit SHA it is about to be stamped with.
+verify_sha_embedded() { # binary sha
+  [[ -f "$1" ]] || { echo "bundle: missing binary $1" >&2; return 1; }
+  grep -aqF -- "$2" "$1" || { echo "bundle: $1 does not embed commit $2 (stale build?); rebuild without --skip-build" >&2; return 1; }
+}
+
+case "${1:-}" in
+  check-out) [[ $# -ge 3 ]] || die "usage: bundle check-out <out> <target_dir> [repo_root]" 2; check_out "$2" "$3" "${4:-$repo}"; exit $? ;;
+  verify-sha) [[ $# -eq 3 ]] || die "usage: bundle verify-sha <binary> <sha>" 2; verify_sha_embedded "$2" "$3"; exit $? ;;
+esac
+
+n_override=""; out=""; dry=false; skip_build=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --n) n_override=${2:?}; shift 2 ;;
+    --out) out=${2:?}; shift 2 ;;
+    --dry-run) dry=true; shift ;;
+    --skip-build)
+      [[ "${CPZED_TEST_SKIP_BUILD:-}" == 1 ]] || die "--skip-build is for tests only; set CPZED_TEST_SKIP_BUILD=1" 2
+      skip_build=true; shift ;;
+    -h|--help) sed -n 2,25p "$0"; exit 0 ;;
+    *) die "unknown argument $1" 2 ;;
+  esac
+done
+
+if $skip_build && [[ "${CPZED_TEST_SKIP_BUILD:-}" == 1 ]]; then testmode=true; fi
+if ! $testmode; then
+  for v in CPZED_CODESIGN CPZED_TEST_GIT_SHA256 CPZED_TEST_SKIP_BUILD; do
+    [[ -z "${!v+x}" ]] || die "$v is set but this is not a test run (needs --skip-build AND CPZED_TEST_SKIP_BUILD=1); refusing to start" 2
+  done
+else
+  CODESIGN=${CPZED_CODESIGN:-/usr/bin/codesign}
+fi
+
+cd "$repo"
+sha=$(git rev-parse HEAD)
+cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/zed/Cargo.toml | head -1)
+[[ -n "$cargo_ver" ]] || die "cannot read crates/zed/Cargo.toml version"
+if [[ -n "$n_override" ]]; then n=$n_override
+elif [[ -f "$STATE" ]]; then n=$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1])).get("n",1))' "$STATE")
+else n=1; fi
+[[ "$n" =~ ^[0-9]+$ ]] || die "n must be an integer, got '$n'"
+target_dir=${CPZED_TARGET_DIR:-$repo/target-install}
+out=${out:-$target_dir/cpzed-out}
+triple=$(rustc --version --verbose | sed -n 's/^host: //p')
+[[ "$triple" == aarch64-apple-darwin || "$triple" == x86_64-apple-darwin ]] || die "unsupported host $triple"
+
+echo "bundle: sha=$sha version=$cargo_ver-cpzed.$n channel=stable target=$target_dir out=$out"
+out=$(check_out "$out" "$target_dir") || die "unsafe --out / target dir (this script rm -rf's the out dir)" 9
+
+# Preflight (all fatal, in this order).
+has_identity=true
+security find-identity -p codesigning 2>/dev/null | grep -qF "\"$IDENTITY\"" || has_identity=false
+tracked_dirty=$(git status --porcelain --untracked-files=no)
+free_gib=$(df -g "$repo" | awk 'NR==2{print $4}')
+echo "bundle: signing identity '$IDENTITY': $($has_identity && echo found || echo MISSING)"
+echo "bundle: free disk: ${free_gib} GiB; tracked changes: ${tracked_dirty:-none}"
+"$here/selfcheck" source >/dev/null || { "$here/selfcheck" source >&2 || true; die "selfcheck source failed: updater gate drifted" 4; }
+$has_identity || die "signing identity '$IDENTITY' not in 'security find-identity -p codesigning'. Create it in Keychain Access (Certificate Assistant > Create a Certificate, type Code Signing, self-signed), then re-run." 3
+[[ -z "$tracked_dirty" ]] || die "tracked files are modified; the build worktree must be clean" 5
+# Unattended-signing probe: a self-signed key shows a keychain "allow" dialog unless its
+# partition list allows codesign. Probe with a timeout so we fail instead of hanging.
+probe=$(mktemp -d); cp /usr/bin/true "$probe/probe"
+if ! perl -e 'alarm 20; exec @ARGV' "$CODESIGN" --force --sign "$IDENTITY" "$probe/probe" >/dev/null 2>&1; then
+  rm -rf "$probe"
+  die "test codesign with '$IDENTITY' failed or hung (likely a keychain permission dialog). The USER must run once in Terminal, typing their login-keychain password themselves: see docs/fork/CPZED-SIGNING.md (bundle --help)." 10
+fi
+rm -rf "$probe"
+if $dry; then echo "bundle: dry run OK (no build, nothing written)"; exit 0; fi
+(( free_gib >= 100 )) || die "only ${free_gib} GiB free; need >= 100 GiB for a release build" 6
+[[ -d "$target_dir" ]] || mkdir -p "$target_dir"
+touch "$target_dir/.metadata_never_index"
+# Only cargo/rustc processes that name OUR target dir count (sccache, other sessions' builds
+# and glider-ci's cargo must not). cargo's own target-dir lock serializes the rest.
+rt_dir=$(realpath_m "$target_dir")
+if ps -axo pid=,command= | awk -v me=$$ '$1 != me' | grep -E '(^| |/)(cargo|rustc)( |$)' | grep -qF -e "$target_dir" -e "${rt_dir#/private}"; then
+  die "a cargo/rustc using $target_dir is running; deploy should retry later" 7
+fi
+
+$testmode || export PATH=$HOME/.cargo/bin:$PATH
+export CARGO_TARGET_DIR=$target_dir CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4
+export ZED_RELEASE_CHANNEL=stable ZED_BUNDLE=true CARGO_BUNDLE_SKIP_BUILD=true
+export ZED_UPDATE_EXPLANATION="$EXPLANATION"   # compile-time lock (option_env!)
+export ZED_COMMIT_SHA=$sha
+export CXXFLAGS="-stdlib=libc++" MACOSX_DEPLOYMENT_TARGET=12.0
+export SDKROOT=${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}
+[[ "$(cargo -q bundle --help 2>&1 | head -n1)" == "cargo-bundle v0.6.1-zed" ]] || die "cargo-bundle v0.6.1-zed required (CPZED-21)"
+
+NICE=(nice -n 15)
+if ! $skip_build; then
+  ALLOW_MISSING_LICENSES=${ALLOW_MISSING_LICENSES:-} "${NICE[@]}" script/generate-licenses
+  "${NICE[@]}" cargo rustc --release --package zed --bin zed --target "$triple" -- -C 'link-arg=-Wl,-unexported_symbol,__R*'
+  "${NICE[@]}" cargo build --release --package cli --target "$triple"
+fi
+
+echo "bundle: assembling"
+for bin in zed cli; do verify_sha_embedded "$target_dir/$triple/release/$bin" "$sha" || die "stale $bin binary" 11; done
+out=$(check_out "$out" "$target_dir") || die "unsafe --out" 9   # resolved path, as validated
+rm -rf -- "$out"; mkdir -p "$out"; touch "$out/.cpzed-bundle-out"
+cp crates/zed/Cargo.toml "$out/Cargo.toml.orig"
+restore() { [[ -f "$out/Cargo.toml.orig" ]] && cp "$out/Cargo.toml.orig" "$repo/crates/zed/Cargo.toml"; }
+trap restore EXIT
+sed -i.bak "s/package.metadata.bundle-stable/package.metadata.bundle/" crates/zed/Cargo.toml
+rm -f crates/zed/Cargo.toml.bak
+app_path=$(cd crates/zed && cargo bundle --release --target "$triple" --select-workspace-root | xargs)
+restore; trap - EXIT
+[[ -d "$app_path" ]] || die "cargo bundle produced no app at '$app_path'"
+
+app="$out/CPZed.app"
+mv "$app_path" "$app"
+cp crates/zed/resources/Document.icns "$app/Contents/Resources/Document.icns" || die "Document.icns copy failed" 12
+
+# Dev icon (identifies the fork build in the Dock) replaces the stable icon.
+icons=$(mktemp -d); mkdir "$icons/z.iconset"
+for s in 16 32 128 256 512; do
+  sips -z $s $s crates/zed/resources/app-icon-dev@2x.png --out "$icons/z.iconset/icon_${s}x${s}.png" >/dev/null
+  sips -z $((s*2)) $((s*2)) crates/zed/resources/app-icon-dev@2x.png --out "$icons/z.iconset/icon_${s}x${s}@2x.png" >/dev/null
+done
+iconutil -c icns "$icons/z.iconset" -o "$app/Contents/Resources/Zed.icns"
+rm -rf "$icons"
+
+cp "$target_dir/$triple/release/zed" "$app/Contents/MacOS/zed"
+cp "$target_dir/$triple/release/cli" "$app/Contents/MacOS/cli"
+
+# Bundled git (same pinned download and SHA-256 as script/bundle-mac).
+gv() { sed -n "s/^$1=\"\(.*\)\"/\1/p" script/bundle-mac | head -1; }
+GIT_VERSION=$(gv GIT_VERSION); GIT_SHA=$(gv GIT_VERSION_SHA)
+if [[ "$triple" == aarch64-apple-darwin ]]; then g_arch=arm64; g_sum=$(gv GIT_ARM64_SHA256); else g_arch=x64; g_sum=$(gv GIT_X64_SHA256); fi
+$testmode && g_sum=${CPZED_TEST_GIT_SHA256:-$g_sum}
+tmp=$(mktemp -d)
+curl --silent --fail --location --max-time 300 --retry 3 --retry-delay 2 --output "$tmp/git.tgz" "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_SHA}-macOS-${g_arch}.tar.gz"
+[[ "$(shasum -a 256 "$tmp/git.tgz" | cut -d' ' -f1)" == "$g_sum" ]] || die "bundled git SHA-256 mismatch"
+tar -xz -C "$tmp" -f "$tmp/git.tgz" bin/git
+mv "$tmp/bin/git" "$app/Contents/MacOS/git"; rm -rf "$tmp"
+
+patch_plist "$app" "$cargo_ver" "$sha" "$n"
+upstream_base=$(git merge-base HEAD origin/main 2>/dev/null || echo unknown)
+python3 -I - "$app/Contents/Resources/cpzed-build.json" "$sha" "$n" "$upstream_base" "$(hostname -s)" <<'PY'
+import json, sys, datetime
+p, sha, n, base, host = sys.argv[1:]
+json.dump({"sha": sha, "n": int(n), "upstream_base": base,
+           "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+           "host": host}, open(p, "w"), indent=2)
+PY
+
+# Signing: no provisioning profile (team-bound), so drop the associated-domains entitlement.
+ent="$out/zed.entitlements"
+sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements > "$ent"
+cs() { perl -e 'alarm 120; exec @ARGV' "$CODESIGN" "$@"; }
+# Same flow as script/bundle-mac: hardened runtime, entitlements on zed and the app.
+for b in cli git; do cs --deep --force --options runtime --sign "$IDENTITY" "$app/Contents/MacOS/$b" -v; done
+cs --deep --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app/Contents/MacOS/zed" -v
+cs --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app" -v
+
+echo "bundle: verifying"
+"$CODESIGN" --verify --deep --strict "$app"
+dv=$("$CODESIGN" -dv "$app" 2>&1)
+grep -qF "Authority=$IDENTITY" <<<"$dv" || die "codesign -dv does not show '$IDENTITY'" 8
+grep -Eq 'flags=0x[0-9a-f]+\(.*runtime' <<<"$dv" || die "codesign -dv does not show the hardened runtime flag" 8
+"$here/selfcheck" app "$app"
+echo "bundle: built $app ($cargo_ver-cpzed.$n, ${sha:0:7})"

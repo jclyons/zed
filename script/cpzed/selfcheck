@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# CPZed updater-lock selfcheck (CPZED-22).
+#
+#   selfcheck source [--file <auto_update.rs>]   # before a build: the gate code is intact
+#   selfcheck app <CPZed.app>                    # after a build: the locks are in the bundle
+#
+# Exit 0 = all checks pass. Non-zero = at least one failed (each failure printed).
+# CPZED_UPDATE_EXPLANATION below is the one place the lock message lives; `bundle`
+# sources this file's value via `selfcheck explanation`.
+set -uo pipefail
+
+CPZED_UPDATE_EXPLANATION="CPZed is a private fork build. It is updated by the CPZed deploy pipeline, not by the stock Zed updater."
+
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+fail=0
+bad() { echo "selfcheck FAIL: $*" >&2; fail=1; }
+ok() { echo "selfcheck ok:   $*"; }
+
+# Fixed-string needles that must each appear in auto_update.rs. Together they pin
+# the polling gate (compile-time AND runtime lock) and the manual-check message.
+SOURCE_NEEDLES=(
+  'if option_env!("ZED_UPDATE_EXPLANATION").is_none()'
+  '&& env::var("ZED_UPDATE_EXPLANATION").is_err()'
+  '&& poll_for_updates'
+  'if let Some(message) = option_env!("ZED_UPDATE_EXPLANATION")'
+  '.or_else(|| env::var("ZED_UPDATE_EXPLANATION").ok())'
+)
+
+check_source() {
+  local file=$1 needle
+  [[ -f "$file" ]] || { bad "missing $file"; return; }
+  for needle in "${SOURCE_NEEDLES[@]}"; do
+    if grep -qF -- "$needle" "$file"; then ok "gate code present: $needle"
+    else bad "gate code changed or missing in $file: $needle"; fi
+  done
+  # The explanation must not be bypassed by an early return before polling starts.
+  local n
+  n=$(grep -cF 'ZED_UPDATE_EXPLANATION' "$file")
+  (( n >= 4 )) || bad "expected >= 4 ZED_UPDATE_EXPLANATION references in $file, found $n"
+}
+
+pb() { /usr/libexec/PlistBuddy -c "$1" "$2" 2>/dev/null; }
+
+check_app() {
+  local app=$1 plist bin
+  plist="$app/Contents/Info.plist"; bin="$app/Contents/MacOS/zed"
+  [[ -f "$plist" && -f "$bin" ]] || { bad "not an app bundle: $app"; return; }
+
+  [[ $(pb 'Print :CFBundleIdentifier' "$plist") == "dev.zed.Zed" ]] && ok "bundle id dev.zed.Zed" || bad "CFBundleIdentifier != dev.zed.Zed"
+  [[ $(pb 'Print :CFBundleName' "$plist") == "CPZed" ]] && ok "CFBundleName CPZed" || bad "CFBundleName != CPZed"
+  [[ $(pb 'Print :CFBundleDisplayName' "$plist") == "CPZed" ]] && ok "CFBundleDisplayName CPZed" || bad "CFBundleDisplayName != CPZed"
+  pb 'Print :CFBundleURLTypes' "$plist" | grep -q '^ *zed$' && ok "zed URL scheme" || bad "zed URL scheme missing"
+
+  local sv bv
+  sv=$(pb 'Print :CFBundleShortVersionString' "$plist"); bv=$(pb 'Print :CFBundleVersion' "$plist")
+  [[ "$sv" =~ ^[0-9]+\.[0-9]+\.[0-9]+-cpzed\.[0-9]+$ ]] && ok "version $sv" || bad "CFBundleShortVersionString '$sv' is not <ver>-cpzed.<n>"
+  [[ "$bv" =~ ^[0-9a-f]{7,40}$ ]] && ok "CFBundleVersion $bv" || bad "CFBundleVersion '$bv' is not a commit SHA"
+
+  local lock
+  lock=$(pb 'Print :LSEnvironment:ZED_UPDATE_EXPLANATION' "$plist")
+  [[ "$lock" == "$CPZED_UPDATE_EXPLANATION" ]] && ok "LSEnvironment backup lock equals the explanation" || bad "LSEnvironment ZED_UPDATE_EXPLANATION missing or differs: '$lock'"
+  local icns
+  for icns in Zed.icns Document.icns; do
+    [[ -s "$app/Contents/Resources/$icns" ]] && ok "$icns present" || bad "$icns missing or empty"
+  done
+
+  # Compile-time lock: the message string must be baked into the binary.
+  if grep -aqF -- "$CPZED_UPDATE_EXPLANATION" "$bin"; then ok "explanation string present in binary"
+  else bad "compile-time ZED_UPDATE_EXPLANATION not found in $bin"; fi
+
+  local stamp="$app/Contents/Resources/cpzed-build.json"
+  if [[ -f "$stamp" ]]; then
+    python3 -I - "$stamp" "$bv" "$sv" <<'PY' && ok "cpzed-build.json consistent" || bad "cpzed-build.json inconsistent with Info.plist"
+import json, sys
+s = json.load(open(sys.argv[1]))
+sha, ver = sys.argv[2], sys.argv[3]
+assert s["sha"].startswith(sha) or sha.startswith(s["sha"]), "sha"
+assert ver.endswith("-cpzed.%s" % s["n"]), "n"
+for k in ("upstream_base", "built_at", "host"):
+    assert s.get(k), k
+PY
+  else bad "cpzed-build.json missing"; fi
+}
+
+case "${1:-}" in
+  explanation) printf '%s\n' "$CPZED_UPDATE_EXPLANATION"; exit 0 ;;
+  source)
+    file="$repo/crates/auto_update/src/auto_update.rs"
+    [[ "${2:-}" == --file ]] && file=${3:?--file needs a path}
+    check_source "$file" ;;
+  app) check_app "${2:?usage: selfcheck app <CPZed.app>}" ;;
+  *) echo "usage: selfcheck source [--file F] | app <CPZed.app> | explanation" >&2; exit 2 ;;
+esac
+exit $fail
