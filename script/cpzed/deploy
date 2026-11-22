@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# script/cpzed/deploy: the unattended CPZed deploy pipeline (CPZED-23; design:
+# designs/cpzed-fork-update-install.md section 5, decisions 11, 12, 15, 16 in designs/DECISIONS.md).
+#
+#   deploy start [run-args]   check the lock, then run `deploy run` fully DETACHED (own session, no TTY,
+#                             survives the parent terminal closing). This is what the sre calls.
+#   deploy run [--first-swap] the pipeline itself, in the foreground (tests, and what `start` execs)
+#   deploy eligible           print the newest eligible fork-main commit (exit 0), or why not
+#   deploy quiescent          the sre's handshake: state.quiescent_at = now (call it every ~60 s while idle)
+#   deploy status             `which`-style summary of state
+#
+# Stages (state.phase): building > staged > gating > snapshot > quitting > swapping > launching > health > done;
+# on a failed health check: rollback (previous build, then stock). Safety rules, all tested in test-deploy:
+#   - every effect goes through an env override so tests use a temp prefix and a dummy app (deploy-lib.sh);
+#   - the app is only ever quit politely and NEVER killed; a refusal aborts, sets `hold`, and notifies;
+#   - the swap is ONE renamex_np(RENAME_SWAP) of a fully staged bundle, after Glider's `ditto -c` finished;
+#   - a hold file stops everything; a lock refuses a second deploy; rm only through `deploy-util swap rm`;
+#   - eligibility only from merged fork-main commits whose PR is clean in merge-ledger.json (eligible);
+#   - a deploy that died after the swap started is NEVER resumed blind: it sets hold and notifies.
+# Exit: 0 deployed | 10 nothing to do / deferred / known-bad sha | 20 rolled back to previous | 21 rolled back to
+#       stock | 30 aborted (hold set or old app relaunched) | 40 rollback impossible, hold | 75 locked | 78 hold file.
+# Extra env: CPZED_REPO (git repo with fork remote), CPZED_LEDGER, CPZED_BUILD_WT, CPZED_BUNDLE_CMD,
+# CPZED_SELFCHECK_CMD, CPZED_VERIFY_CMD, CPZED_SIGN_CMD, CPZED_LSREGISTER_CMD, CPZED_COALESCE_S (1800),
+# CPZED_PREQUIT_DELAY_S (120), CPZED_QUIT_WAIT_S (120), CPZED_FIRST_SWAP_WAIT_S (1800), CPZED_DITTO_WAIT_S (1800).
+set -uo pipefail
+DL_NAME=deploy
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/deploy-lib.sh"
+
+REPO=${CPZED_REPO:-$(cd "$here/../.." && pwd)}
+LEDGER=${CPZED_LEDGER:-$HOME/code/cpzed-sandbox/merge-ledger.json}
+BUILD_WT=${CPZED_BUILD_WT:-$HOME/code/cpzed-sandbox/worktree-branch-install}
+GH=${CPZED_GH_CMD:-gh}
+COALESCE=${CPZED_COALESCE_S:-1800}; PREQUIT=${CPZED_PREQUIT_DELAY_S:-120}; QUIT_WAIT=${CPZED_QUIT_WAIT_S:-120}
+FS_WAIT=${CPZED_FIRST_SWAP_WAIT_S:-1800}; DITTO_WAIT=${CPZED_DITTO_WAIT_S:-1800}
+MBP_NOTE="MBP: CPZed <N> will arrive through Glider in about 10-20 min. Glider replaces it under a running CPZed; quit and reopen CPZed on the MBP after that."
+ZLOG=${CPZED_ZED_LOG:-$HOME/Library/Logs/Zed/Zed.log}
+CLI_LINK=$HOME_DIR/zed-cli
+
+# ------------------------------------------------------------- effects ----
+quit_app() { # polite quit only
+  if [[ -n "${CPZED_QUIT_CMD:-}" ]]; then dl_run CPZED_QUIT_CMD
+  else /usr/bin/osascript -e 'tell application id "dev.zed.Zed" to quit'; fi
+}
+open_app() { # path
+  if [[ -n "${CPZED_OPEN_CMD:-}" ]]; then dl_run CPZED_OPEN_CMD "$1"; else /usr/bin/open -a "$1"; fi
+}
+sign_app() { # app: re-seal after a re-stamp, keeping the existing entitlements
+  if [[ -n "${CPZED_SIGN_CMD:-}" ]]; then dl_run CPZED_SIGN_CMD "$1"; return; fi
+  local ent; ent=$(mktemp "${TMPDIR:-/tmp}/cpzed-ent.XXXXXX")
+  /usr/bin/codesign -d --entitlements :- "$1" >"$ent" 2>/dev/null || true
+  perl -e 'alarm 120; exec @ARGV' /usr/bin/codesign --force --options runtime --entitlements "$ent" \
+    --sign "${CPZED_IDENTITY:-CPZed Local Signing}" "$1"; local rc=$?
+  rm -f "$ent"; return $rc
+}
+verify_app() { # app
+  if [[ -n "${CPZED_VERIFY_CMD:-}" ]]; then dl_run CPZED_VERIFY_CMD "$1"; else /usr/bin/codesign --verify --deep --strict "$1"; fi
+}
+lsreg() {
+  if [[ -n "${CPZED_LSREGISTER_CMD:-}" ]]; then dl_run CPZED_LSREGISTER_CMD -f "$1" || true
+  else /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$1" >/dev/null 2>&1 || true; fi
+}
+retarget_cli() { # cli path; atomic retarget of the user-owned link
+  mkdir -p "$HOME_DIR"; ln -sfn "$1" "$CLI_LINK.new" && mv -f "$CLI_LINK.new" "$CLI_LINK"
+}
+log_size() { stat -f %z "$ZLOG" 2>/dev/null || echo 0; }
+glider_archiving() { pgrep -f "ditto -c.*CPZed\.app" >/dev/null 2>&1; }
+thread_count() { # app -> count (0 when the app is not answering)
+  local o c; o=$(mktemp "${TMPDIR:-/tmp}/cpzed-th.XXXXXX")
+  if [[ -n "$(port_pid)" ]] && perl -e 'alarm 30; exec @ARGV' "$1/Contents/MacOS/cli" --agent-list >"$o" 2>/dev/null; then c=$(util json-count "$o" || echo 0); else c=0; fi
+  rm -f "$o"; echo "${c:-0}"
+}
+rm_in() { util swap rm "$1" "$2"; }   # the only way this script deletes anything
+
+# Politely quit and wait; 0 = exited, 1 = refused (nothing was killed).
+quit_and_wait() {
+  local pid; pid=$(port_pid)
+  [[ -n "$pid" ]] || return 0
+  quit_app >/dev/null 2>&1 || true
+  local end=$(( $(ts) + QUIT_WAIT ))
+  while (( $(ts) < end )); do
+    if [[ -z "$(port_pid)" ]] && ! pid_alive "$pid"; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- lock ----
+LOCK_HELD=0; CHILD=
+lock_acquire() {
+  mkdir -p "$HOME_DIR"
+  local i op
+  for i in 1 2; do
+    if ( set -o noclobber; echo "$$" > "$LOCK" ) 2>/dev/null; then LOCK_HELD=1; return 0; fi
+    op=$(cat "$LOCK" 2>/dev/null || true)
+    if pid_alive "$op"; then return 1; fi
+    # stale: rename it away (atomic, one taker wins), then retry
+    mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null && rm -f "$LOCK.stale.$$"
+  done
+  return 1
+}
+lock_release() { [[ $LOCK_HELD == 1 && "$(cat "$LOCK" 2>/dev/null)" == "$$" ]] && rm -f "$LOCK"; LOCK_HELD=0; }
+
+# --------------------------------------------------------------- stages ---
+relaunch_old() { # best effort: bring the app that was quit back
+  local target=$1
+  [[ -d "$target" ]] && open_app "$target" || true
+}
+
+abort_deploy() { # msg [hold]  -> exit 30
+  local msg=$1 holdit=${2:-}
+  [[ -n "$holdit" ]] && hold_set "$msg"
+  st_set phase "aborted"; notify abort "CPZed deploy aborted: $msg"
+  exit 30
+}
+
+make_resume_text() {
+  local r; r=$(util resume "$STATE")
+  if [[ -n "$r" ]]; then printf 'Resume list (sessions interrupted by the restart):\n%s\n' "$r"
+  else printf 'Resume list: no claude sessions were running under the app.\n'; fi
+}
+
+do_rollback() { # reason ; never returns
+  local reason=$1 failed_n failed_sha prev n2 pre_threads prev_sha prev_zip
+  failed_n=$(st_get build_n); failed_sha=$(st_get target_sha); pre_threads=$(st_get pre_threads); pre_threads=${pre_threads:-0}
+  st_set phase rollback; st_set failed_sha "$failed_sha"
+  log "ROLLBACK: $reason"
+  notify rollback "CPZed $failed_n failed its health check ($reason); rolling back"
+  quit_and_wait || { hold_set "rollback: app refused to quit"; notify urgent "CPZed rollback blocked: the app will not quit. Hold set; nothing was killed."; exit 40; }
+  prev=""
+  if [[ -d "$STAGE_DIR/CPZed.app" && "$(st_get first_swap)" != 1 ]]; then prev=$STAGE_DIR/CPZed.app
+  else
+    prev_zip=$(ls -1t "$HOME_DIR/ring"/*.zip 2>/dev/null | while read -r z; do
+      zn=$(basename "$z" | cut -d- -f1); [[ "$zn" =~ ^[0-9]+$ && "$zn" != "$failed_n" ]] && { echo "$z"; break; }; done)
+    if [[ -n "$prev_zip" && "$(st_get first_swap)" != 1 ]]; then
+      mkdir -p "$STAGE_DIR/x"; ditto -x -k "$prev_zip" "$STAGE_DIR/x" && [[ -d "$STAGE_DIR/x/CPZed.app" ]] || true
+      if [[ -d "$STAGE_DIR/x/CPZed.app" ]]; then
+        rm_in "$STAGE_DIR/CPZed.app" "$STAGE_DIR" 2>/dev/null
+        util swap rename "$STAGE_DIR/x/CPZed.app" "$STAGE_DIR/CPZed.app" && prev=$STAGE_DIR/CPZed.app
+      fi
+    fi
+  fi
+  if [[ -n "$prev" ]]; then
+    n2=$(st_get n); st_set n $((n2 + 1))                         # re-stamp n+1, never reusing a number
+    prev_sha=$(app_sha "$prev")
+    if util restamp "$prev" "$n2" "$prev_sha" && sign_app "$prev" && verify_app "$prev" \
+       && util swap exchange "$prev" "$APP"; then
+      lsreg "$APP"; retarget_cli "$APP/Contents/MacOS/cli"
+      local off; off=$(log_size); open_app "$APP"
+      if "$here/health" --app "$APP" --n "$n2" --sha "$prev_sha" --min-threads "$pre_threads" --log-offset "$off" >"$LOGDIR/health-rollback.out" 2>&1; then
+        st_hist "{\"kind\":\"rollback\",\"n\":$n2,\"sha\":\"$prev_sha\",\"at\":$(ts)}"
+        st_set phase rolled-back; st_set deployed_sha "$prev_sha"
+        notify rollback "CPZed rolled back to $n2 (build ${prev_sha:0:7}): $reason. $(make_resume_text)"
+        exit 20
+      fi
+      log "previous build failed its health check too: $(tail -1 "$LOGDIR/health-rollback.out")"
+      quit_and_wait || { hold_set "rollback: previous build refused to quit"; notify urgent "CPZed rollback blocked: nothing was killed. Hold set."; exit 40; }
+    else
+      log "previous build could not be restored (restamp/sign/verify/swap failed)"
+    fi
+  fi
+  # level 2: stock
+  local sz
+  sz=$("$here/backup" latest-stock 2>/dev/null || true)
+  if [[ ! -d "$STOCK_APP" ]]; then
+    if [[ -n "$sz" ]]; then
+      mkdir -p "$HOME_DIR/tmp"; local x; x=$(mktemp -d "$HOME_DIR/tmp/stock.XXXXXX")
+      if ditto -x -k "$sz" "$x" && [[ -d "$x/Zed.app" ]] && verify_app "$x/Zed.app"; then
+        # stage on the same volume as /Applications, then rename in (nothing exists at Zed.app)
+        mkdir -p "$STAGE_DIR"; rm_in "$STAGE_DIR/Zed.app" "$STAGE_DIR" 2>/dev/null
+        ditto "$x/Zed.app" "$STAGE_DIR/Zed.app" && util swap rename "$STAGE_DIR/Zed.app" "$STOCK_APP"
+      fi
+      rm_in "$x" "$HOME_DIR/tmp" || true
+    fi
+  fi
+  if [[ -d "$STOCK_APP" ]]; then
+    retarget_cli "$STOCK_APP/Contents/MacOS/cli"; lsreg "$STOCK_APP"
+    open_app "$STOCK_APP"
+    local end=$(( $(ts) + ${CPZED_HEALTH_BUDGET_S:-90} ))
+    while (( $(ts) < end )); do [[ -n "$(port_pid)" ]] && break; sleep 1; done
+    if [[ -n "$(port_pid)" ]]; then
+      hold_set "rolled back to stock Zed; investigate before clearing"
+      st_hist "{\"kind\":\"rollback-stock\",\"at\":$(ts)}"; st_set phase rolled-back-stock
+      notify urgent "CPZed $failed_n and the previous build both failed ($reason). Stock Zed is running again. Hold set. The failed CPZed.app is still at $APP."
+      exit 21
+    fi
+  fi
+  hold_set "all rollbacks failed"
+  st_set phase rollback-failed
+  notify urgent "CPZed deploy FAILED and no rollback worked ($reason). Hold set. Backups are untouched: $HOME_DIR/backup, $HOME_DIR/stock."
+  exit 40
+}
+
+run_pipeline() { # args: [--first-swap]
+  local first=0
+  [[ "${1:-}" == --first-swap ]] && first=1
+  dl_init
+  hold_active && { echo "deploy: hold file present: $(head -1 "$HOLD")" >&2; exit 78; }
+  lock_acquire || { echo "deploy: another deploy is running (pid $(cat "$LOCK" 2>/dev/null))" >&2; exit 75; }
+  trap 'lock_release' EXIT
+  trap '[[ -n "${CHILD:-}" ]] && kill "$CHILD" 2>/dev/null; lock_release; exit 143' TERM INT HUP
+
+  # A dead deploy: restart only if it never touched the app.
+  local ph; ph=$(st_get phase)
+  case "$ph" in
+    swapping|launching|health|rollback) hold_set "a previous deploy died in phase '$ph'; inspect $APP and the logs"
+      notify urgent "CPZed deploy: a previous run died during '$ph'. Hold set, nothing was touched. Inspect $APP."; exit 30;;
+  esac
+  ((first)) && [[ -e "$APP" ]] && { echo "deploy: --first-swap but $APP already exists" >&2; exit 30; }
+  ((! first)) && [[ ! -d "$APP" ]] && { echo "deploy: $APP is missing; use --first-swap for the first install" >&2; exit 30; }
+
+  # ---- eligibility, coalesce, interval ----
+  git -C "$REPO" fetch -q fork main 2>/dev/null || log "fetch fork main failed; using the local ref"
+  local deployed target rc
+  deployed=$(st_get deployed_sha)
+  target=$(util eligible "$REPO" "$LEDGER" "$GH" --base fork/main ${deployed:+--deployed "$deployed"} --quiet-s "$COALESCE"); rc=$?
+  if (( rc != 0 )); then log "no deploy: $target"; echo "$target"; exit 10; fi
+  [[ "$target" == "$(st_get failed_sha)" ]] && { log "no deploy: $target failed before"; echo "known-bad sha $target"; exit 10; }
+  if ! ((first)); then
+    local why; why=$(util interval "$STATE" "${CPZED_MIN_INTERVAL_S:-14400}" "${CPZED_MAX_PER_DAY:-2}") || { log "deferred: $why"; echo "$why"; exit 10; }
+  fi
+
+  # ---- build, verify, stage (skipped when a valid staged bundle for this sha exists) ----
+  local n staged=0
+  if [[ "$ph" =~ ^(staged|gating|snapshot|quitting)$ && "$(st_get target_sha)" == "$target" && -d "$STAGE_DIR/CPZed.app" \
+        && "$(app_sha "$STAGE_DIR/CPZed.app")" == "$target" ]]; then
+    staged=1; n=$(st_get build_n); log "resuming with staged build n=$n"
+  fi
+  if ((! staged)); then
+    st_set phase building; st_set target_sha "$target"; st_set first_swap "$first"
+    n=$(st_get n); n=${n:-1}; st_set n $((n + 1)); st_set build_n "$n"
+    local out
+    if [[ -n "${CPZED_BUNDLE_CMD:-}" ]]; then
+      out=$HOME_DIR/tmp/bundle-out; mkdir -p "$HOME_DIR/tmp"; export CPZED_TEST_BUNDLE_OUT=$out CPZED_TEST_SHA=$target CPZED_TEST_N=$n
+      rm_in "$out" "$HOME_DIR/tmp" 2>/dev/null; dl_run CPZED_BUNDLE_CMD; rc=$?
+    else
+      git -C "$BUILD_WT" switch -q --detach "$target" || abort_deploy "cannot check out $target in $BUILD_WT"
+      out=${CPZED_BUNDLE_OUT:-$BUILD_WT/target-install/cpzed-out}
+      while :; do
+        ( cd "$BUILD_WT" && nice -n 15 env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4 script/cpzed/bundle --n "$n" ); rc=$?
+        (( rc == 7 || rc == 6 )) || break
+        hold_active && exit 78
+        log "bundle waiting (exit $rc: cargo running or low disk)"; sleep "${CPZED_BUILD_RETRY_S:-300}"
+      done
+    fi
+    if (( rc == 10 )); then abort_deploy "CPZed signing key not usable unattended: run the partition-list step (docs: designs/cpzed-fork-update-install.md, Signing key setup)" hold; fi
+    (( rc == 0 )) || { st_set failed_sha "$target"; abort_deploy "bundle failed (exit $rc) for ${target:0:7}"; }
+    local app=$out/CPZed.app
+    [[ -d "$app" ]] || abort_deploy "bundle produced no $app"
+    [[ "$(app_sha "$app")" == "$target" && "$(app_n "$app")" == "$n" ]] || { st_set failed_sha "$target"; abort_deploy "build stamp (sha $(app_sha "$app"), n $(app_n "$app")) does not match ${target:0:7}/$n"; }
+    verify_app "$app" || { st_set failed_sha "$target"; abort_deploy "codesign verification failed for the new build"; }
+    if [[ -n "${CPZED_SELFCHECK_CMD:-}" ]]; then dl_run CPZED_SELFCHECK_CMD app "$app" || { st_set failed_sha "$target"; abort_deploy "selfcheck failed (updater locks missing)"; }
+    else [[ -x "$here/selfcheck" ]] || abort_deploy "script/cpzed/selfcheck is missing"
+      "$here/selfcheck" app "$app" || { st_set failed_sha "$target"; abort_deploy "selfcheck failed (updater locks missing)"; }; fi
+    mkdir -p "$STAGE_DIR"
+    rm_in "$STAGE_DIR/CPZed.app" "$STAGE_DIR" || abort_deploy "cannot clear the stage dir"
+    ditto "$app" "$STAGE_DIR/CPZed.app" || abort_deploy "staging copy failed"
+    [[ "$(app_sha "$STAGE_DIR/CPZed.app")" == "$target" ]] || abort_deploy "staged copy does not match"
+    "$here/backup" ring-add "$STAGE_DIR/CPZed.app" >/dev/null || abort_deploy "ring zip failed"
+    st_set phase staged
+    notify ready "CPZed $n/${target:0:7} ready, will restart when sessions are idle"
+  fi
+
+  # ---- gate, snapshot, pre-quit notice, re-gate ----
+  local sessions_msg
+  while :; do
+    st_set phase gating
+    "$here/gate" wait & CHILD=$!; wait "$CHILD"; rc=$?; CHILD=
+    (( rc == 2 )) && exit 78
+    st_set phase snapshot
+    local main; main=$(port_pid)
+    st_setj sessions "$( [[ -n "$main" ]] && util claudes "$main" || echo '[]')"
+    local cur_app=$APP; ((first)) && cur_app=$STOCK_APP
+    st_set pre_threads "$(thread_count "$cur_app")"
+    "$here/backup" data >/dev/null || abort_deploy "pre-quit data backup failed"
+    sessions_msg=$(util resume "$STATE" | paste -sd';' -)
+    notify restarting "CPZed restarting in $(awk -v p="$PREQUIT" 'BEGIN{printf "%d", p/60+0.5}') min (build $n). Sessions about to be interrupted: ${sessions_msg:-none}"
+    sleep "$PREQUIT"
+    if "$here/gate" check >/dev/null 2>&1; then break; fi
+    log "gate failed right before the quit; back to waiting"
+    st_set quiescent_at 0
+  done
+
+  # Wait out any Glider archive of the current bundle BEFORE quitting (and again before the swap).
+  local end=$(( $(ts) + DITTO_WAIT ))
+  while glider_archiving && (( $(ts) < end )); do sleep 2; done
+  glider_archiving && abort_deploy "Glider is still archiving CPZed.app; nothing was quit"
+
+  # ---- quit (polite, never forced) ----
+  st_set phase quitting
+  local old_app=$APP; ((first)) && old_app=$STOCK_APP
+  if ! quit_and_wait; then
+    abort_deploy "CPZed quit blocked: the app is still running after ${QUIT_WAIT}s (a save dialog?). Not forced. Resolve it, then clear the hold." hold
+  fi
+
+  # ---- first swap: the user removes stock with sudo; we never run sudo ----
+  if ((first)); then
+    st_set phase "waiting-first-swap"; rm -f "$HOME_DIR/first-swap-confirm"
+    local l1="sudo rm -rf \"$STOCK_APP\""
+    notify first-swap "CPZed first swap: stock Zed is quit. Run this in a plain Terminal, then create the marker: $l1  &&  touch \"$HOME_DIR/first-swap-confirm\""
+    echo "FIRST SWAP: run:  $l1"; echo "then:  touch \"$HOME_DIR/first-swap-confirm\""
+    local fend=$(( $(ts) + FS_WAIT ))
+    while [[ ! -e "$HOME_DIR/first-swap-confirm" ]] && (( $(ts) < fend )); do sleep 1; done
+    if [[ ! -e "$HOME_DIR/first-swap-confirm" ]]; then
+      relaunch_old "$STOCK_APP"; abort_deploy "first swap timed out waiting for the user's confirm marker; stock relaunched" hold
+    fi
+    rm -f "$HOME_DIR/first-swap-confirm"
+    if [[ -e "$STOCK_APP" ]]; then relaunch_old "$STOCK_APP"; abort_deploy "first swap: $STOCK_APP is still present after the confirm marker; stock relaunched" hold; fi
+  fi
+
+  # ---- swap: ONE atomic exchange of a fully staged bundle ----
+  local send=$(( $(ts) + 600 ))
+  while glider_archiving && (( $(ts) < send )); do sleep 2; done
+  if glider_archiving; then relaunch_old "$old_app"; abort_deploy "Glider started archiving CPZed.app during the quit; old build relaunched, nothing swapped"; fi
+  st_set phase swapping
+  if ((first)); then
+    util swap rename "$STAGE_DIR/CPZed.app" "$APP" || { st_set phase aborted; hold_set "first swap rename failed"; notify urgent "CPZed first swap rename failed; hold set."; exit 30; }
+  else
+    util swap exchange "$STAGE_DIR/CPZed.app" "$APP" || { relaunch_old "$APP"; abort_deploy "atomic swap failed; old build relaunched"; }
+  fi
+  lsreg "$APP"; retarget_cli "$APP/Contents/MacOS/cli"
+
+  # ---- relaunch + health ----
+  st_set phase launching
+  local off; off=$(log_size)
+  open_app "$APP" || true
+  st_set phase health
+  local hout; hout=$("$here/health" --app "$APP" --n "$n" --sha "$target" --min-threads "$(st_get pre_threads)" --log-offset "$off" 2>&1); rc=$?
+  if (( rc != 0 )); then do_rollback "$(tail -1 <<<"$hout")"; fi
+
+  # ---- pass ----
+  rm_in "$STAGE_DIR/CPZed.app" "$STAGE_DIR" 2>/dev/null || true
+  st_hist "{\"kind\":\"deploy\",\"n\":$n,\"sha\":\"$target\",\"at\":$(ts)}"
+  st_set deployed_sha "$target"; st_set phase done; st_del failed_sha
+  local prompts=""
+  grep -q '^prompts_pending=1' <<<"$hout" && prompts=$'\nKeychain/privacy prompts pending: answer Always Allow, or re-sign in.'
+  local fs=""
+  ((first)) && fs=$'\nNow type once (needs sudo): sudo ln -sfn ~/Library/Application\\ Support/CPZed/zed-cli /usr/local/bin/zed'
+  notify running "CPZed $n running (build ${target:0:7}).${prompts}${fs}
+$(make_resume_text)
+${MBP_NOTE//<N>/$n}"
+  exit 0
+}
+
+case "${1:-}" in
+  run) shift; run_pipeline "$@" ;;
+  start) shift
+    dl_init
+    hold_active && { echo "deploy: hold file present: $(head -1 "$HOLD")" >&2; exit 78; }
+    op=$(cat "$LOCK" 2>/dev/null || true)
+    pid_alive "$op" && { echo "deploy: another deploy is running (pid $op)" >&2; exit 75; }
+    "$here/detach" --pidfile "$HOME_DIR/deploy.pid" "$LOGDIR/deploy-run.log" -- "$here/deploy" run "$@"
+    echo "deploy: started detached; log $LOGDIR/deploy-run.log" ;;
+  eligible) dl_init
+    git -C "$REPO" fetch -q fork main 2>/dev/null || true
+    d=$(st_get deployed_sha)
+    util eligible "$REPO" "$LEDGER" "$GH" --base fork/main ${d:+--deployed "$d"} --quiet-s "$COALESCE" ;;
+  quiescent) dl_init; st_set quiescent_at "$(ts)" ;;
+  status) exec "$here/which" ;;
+  *) sed -n 2,12p "$0" >&2; exit 64 ;;
+esac

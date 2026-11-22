@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# script/cpzed/detach: run a command fully detached from the calling terminal (CPZED-23).
+#
+#   detach [--pidfile FILE] <log> -- <cmd> [args...]
+#
+# The command gets its own session and process group (perl POSIX::setsid), no controlling TTY,
+# stdin from /dev/null and stdout/stderr appended to <log>; `nohup` is a second guard against
+# SIGHUP. It therefore survives the parent terminal (a Zed terminal thread, an ssh session)
+# closing. macOS has no setsid(1). Prints nothing; with --pidfile the detached pid is written
+# there (the pid is the command's own, since perl execs it).
+set -euo pipefail
+pidfile=""
+if [[ "${1:-}" == --pidfile ]]; then pidfile=${2:?}; shift 2; fi
+[[ $# -ge 3 && "$2" == -- ]] || { echo "usage: detach [--pidfile FILE] <log> -- <cmd> [args...]" >&2; exit 2; }
+log=$1; shift 2
+mkdir -p "$(dirname "$log")"
+nohup perl -MPOSIX -e '
+  my ($log, $pidfile, @cmd) = @ARGV;
+  fork and exit 0;
+  POSIX::setsid() or die "setsid: $!";
+  open STDIN, "<", "/dev/null";
+  open STDOUT, ">>", $log or die "log: $!";
+  open STDERR, ">&", \*STDOUT;
+  if ($pidfile ne "") { open my $f, ">", $pidfile or die "pidfile: $!"; print $f "$$\n"; close $f; }
+  exec { $cmd[0] } @cmd or die "exec: $!";
+' "$log" "$pidfile" "$@" >/dev/null 2>&1 </dev/null &
+disown 2>/dev/null || true

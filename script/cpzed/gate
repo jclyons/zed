@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# script/cpzed/gate: the quiescence gate before CPZed is quit (CPZED-23, design section 5 step 3).
+#
+#   gate check              one evaluation; prints one reason per line when busy; exit 0 quiet, 1 busy, 2 hold
+#   gate wait [--timeout S] repeat until the gate passes TWICE in a row, CPZED_GATE_INTERVAL_S apart.
+#                           Never forces: it only waits. Sends the "still waiting" notice every
+#                           CPZED_GATE_NOTICE_S (default 4 h) and keeps waiting. --timeout is for tests
+#                           and callers that want control back (exit 3); it does nothing to the app.
+#
+# A pass requires ALL of:
+#   - no hold file;
+#   - the minimum interval (4 h) and daily cap (2) between deploys allow it;
+#   - no build/test descendant under the app (cargo, rustc, cc, ld, xcodebuild, swift, npm, pnpm,
+#     pytest, nextest, git except fsmonitor);
+#   - state.quiescent_at (written by the sre after ListAgents says every local session is idle) is at
+#     most CPZED_QUIESCENT_MAX_S (120) old and not in the future;
+#   - every claude descendant used under 2% CPU over CPZED_GATE_CPU_WINDOW_S (60);
+#   - HID idle >= CPZED_HID_MIN_S (600).
+# No instance listening on the port means there is nothing to interrupt: the process checks pass.
+set -uo pipefail
+DL_NAME=gate
+. "$(cd "$(dirname "$0")" && pwd)/deploy-lib.sh"
+dl_init
+
+MIN_INTERVAL=${CPZED_MIN_INTERVAL_S:-14400}; PER_DAY=${CPZED_MAX_PER_DAY:-2}
+Q_MAX=${CPZED_QUIESCENT_MAX_S:-120}; CPU_WIN=${CPZED_GATE_CPU_WINDOW_S:-60}
+HID_MIN=${CPZED_HID_MIN_S:-600}; INTERVAL=${CPZED_GATE_INTERVAL_S:-60}; NOTICE=${CPZED_GATE_NOTICE_S:-14400}
+
+hid_idle() {
+  if [[ -n "${CPZED_HID_IDLE_CMD:-}" ]]; then dl_run CPZED_HID_IDLE_CMD 2>/dev/null
+  else /usr/sbin/ioreg -c IOHIDSystem 2>/dev/null | awk '/HIDIdleTime/{printf "%d\n", $NF/1000000000; exit}'; fi
+}
+
+# prints reasons; returns 0 when quiet
+check_once() {
+  local reasons=() main out q now idle
+  hold_active && { echo "hold file present: $(head -1 "$HOLD")"; return 2; }
+  out=$(util interval "$STATE" "$MIN_INTERVAL" "$PER_DAY") || reasons+=("$out")
+  main=$(port_pid)
+  if [[ -n "$main" ]]; then
+    out=$(util busy "$main")
+    [[ -z "$out" ]] || while IFS= read -r l; do reasons+=("build/test running under app: $l"); done <<<"$out"
+  fi
+  q=$(st_get quiescent_at); now=$(ts)
+  if [[ ! "$q" =~ ^[0-9]+$ ]]; then reasons+=("no quiescent_at handshake from the sre")
+  elif (( now - q > Q_MAX )); then reasons+=("quiescent_at is stale ($((now - q))s old, max ${Q_MAX}s)")
+  elif (( q - now > 5 )); then reasons+=("quiescent_at is in the future")
+  fi
+  idle=$(hid_idle)
+  if [[ ! "$idle" =~ ^[0-9]+$ ]]; then reasons+=("cannot read HID idle time")
+  elif (( idle < HID_MIN )); then reasons+=("user active: HID idle ${idle}s < ${HID_MIN}s"); fi
+  if [[ -n "$main" ]]; then
+    local cl pids before after
+    cl=$(util claudes "$main")
+    pids=$(python3 -I -c 'import json,sys;print(" ".join(str(c["pid"]) for c in json.loads(sys.argv[1])))' "$cl")
+    if [[ -n "$pids" ]]; then
+      before=$(util cpu $pids); sleep "$CPU_WIN"; after=$(util cpu $pids)
+      while read -r pid cpu; do
+        [[ -n "$pid" ]] || continue
+        b=$(awk -v p="$pid" '$1==p{print $2}' <<<"$before")
+        [[ -n "$b" ]] || continue
+        pct=$(awk -v a="$cpu" -v b="$b" -v w="$CPU_WIN" 'BEGIN{printf "%.1f", (a-b)/w*100}')
+        awk -v p="$pct" 'BEGIN{exit !(p>=2.0)}' && reasons+=("claude pid $pid used ${pct}% CPU over ${CPU_WIN}s")
+      done <<<"$after"
+    fi
+  fi
+  ((${#reasons[@]} == 0)) && return 0
+  printf '%s\n' "${reasons[@]}"; return 1
+}
+
+case "${1:-}" in
+  check) check_once; exit $? ;;
+  wait)
+    timeout=""; [[ "${2:-}" == --timeout ]] && timeout=${3:?}
+    start=$(ts); last_notice=$start; passes=0
+    while :; do
+      out=$(check_once); rc=$?
+      if (( rc == 2 )); then echo "$out"; exit 2; fi
+      if (( rc == 0 )); then
+        passes=$((passes + 1)); log "gate pass $passes/2"
+        (( passes >= 2 )) && exit 0
+      else
+        passes=0; log "gate busy: ${out//$'\n'/; }"
+        if (( $(ts) - last_notice >= NOTICE )); then
+          notify waiting "CPZed still waiting for quiet: ${out//$'\n'/; }"; last_notice=$(ts)
+        fi
+      fi
+      if [[ -n "$timeout" ]] && (( $(ts) - start >= timeout )); then echo "$out"; exit 3; fi
+      sleep "$INTERVAL"
+    done ;;
+  *) echo "usage: gate check | gate wait [--timeout S]" >&2; exit 64 ;;
+esac
