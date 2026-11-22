@@ -14,6 +14,9 @@ ln -s /Applications "$tgt/link-apps"; ln -s "$HOME" "$tgt/link-home"
 FH=$T/home; root=$FH/code/cpzed-sandbox/wt; tgt=$root/target-install
 mkdir -p "$tgt/inside" "$FH/Library/Application Support/CPZed" "$FH/code/cpzed-sandbox/zed.git"
 ln -s /Applications "$tgt/link-apps"; ln -s "$FH" "$tgt/link-home"
+mkdir -p "$root/script/cpzed" "$FH/code/cpzed-sandbox/wt/untracked-work"; touch "$tgt/.metadata_never_index"
+echo x > "$root/script/cpzed/tracked.sh"; echo y > "$root/untracked-work-file"
+git -C "$root" init -q && git -C "$root" add script && git -C "$root" -c user.name=t -c user.email=t@t commit -qm init
 co() { HOME=$FH "$here/bundle" check-out "$@"; }
 t "out inside target ok"             ok   co "$tgt/inside/o" "$tgt" "$root"
 t "default-style out ok"             ok   co "$tgt/cpzed-out" "$tgt" "$root"
@@ -34,6 +37,16 @@ t "symlink to HOME"                  fail co "$tgt/link-home/x" "$tgt" "$root"
 t "out == target itself"             fail co "$tgt" "$tgt" "$root"
 t "target == repo root itself"       fail co "$root/x" "$root" "$root"
 t "target outside repo root"         fail co "$T/elsewhere/o" "$T/elsewhere" "$root"
+t "N1 target == repo/script (tracked)"  fail co "$root/script/cpzed" "$root/script" "$root"
+t "N1 out == repo/script/cpzed (tracked)" fail co "$root/script/cpzed" "$tgt" "$root"
+mkdir -p "$tgt/work"; echo u > "$tgt/work/untracked.txt"
+t "N1 out with untracked file, no marker" fail co "$tgt/work" "$tgt" "$root"
+mkdir -p "$root/plain"; echo u > "$root/plain/untracked.txt"
+t "N1 target with untracked work, no marker" fail co "$root/plain/o" "$root/plain" "$root"
+mkdir -p "$tgt/prev"; touch "$tgt/prev/.cpzed-bundle-out" "$tgt/prev/file"
+t "out with our marker is ok"           ok   co "$tgt/prev" "$tgt" "$root"
+got=$(HOME=$FH "$here/bundle" check-out "$tgt/inside/../inside/o" "$tgt" "$root" 2>/dev/null); want=$(python3 -I -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$tgt/inside/o")
+t "N2 returns the resolved path (not the caller spelling)" ok test "$got" = "$want"
 t "--skip-build without env guard"  fail "$here/bundle" --skip-build --dry-run
 
 sha=0123456789abcdef0123456789abcdef01234567

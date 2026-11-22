@@ -81,6 +81,23 @@ for p in (ro, rt):
         die("refusing home or a direct child of home: " + p)
 if not inside(rt, rr): die("target dir (%s) must be strictly inside the repo root (%s)" % (rt, rr))
 if not inside(ro, rt): die("--out (%s) must be strictly inside the target dir (%s)" % (ro, rt))
+# Never delete source: neither path may contain tracked files or unmarked untracked work.
+import subprocess
+real = os.path.realpath
+def git(*a):
+    r = subprocess.run(["git", "-C", real(root)] + list(a), capture_output=True, text=True)
+    if r.returncode != 0: die("git failed in repo root %s: %s" % (root, r.stderr.strip()))
+    return r.stdout
+for label, path, marker in (("target dir", real(tgt), ".metadata_never_index"), ("--out", real(out), ".cpzed-bundle-out")):
+    rel = os.path.relpath(path, real(root))
+    if git("ls-files", "--", rel).strip(): die("%s contains tracked files: %s" % (label, path))
+    if os.path.exists(path):
+        if not os.path.isdir(path): die("%s is not a directory: %s" % (label, path))
+        if os.listdir(path) and not os.path.exists(os.path.join(path, marker)):
+            if git("status", "--porcelain", "--untracked-files=all", "--", rel).strip():
+                die("%s has untracked work and no %s marker: %s" % (label, marker, path))
+            if label == "--out": die("--out is non-empty and lacks the %s marker, refusing to delete: %s" % (marker, path))
+print(real(out))
 PY
 }
 
@@ -123,7 +140,7 @@ triple=$(rustc --version --verbose | sed -n 's/^host: //p')
 [[ "$triple" == aarch64-apple-darwin || "$triple" == x86_64-apple-darwin ]] || die "unsupported host $triple"
 
 echo "bundle: sha=$sha version=$cargo_ver-cpzed.$n channel=stable target=$target_dir out=$out"
-check_out "$out" "$target_dir" || die "unsafe --out / target dir (this script rm -rf's the out dir)" 9
+out=$(check_out "$out" "$target_dir") || die "unsafe --out / target dir (this script rm -rf's the out dir)" 9
 
 # Preflight (all fatal, in this order).
 has_identity=true
@@ -167,8 +184,8 @@ fi
 
 echo "bundle: assembling"
 for bin in zed cli; do verify_sha_embedded "$target_dir/$triple/release/$bin" "$sha" || die "stale $bin binary" 11; done
-check_out "$out" "$target_dir" || die "unsafe --out" 9
-rm -rf "$out"; mkdir -p "$out"
+out=$(check_out "$out" "$target_dir") || die "unsafe --out" 9   # resolved path, as validated
+rm -rf -- "$out"; mkdir -p "$out"; touch "$out/.cpzed-bundle-out"
 cp crates/zed/Cargo.toml "$out/Cargo.toml.orig"
 restore() { [[ -f "$out/Cargo.toml.orig" ]] && cp "$out/Cargo.toml.orig" "$repo/crates/zed/Cargo.toml"; }
 trap restore EXIT
