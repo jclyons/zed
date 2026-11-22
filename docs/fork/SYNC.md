@@ -12,7 +12,7 @@ How the fork (`jclyons/zed`) keeps up with upstream (`zed-industries/zed`). Desi
 ## Running it
 
 ```bash
-cd ~/code/cpzed-sandbox/worktree-branch-sync   
+cd ~/code/cpzed-sandbox/worktree-branch-sync
 script/cpzed/sync --dry-run                    # fetch and report only
 script/cpzed/sync                              # merge + push branch + open PR
 script/cpzed/sync --no-pr                      # merge into a LOCAL branch, no push, no PR

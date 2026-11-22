@@ -40,13 +40,36 @@ $S >$T/o 2>&1; ck skip-rc $? 0; grep -q "already open" $T/o; ck skip-msg $? 0
 : > $T/open
 # gh list error -> exit 1
 touch $T/faillist; $S >$T/o 2>&1; ck ghlist-err $? 1; rm $T/faillist
-# ls-remote network error -> exit 1 (point fork at missing path after fetch is impossible; use bad remote url after setting)
 # S1 guards
 $S --repo Zed-Industries/zed --dry-run >$T/o 2>&1; ck repo-guard $? 1
 $S --repo JCLYONS/ZED --dry-run >$T/o 2>&1; ck repo-case-ok $? 0
 git remote set-url --push fork https://github.com/Zed-Industries/zed.git; $S --dry-run >$T/o 2>&1; ck url-guard $? 1
 git remote set-url --push fork https://github.com/evil/zed.git; $S --dry-run >$T/o 2>&1; ck allowlist $? 1
-git remote set-url --push fork ../fk.git
+git config --unset-all remote.fork.pushurl
+fkrefs=$(git ls-remote $T/fk.git | md5 -q); git init -q --bare $T/evil.git
+# multiple push URLs: `git push fork` would push to all of them
+git remote set-url --push fork $T/fk.git; git remote set-url --add --push fork $T/evil.git
+$S >$T/o 2>&1; ck two-pushurls $? 1; grep -q "2 URLs" $T/o; ck two-pushurls-msg $? 0
+ck two-pushurls-nopush "$(git ls-remote $T/evil.git | wc -l | tr -d ' ')$([ "$(git ls-remote $T/fk.git | md5 -q)" = "$fkrefs" ] && echo same)" "0same"
+git config --unset-all remote.fork.pushurl
+git remote set-url --push fork $T/fk.git; git remote set-url --add --push fork $T/fk.git
+$S >$T/o 2>&1; ck identical-pushurls $? 1
+git config --unset-all remote.fork.pushurl
+git remote set-url --add --push fork git@github.com:zed-industries/zed.git; git remote set-url --add --push fork $T/fk.git
+$S >$T/o 2>&1; ck zed-industries-extra-pushurl $? 1
+git config --unset-all remote.fork.pushurl
+# push URL differs from fetch URL
+git remote set-url --push fork $T/evil.git
+$S >$T/o 2>&1; ck pushurl-mismatch $? 1; grep -q "differs" $T/o; ck pushurl-mismatch-msg $? 0
+ck mismatch-nopush "$(git ls-remote $T/evil.git | wc -l | tr -d ' ')" 0
+git config --unset-all remote.fork.pushurl
+# closed-unmerged PR for the existing branch: loud warning, exit 0
+: > $T/open; echo "#7 CLOSED https://example/pr/7" > $T/all
+$S >$T/o 2>&1; ck closed-pr-rc $? 0; grep -q "CLOSED WITHOUT MERGING" $T/o; ck closed-pr-loud $? 0
+# git ls-remote network error must exit 1, never be read as "no branch"
+mkdir -p $T/fakebin; realgit=$(command -v git)
+printf '#!/bin/sh\n[ "$1" = ls-remote ] && { echo "fatal: network down" >&2; exit 128; }\nexec %s "$@"\n' "$realgit" > $T/fakebin/git; chmod +x $T/fakebin/git
+PATH=$T/fakebin:$PATH $S >$T/o 2>&1; ck lsremote-err $? 1; grep -q "ls-remote" $T/o; ck lsremote-err-msg $? 0
 # conflict + non-conflict
 git -C ../fk.git branch -D cpzed-sync-$(git rev-parse --short=10 origin/main) -q
 cd ../seed; echo U>b; git commit -qam up2; git push -q origin main; git fetch -q ../fk.git main; git checkout -q -B fkm FETCH_HEAD; echo F>b; git commit -qam fkb; git push -q ../fk.git fkm:main; cd ../work

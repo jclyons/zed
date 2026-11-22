@@ -69,20 +69,38 @@ cd "$(git rev-parse --show-toplevel)"
 # push URL is that repo on GitHub (a local path only with the test override). Upstream is
 # never a push or PR target.
 [ "$(lower "$repo")" = "$ALLOWED_REPO" ] || die "--repo must be $ALLOWED_REPO (got '$repo')"
-up_url=$(git remote get-url "$upstream_remote") || die "no remote $upstream_remote"
-fork_url=$(git remote get-url --push "$fork_remote") || die "no remote $fork_remote"
+# `git push <remote>` pushes to ALL of a remote's push URLs, so require exactly one fetch URL and
+# exactly one push URL on the fork remote, allowlist it, and push to that explicit URL.
+one_url() { # $1 = label, rest = git remote get-url args; prints the single URL or dies
+  local label=$1; shift
+  local out n
+  out=$(git remote get-url "$@") || die "cannot read $label"
+  n=$(printf '%s\n' "$out" | grep -c .)
+  [ "$n" -eq 1 ] || die "$label has $n URLs (expected exactly 1); refusing:
+$out"
+  printf '%s' "$out"
+}
+up_url=$(one_url "remote $upstream_remote fetch URL" --all "$upstream_remote")
+fork_fetch_url=$(one_url "remote $fork_remote fetch URL" --all "$fork_remote")
+fork_url=$(one_url "remote $fork_remote push URL" --push --all "$fork_remote")
 [ "$up_url" != "$fork_url" ] || die "upstream and fork remotes point at the same URL"
-case "$(lower "$fork_url")" in
-  *zed-industries*) die "fork remote '$fork_remote' points at zed-industries; refusing" ;;
-esac
-if ! printf '%s' "$(lower "$fork_url")" | grep -Eq '^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)jclyons/zed(\.git)?/?$'; then
-  # Any remote URL (scheme:// or user@host:) must be the allowlisted GitHub repo; only a plain
-  # local path may pass, and only with the test override.
-  case "$fork_url" in
-    *://*|*@*:*) die "fork remote URL '$fork_url' is not github.com/$ALLOWED_REPO" ;;
+[ "$(lower "$fork_fetch_url")" = "$(lower "$fork_url")" ] \
+  || die "remote $fork_remote fetch URL ($fork_fetch_url) differs from its push URL ($fork_url); refusing"
+check_fork_url() {
+  local u=$1
+  case "$(lower "$u")" in
+    *zed-industries*) die "remote '$fork_remote' URL '$u' points at zed-industries; refusing" ;;
   esac
-  [ "${CPZED_SYNC_ALLOW_LOCAL_FORK:-}" = 1 ] || die "fork remote URL '$fork_url' is not github.com/$ALLOWED_REPO"
-fi
+  if ! printf '%s' "$(lower "$u")" | grep -Eq '^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)jclyons/zed(\.git)?/?$'; then
+    # Any remote URL (scheme:// or user@host:) must be the allowlisted GitHub repo; only a plain
+    # local path may pass, and only with the test override.
+    case "$u" in
+      *://*|*@*:*) die "remote '$fork_remote' URL '$u' is not github.com/$ALLOWED_REPO" ;;
+    esac
+    [ "${CPZED_SYNC_ALLOW_LOCAL_FORK:-}" = 1 ] || die "remote '$fork_remote' URL '$u' is not github.com/$ALLOWED_REPO"
+  fi
+}
+check_fork_url "$fork_url"
 
 # State for cleanup.
 tmpdir=""
@@ -192,6 +210,12 @@ if $branch_on_fork; then
   existing=$(gh_json pr list --repo "$repo" --head "$branch" --state all --json number,state,url \
     --jq '.[] | "#\(.number) \(.state) \(.url)"')
   if [ -n "$existing" ]; then
+    if ! echo "$existing" | grep -Eq ' (OPEN|MERGED) '; then
+      echo "sync: WARNING: branch $branch is on $fork_remote and its only PR was CLOSED WITHOUT MERGING:" >&2
+      echo "$existing" | sed 's/^/  /' >&2
+      echo "sync: skipping (exit 0) until upstream moves to a new head; to retry this range, delete the branch on $fork_remote and re-run." >&2
+      exit 0
+    fi
     say "branch $branch is on $fork_remote and a PR exists (open or merged); nothing to do:"
     echo "$existing" | sed 's/^/  /'
     exit 0
@@ -245,6 +269,6 @@ fi
 
 # Push the sync branch only, to the fork, explicit refspec. Never main, never force.
 [ "$branch" != "$base" ] || die "internal: sync branch equals base"
-git push --quiet "$fork_remote" "$merged:refs/heads/$branch" || die "push of $branch to $fork_remote failed"
+git push --quiet "$fork_url" "$merged:refs/heads/$branch" || die "push of $branch to $fork_remote failed"
 say "pushed $branch to $fork_remote"
 open_pr "$merged"
