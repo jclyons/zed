@@ -82,6 +82,10 @@ gh pr merge <n> --repo jclyons/zed --merge --match-head-commit <full-head-sha>
 - Only one sync PR is open at a time. The script skips while one is open; a newer upstream head is picked up by the first run after it merges.
 - A merged sync PR is an eligible commit for `script/cpzed/deploy` like any other.
 
+## Testing the script
+
+`script/cpzed/test-sync` is self-contained: it builds throwaway bare upstream and fork repos and a stub `gh` in a temp dir (removed on exit), uses no network and no real remotes, prints `pass=N fail=M` and exits nonzero on any failure. Run it after any change to `script/cpzed/sync`.
+
 ## What the script does not do
 
 - It does not run builds or tests; the PR gates do.

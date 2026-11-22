@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# script/cpzed/test-sync: self-contained tests for script/cpzed/sync.
+# Builds throwaway bare "upstream" and "fork" repos and a stub `gh` in a temp dir; no network,
+# no real remotes. Prints a pass/fail count; exits nonzero on any failure.
+set -u
+S="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sync"
+[ -x "$S" ] || { echo "test-sync: $S not executable" >&2; exit 1; }
+T=$(mktemp -d "${TMPDIR:-/tmp}/cpzed-test-sync.XXXXXX")
+trap 'rm -rf "$T"' EXIT
+cd "$T"
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t CPZED_SYNC_ALLOW_LOCAL_FORK=1 TMPDIR=$T
+pass=0; fail=0
+ck(){ if [ "$2" = "$3" ]; then pass=$((pass+1)); echo "ok   $1"; else fail=$((fail+1)); echo "FAIL $1: got '$2' want '$3'"; fi; }
+git init -q --bare up.git; git init -q --bare fk.git
+git clone -q up.git seed 2>/dev/null; cd seed; git checkout -q -b main; echo a>a; echo b>b; git add .; git commit -qm c0; git push -q origin main; git push -q ../fk.git main; cd ..
+git clone -q fk.git work 2>/dev/null; cd work; git remote rename origin fork; git remote add origin ../up.git; git fetch -q origin; git switch -q --detach fork/main; echo dirty>>a  # dirty tree must not matter
+cat > $T/gh <<'G'
+#!/bin/sh
+echo "GH $*" >> $STUB_LOG
+case "$1 $2" in
+ "pr list") case "$*" in *"--state open"*) cat $STUB_OPEN 2>/dev/null;; *) cat $STUB_ALL 2>/dev/null;; esac; [ -f $STUB_FAILLIST ] && exit 1; exit 0;;
+ "pr create") if [ -f $STUB_FAILCREATE ]; then rm $STUB_FAILCREATE; exit 1; fi; echo https://example/pr/1; echo "#1 OPEN https://example/pr/1" > $STUB_ALL;;
+esac
+G
+chmod +x $T/gh
+export CPZED_SYNC_GH=$T/gh STUB_LOG=$T/gh.log STUB_OPEN=$T/open STUB_ALL=$T/all STUB_FAILCREATE=$T/failcreate STUB_FAILLIST=$T/faillist
+snap(){ echo "$(git rev-parse HEAD) $(git status --porcelain) $(git symbolic-ref -q HEAD) $(git worktree list|wc -l) $(md5 -q a)"; }
+before=$(snap)
+$S >$T/o 2>&1; ck noop-rc $? 0; grep -q "up to date" $T/o; ck noop-msg $? 0
+cd ../seed; echo u>>b2; echo x>x; git add x; git commit -qm up1; git push -q origin main; cd ../work
+$S --dry-run >$T/o 2>&1; ck dry-rc $? 0; ck dry-nopush "$(git ls-remote ../fk.git|wc -l|tr -d " ")" 1
+# B1: create fails once
+touch $T/failcreate; : > $T/all
+$S >$T/o 2>&1; ck create-fail-rc $? 1; ck branch-pushed "$(git ls-remote ../fk.git 'refs/heads/cpzed-sync-*'|wc -l|tr -d " ")" 1
+: > $T/all; $S >$T/o 2>&1; ck recover-rc $? 0; grep -q "opened PR" $T/o; ck recover-opened $? 0
+$S >$T/o 2>&1; ck rerun-rc $? 0; grep -q "a PR exists" $T/o; ck rerun-msg $? 0
+# S2: open sync PR for a different branch -> skip
+echo "#9 cpzed-sync-deadbeef00 https://example/pr/9" > $T/open; : > $T/all
+$S >$T/o 2>&1; ck skip-rc $? 0; grep -q "already open" $T/o; ck skip-msg $? 0
+: > $T/open
+# gh list error -> exit 1
+touch $T/faillist; $S >$T/o 2>&1; ck ghlist-err $? 1; rm $T/faillist
+# ls-remote network error -> exit 1 (point fork at missing path after fetch is impossible; use bad remote url after setting)
+# S1 guards
+$S --repo Zed-Industries/zed --dry-run >$T/o 2>&1; ck repo-guard $? 1
+$S --repo JCLYONS/ZED --dry-run >$T/o 2>&1; ck repo-case-ok $? 0
+git remote set-url --push fork https://github.com/Zed-Industries/zed.git; $S --dry-run >$T/o 2>&1; ck url-guard $? 1
+git remote set-url --push fork https://github.com/evil/zed.git; $S --dry-run >$T/o 2>&1; ck allowlist $? 1
+git remote set-url --push fork ../fk.git
+# conflict + non-conflict
+git -C ../fk.git branch -D cpzed-sync-$(git rev-parse --short=10 origin/main) -q
+cd ../seed; echo U>b; git commit -qam up2; git push -q origin main; git fetch -q ../fk.git main; git checkout -q -B fkm FETCH_HEAD; echo F>b; git commit -qam fkb; git push -q ../fk.git fkm:main; cd ../work
+$S >$T/o 2>&1; ck conflict-rc $? 2; grep -q "^  b" $T/o; ck conflict-files $? 0
+ck no-leftover-wt "$(git worktree list|wc -l|tr -d " ")" 1; ck no-tmp "$(ls $T | grep -c cpzed-sync.)" 0
+ck untouched "$(snap)" "$before"
+# --no-pr clean path
+cd ../seed; git checkout -q -B fkm2 FETCH_HEAD 2>/dev/null; cd ../work
+# exit 3: unrelated histories (merge fails, no conflict files)
+git init -q --bare $T/up2.git; git clone -q $T/up2.git $T/seed2 2>/dev/null; (cd $T/seed2; git checkout -q -b main; echo z>z; git add .; git commit -qm z; git push -q origin main)
+git remote set-url origin $T/up2.git; : > $T/open; : > $T/all
+$S >$T/o 2>&1; ck merge-fail-rc $? 3; grep -q "not a conflict" $T/o; ck merge-fail-msg $? 0
+ck untouched2 "$(snap)" "$before"
+echo "test-sync: pass=$pass fail=$fail"
+[ "$fail" -eq 0 ]
