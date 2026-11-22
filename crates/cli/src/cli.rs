@@ -77,6 +77,31 @@ pub enum CliRequest {
     /// Print the running Zed's agent threads as JSON (currently terminal
     /// threads only).
     ListAgentThreads,
+    /// Create a new terminal agent thread in the running Zed. Appended last
+    /// to keep the enum append-only.
+    NewAgentTerminal {
+        /// Absolute, canonical working directory (resolved by the CLI).
+        cwd: PathBuf,
+        /// Command typed into the shell after startup; `None` = settings' init command.
+        command: Option<String>,
+        /// Custom title shown in the sidebar.
+        title: Option<String>,
+        #[serde(default)]
+        on_no_match: NoMatchBehavior,
+    },
+}
+
+/// What `--agent-new` does when no open project contains the requested cwd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NoMatchBehavior {
+    /// Fail with a deterministic error (default).
+    #[default]
+    Error,
+    /// Add the directory as a workspace (`--open-project`).
+    OpenProject,
+    /// Open it in a new window (`--new-window`).
+    NewWindow,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,5 +131,46 @@ pub trait CliResponseSink: Send + 'static {
 impl CliResponseSink for ipc::IpcSender<CliResponse> {
     fn send(&self, response: CliResponse) -> Result<()> {
         ipc::IpcSender::send(self, response).map_err(|error| anyhow::anyhow!("{error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_agent_terminal_round_trips() {
+        let request = CliRequest::NewAgentTerminal {
+            cwd: PathBuf::from("/tmp/project"),
+            command: Some("echo hi".into()),
+            title: Some("t".into()),
+            on_no_match: NoMatchBehavior::NewWindow,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        match serde_json::from_str::<CliRequest>(&json).unwrap() {
+            CliRequest::NewAgentTerminal {
+                cwd,
+                command,
+                title,
+                on_no_match,
+            } => {
+                assert_eq!(cwd, PathBuf::from("/tmp/project"));
+                assert_eq!(command.as_deref(), Some("echo hi"));
+                assert_eq!(title.as_deref(), Some("t"));
+                assert_eq!(on_no_match, NoMatchBehavior::NewWindow);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let missing: CliRequest = serde_json::from_str(
+            r#"{"NewAgentTerminal":{"cwd":"/x","command":null,"title":null}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            missing,
+            CliRequest::NewAgentTerminal {
+                on_no_match: NoMatchBehavior::Error,
+                ..
+            }
+        ));
     }
 }

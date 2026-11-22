@@ -136,6 +136,24 @@ struct Args {
     /// terminal threads only), for scripts and orchestration.
     #[arg(long)]
     agent_list: bool,
+    /// Create a new terminal agent thread in the running Zed.
+    #[arg(long, conflicts_with_all = ["paths_with_position", "agent_list", "debug_state", "diff"])]
+    agent_new: bool,
+    /// Command to type into the new terminal thread (requires --agent-new).
+    #[arg(long, requires = "agent_new", value_name = "CMD")]
+    command: Option<String>,
+    /// Title for the new terminal thread (requires --agent-new).
+    #[arg(long, requires = "agent_new", value_name = "TITLE")]
+    title: Option<String>,
+    /// Working directory for the new terminal thread (default: current directory).
+    #[arg(long, requires = "agent_new", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+    cwd: Option<PathBuf>,
+    /// If no open project contains the cwd, add it as a workspace.
+    #[arg(long, requires = "agent_new", conflicts_with = "new_window")]
+    open_project: bool,
+    /// If no open project contains the cwd, open it in a new window.
+    #[arg(long, requires = "agent_new")]
+    new_window: bool,
     /// Open the project in a dev container.
     ///
     /// Automatically triggers "Reopen in Dev Container" if a `.devcontainer/`
@@ -268,10 +286,58 @@ fn create_empty_stub(temp_dir: &mut TempDir, rel: &Path) -> anyhow::Result<PathB
     Ok(stub_path)
 }
 
+fn build_agent_new_request(
+    cwd: PathBuf,
+    command: Option<String>,
+    title: Option<String>,
+    open_project: bool,
+    new_window: bool,
+) -> CliRequest {
+    let on_no_match = if new_window {
+        cli::NoMatchBehavior::NewWindow
+    } else if open_project {
+        cli::NoMatchBehavior::OpenProject
+    } else {
+        cli::NoMatchBehavior::Error
+    };
+    CliRequest::NewAgentTerminal {
+        cwd,
+        command,
+        title,
+        on_no_match,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("zed").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn agent_new_flags() {
+        let args = parse(&["--agent-new", "--command", "x", "--new-window"]).unwrap();
+        assert!(args.agent_new && args.new_window && !args.open_project);
+        assert_eq!(args.command.as_deref(), Some("x"));
+        assert!(parse(&["--agent-new", "some/path"]).is_err());
+        assert!(parse(&["--agent-new", "--agent-list"]).is_err());
+        assert!(parse(&["--agent-new", "--open-project", "--new-window"]).is_err());
+        assert!(parse(&["--command", "x"]).is_err());
+    }
+
+    #[test]
+    fn agent_new_request_mapping() {
+        let map = |o, n| match build_agent_new_request("/a".into(), Some("x".into()), None, o, n) {
+            CliRequest::NewAgentTerminal { on_no_match, .. } => on_no_match,
+            _ => unreachable!(),
+        };
+        assert_eq!(map(false, false), cli::NoMatchBehavior::Error);
+        assert_eq!(map(true, false), cli::NoMatchBehavior::OpenProject);
+        assert_eq!(map(false, true), cli::NoMatchBehavior::NewWindow);
+    }
     use util::path;
     use util::paths::SanitizedPath;
     use util::test::TempTree;
@@ -652,6 +718,25 @@ fn run() -> Result<()> {
         }
     }
 
+    let agent_new_request = if args.agent_new {
+        let cwd = match &args.cwd {
+            Some(cwd) => cwd.clone(),
+            None => env::current_dir()?,
+        };
+        let cwd = cwd
+            .canonicalize()
+            .with_context(|| format!("resolving --cwd {}", cwd.display()))?;
+        Some(build_agent_new_request(
+            cwd,
+            args.command.clone(),
+            args.title.clone(),
+            args.open_project,
+            args.new_window,
+        ))
+    } else {
+        None
+    };
+
     anyhow::ensure!(
         args.dev_server_token.is_none(),
         "Dev servers were removed in v0.157.x please upgrade to SSH remoting: https://zed.dev/docs/remote-development"
@@ -694,6 +779,8 @@ fn run() -> Result<()> {
 
                 tx.send(if args.debug_state {
                     CliRequest::DebugState
+                } else if let Some(request) = agent_new_request {
+                    request
                 } else if args.agent_list {
                     CliRequest::ListAgentThreads
                 } else {
