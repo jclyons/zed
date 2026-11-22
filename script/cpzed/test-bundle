@@ -110,6 +110,17 @@ for i, n in enumerate(needles):
     assert n in src
     open("%s/needle%d.rs" % (sys.argv[2], i), "w").write(src.replace(n, "/*removed*/"))
 PY
+# C2: logic flips that keep every ZED_UPDATE_EXPLANATION reference (and the count) intact.
+python3 -I - "$repo/crates/auto_update/src/auto_update.rs" "$T" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+for name, old, new in (("flip_is_err", 'env::var("ZED_UPDATE_EXPLANATION").is_err()', 'env::var("ZED_UPDATE_EXPLANATION").is_ok()'),
+                       ("flip_is_none", 'option_env!("ZED_UPDATE_EXPLANATION").is_none()', 'option_env!("ZED_UPDATE_EXPLANATION").is_some()')):
+    assert old in src and src.count("ZED_UPDATE_EXPLANATION") == src.replace(old, new).count("ZED_UPDATE_EXPLANATION")
+    open("%s/%s.rs" % (sys.argv[2], name), "w").write(src.replace(old, new))
+PY
+t "C2 flipped .is_err() -> .is_ok()"     fail "$here/selfcheck" source --file "$T/flip_is_err.rs"
+t "C2 flipped .is_none() -> .is_some()"  fail "$here/selfcheck" source --file "$T/flip_is_none.rs"
 for i in 0 1 2 3 4; do t "selfcheck needle $i doctored" fail "$here/selfcheck" source --file "$T/needle$i.rs"; done
 printf nothing > "$app/Contents/MacOS/zed"
 /usr/libexec/PlistBuddy -c "Set :LSEnvironment:ZED_UPDATE_EXPLANATION \"$("$here/selfcheck" explanation)\"" "$app/Contents/Info.plist"
@@ -180,6 +191,11 @@ t "E2E signing probe fails -> 10"        ok   rrc 10 "keychain permission" STUB_
 t "E2E stale binary -> 11"               ok   bash -c 'printf "stale" > "$1"' _ "$bd/zed"
 t "E2E stale binary rc 11"               ok   rrc 11 "stale zed binary" -- --skip-build
 mkbins "$sha"
+rm -rf "$R/target-install/cpzed-out"
+t "N7 git sha mismatch -> 1"             ok   rrc 1 "SHA-256 mismatch" CPZED_TEST_GIT_SHA256=0000 -- --skip-build
+t "N7 no git extracted after a mismatch" ok   test ! -e "$R/target-install/cpzed-out/CPZed.app/Contents/MacOS/git"
+t "N7 mismatch stops before signing"     ok   bash -c '! grep -q "^codesign --deep" "$1"' _ "$STUB_LOG"
+rm -rf "$R/target-install/cpzed-out"
 t "E2E out replaced between checks -> 9" ok   rrc 9 "unsafe --out" "STUB_PLANT_OUT=$R/target-install/cpzed-out" -- --skip-build
 rm -rf "$R/target-install/cpzed-out"
 t "E2E missing hardened runtime -> 8"    ok   rrc 8 "hardened runtime" STUB_RUNTIME=0 -- --skip-build
@@ -195,14 +211,15 @@ t "S1 all three together refused"            ok rprod 2 "not a test run" CPZED_C
 t "S1 flag without env var refused"          ok rrc 2 "tests only" CPZED_TEST_SKIP_BUILD= -- --skip-build --dry-run
 # cargo/rustc detection: fake long-running processes
 mkdir -p "$T/fc"; printf '#!/bin/bash\nsleep 40\n' > "$T/fc/cargo"; printf '#!/bin/bash\nsleep 40\n' > "$T/fc/sccache"; chmod +x "$T/fc/"*
+waitps() { local i; for i in $(seq 50); do ps -axo command= | grep -F -- "$1" | grep -qv grep && return 0; sleep 0.2; done; return 1; }
 "$T/fc/sccache" --server "$R/target-install" & p1=$!; "$T/fc/cargo" build --target-dir /somewhere/else/glider-ci & p2=$!
-sleep 1
+waitps "--target-dir /somewhere/else/glider-ci"; waitps "sccache --server"
 t "E2E sccache + unrelated cargo do not exit 7" ok rrc 0 "bundle: built" -- --skip-build
 t "E2E all 4 sign calls use the hardened runtime" ok test "$(grep -c -e "--force.*--options runtime" "$STUB_LOG")" = 4
 t "E2E curl has --max-time and --retry"  ok   grep -q -e "--max-time 300 --retry 3" "$STUB_LOG"
 t "E2E built plist has -cpzed.1"         ok   grep -q "1.31.0-cpzed.1" <(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$R/target-install/cpzed-out/CPZed.app/Contents/Info.plist")
 "$T/fc/cargo" build --target-dir "$R/target-install" & p3=$!
-sleep 1
+waitps "build --target-dir $R/target-install" || waitps "--target-dir ${R#/private}/target-install"
 t "E2E cargo using our target dir -> 7"  ok   rrc 7 "using" -- --skip-build
 kill $p1 $p2 $p3 2>/dev/null; wait 2>/dev/null
 exit $fails
