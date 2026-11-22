@@ -3,6 +3,13 @@
 //! activating, focusing or switching any window.
 //!
 //! Design: `designs/cpzed-3-agent-new.md` (fork-private).
+//!
+//! Known limitation (tracked as a follow-up): when the CLI launches Zed
+//! itself, this handler can run before session restore has reopened the user's
+//! windows. A cwd inside a project that restore is about to bring back then
+//! reports "no match" (exit 3), and `--open-project` / `--new-window` can open
+//! a duplicate. Fixing it needs the startup path in `main.rs`, which this
+//! module does not own.
 
 use agent_ui::terminal_thread_metadata_store::TerminalThreadMetadataStore;
 use agent_ui::{AgentPanel, AgentPanelEvent, TerminalId};
@@ -10,6 +17,8 @@ use cli::{CliResponse, CliResponseSink, NoMatchBehavior};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt, select_biased};
 use gpui::{App, AppContext as _, AsyncApp, Entity, WindowHandle};
+use project::DisableAiSettings;
+use settings::Settings as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +45,8 @@ pub struct Timeouts {
     pub metadata: Duration,
     /// Waiting for a freshly added workspace to register its agent panel.
     pub panel_load: Duration,
+    /// Running `git rev-parse` for the linked-worktree fallback.
+    pub git: Duration,
 }
 
 impl Default for Timeouts {
@@ -44,6 +55,7 @@ impl Default for Timeouts {
             confirm: Duration::from_secs(15),
             metadata: Duration::from_secs(5),
             panel_load: Duration::from_secs(10),
+            git: Duration::from_secs(5),
         }
     }
 }
@@ -143,9 +155,18 @@ async fn run(
         )));
     }
 
-    let _guard = SPAWN_LOCK.lock().await;
+    if cx.update(|cx| DisableAiSettings::get_global(cx).disable_ai) {
+        return Err(Failure::new(
+            EXIT_UNSUPPORTED,
+            "AI features are disabled (disable_ai); cannot create an agent terminal",
+        ));
+    }
 
-    let target = resolve_target(&cwd, on_no_match, &app_state, cx).await?;
+    let _guard = SPAWN_LOCK.lock().await;
+    #[cfg(test)]
+    let _probe = tests::ConcurrencyProbe::enter();
+
+    let target = resolve_target(&cwd, on_no_match, &app_state, timeouts.git, cx).await?;
     let panel = wait_for_panel(&target, timeouts.panel_load, cx).await?;
     spawn_and_confirm(&target, &panel, cwd, command, title, timeouts, cx).await
 }
@@ -177,6 +198,7 @@ async fn resolve_target(
     cwd: &Path,
     on_no_match: NoMatchBehavior,
     app_state: &Arc<AppState>,
+    git_timeout: Duration,
     cx: &mut AsyncApp,
 ) -> Result<Target, Failure> {
     // Phase 1 (foreground, read-only): snapshot every open local workspace.
@@ -224,12 +246,12 @@ async fn resolve_target(
     if linked_match.is_none() {
         // Snapshots may not list linked worktrees (e.g. bare-repo layouts);
         // ask git directly and compare common dirs.
-        if let Some((toplevel, common_dir)) = git_toplevel_and_common_dir(&canonical_cwd).await {
+        let git_result = bounded(git_toplevel_and_common_dir(&canonical_cwd), git_timeout, cx)
+            .await
+            .flatten();
+        if let Some((toplevel, common_dir)) = git_result {
             let common_dir = canonical_or_self(&common_dir);
-            if let Some(index) = linked
-                .iter()
-                .position(|entry| entry.common_dirs.contains(&common_dir))
-            {
+            if let Some(index) = pick_by_common_dir(&common_dir, &linked) {
                 linked_match = Some((index, canonical_or_self(&toplevel)));
             }
         }
@@ -240,14 +262,16 @@ async fn resolve_target(
     }
 
     // Step 3: nothing matches.
-    match on_no_match {
-        NoMatchBehavior::Error => Err(Failure::new(
-            EXIT_NO_MATCH,
-            format!(
-                "no open Zed project contains {}; pass --open-project to add it",
-                cwd.display()
-            ),
-        )),
+    let (window, mode) = match on_no_match {
+        NoMatchBehavior::Error => {
+            return Err(Failure::new(
+                EXIT_NO_MATCH,
+                format!(
+                    "no open Zed project contains {}; pass --open-project to add it",
+                    cwd.display()
+                ),
+            ));
+        }
         NoMatchBehavior::OpenProject => {
             let window = cx.update(|cx| {
                 let active = cx
@@ -260,39 +284,13 @@ async fn resolve_target(
                 })
             });
             match window {
-                Some(window) => {
-                    open_workspace(
-                        vec![cwd.to_path_buf()],
-                        Some(window),
-                        OpenMode::Add,
-                        app_state,
-                        cx,
-                    )
-                    .await
-                }
-                None => {
-                    open_workspace(
-                        vec![cwd.to_path_buf()],
-                        None,
-                        OpenMode::NewWindow,
-                        app_state,
-                        cx,
-                    )
-                    .await
-                }
+                Some(window) => (Some(window), OpenMode::Add),
+                None => (None, OpenMode::NewWindow),
             }
         }
-        NoMatchBehavior::NewWindow => {
-            open_workspace(
-                vec![cwd.to_path_buf()],
-                None,
-                OpenMode::NewWindow,
-                app_state,
-                cx,
-            )
-            .await
-        }
-    }
+        NoMatchBehavior::NewWindow => (None, OpenMode::NewWindow),
+    };
+    open_workspace(vec![cwd.to_path_buf()], window, mode, app_state, cx).await
 }
 
 fn collect_candidates(
@@ -391,8 +389,29 @@ fn pick_linked_root(cwd: &Path, linked: &[RawLinked]) -> Option<(usize, PathBuf)
         })
 }
 
+/// First open workspace whose repository shares `common_dir` (canonical).
+fn pick_by_common_dir(common_dir: &Path, linked: &[RawLinked]) -> Option<usize> {
+    linked
+        .iter()
+        .position(|entry| entry.common_dirs.iter().any(|dir| dir == common_dir))
+}
+
 fn canonical_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Awaits `future`, giving up (`None`) after `timeout`.
+async fn bounded<T>(
+    future: impl std::future::Future<Output = T>,
+    timeout: Duration,
+    cx: &AsyncApp,
+) -> Option<T> {
+    let mut timer = cx.background_executor().timer(timeout).fuse();
+    let mut future = std::pin::pin!(future.fuse());
+    select_biased! {
+        value = future => Some(value),
+        _ = timer => None,
+    }
 }
 
 /// `(--show-toplevel, --git-common-dir)` for `cwd`, or `None` when `cwd` is
@@ -466,10 +485,8 @@ async fn wait_for_panel(
         select_biased! {
             _ = tick => {}
             _ = timer => {
-                return Err(Failure::new(
-                    EXIT_UNSUPPORTED,
-                    "the agent panel is not available in the target workspace \
-                     (is AI disabled?)",
+                return Err(Failure::internal(
+                    "the agent panel did not load in the target workspace in time",
                 ));
             }
         }
@@ -557,22 +574,17 @@ async fn reply_json(
     let mut folder_paths: Option<Vec<String>> = None;
     if let Some(store) = store {
         let reload = cx.update(|cx| store.read(cx).reload_task());
-        let mut timer = cx.background_executor().timer(timeouts.metadata).fuse();
-        let mut reload = reload.fuse();
-        select_biased! {
-            _ = reload => {
-                folder_paths = cx.update(|cx| {
-                    store.read(cx).entry(terminal_id).map(|metadata| {
-                        metadata
-                            .folder_paths()
-                            .paths()
-                            .iter()
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .collect()
-                    })
-                });
-            }
-            _ = timer => {}
+        if bounded(reload, timeouts.metadata, cx).await.is_some() {
+            folder_paths = cx.update(|cx| {
+                store.read(cx).entry(terminal_id).map(|metadata| {
+                    metadata
+                        .folder_paths()
+                        .paths()
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect()
+                })
+            });
         }
     }
 
@@ -621,6 +633,30 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use std::sync::Mutex;
+
+    thread_local! {
+        static ACTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static MAX_ACTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Records how many requests are inside the serialized section at once
+    /// (per test thread). With `SPAWN_LOCK` it never exceeds one.
+    pub(super) struct ConcurrencyProbe;
+
+    impl ConcurrencyProbe {
+        pub(super) fn enter() -> Self {
+            let active = ACTIVE.get() + 1;
+            ACTIVE.set(active);
+            MAX_ACTIVE.set(MAX_ACTIVE.get().max(active));
+            Self
+        }
+    }
+
+    impl Drop for ConcurrencyProbe {
+        fn drop(&mut self) {
+            ACTIVE.set(ACTIVE.get() - 1);
+        }
+    }
 
     #[derive(Default)]
     struct CapturingSink(Mutex<Vec<CliResponse>>);
@@ -1100,8 +1136,15 @@ mod tests {
         )
         .await;
         assert_eq!(outcome.status, 0, "{outcome:?}");
+        cx.run_until_parked();
         assert_eq!(workspace_count(cx, window), 2);
         assert_eq!(displayed_workspace(cx, window), main_ws);
+        let keys = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.project_group_keys()
+            })
+            .unwrap();
+        assert_eq!(keys.len(), 1, "bare-repo worktrees share one group");
     }
 
     #[gpui::test]
@@ -1112,6 +1155,7 @@ mod tests {
         insert_dirs(&app_state, &root, json!({})).await;
         let (_window, workspace) = open_window(cx, &app_state, &root).await;
 
+        MAX_ACTIVE.set(0);
         let mut first_cx = cx.to_async();
         let mut second_cx = cx.to_async();
         let first_sink = CapturingSink::default();
@@ -1148,6 +1192,7 @@ mod tests {
         let first_id = first.stdout.unwrap()["id"].as_str().unwrap().to_string();
         let second_id = second.stdout.unwrap()["id"].as_str().unwrap().to_string();
         assert_ne!(first_id, second_id);
+        assert_eq!(MAX_ACTIVE.get(), 1, "requests must be serialized");
         cx.run_until_parked();
         // Exactly the two requested terminals: no stray "initial" terminal.
         assert_eq!(terminal_count(cx, &workspace), 2);
@@ -1182,12 +1227,34 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_zero_metadata_timeout_still_replies(cx: &mut TestAppContext) {
+    async fn test_bounded_gives_up_on_a_hung_future(cx: &mut TestAppContext) {
+        let async_cx = cx.to_async();
+        // A store whose load never finishes must not hang the CLI.
+        let hung = bounded(
+            futures::future::pending::<()>(),
+            Duration::from_millis(10),
+            &async_cx,
+        )
+        .await;
+        assert_eq!(hung, None);
+        let done = bounded(async { 7 }, Duration::from_secs(5), &async_cx).await;
+        assert_eq!(done, Some(7));
+    }
+
+    #[gpui::test]
+    async fn test_disabled_ai_exits_4_immediately(cx: &mut TestAppContext) {
         let app_state = init_agent_test(cx);
-        let dirs = TestDirs::new("metadata");
+        let dirs = TestDirs::new("disabled");
         let root = dirs.dir("project");
         insert_dirs(&app_state, &root, json!({})).await;
-        let (_window, _workspace) = open_window(cx, &app_state, &root).await;
+        let (_window, workspace) = open_window(cx, &app_state, &root).await;
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.disable_ai = Some(settings::SaturatingBool(true));
+                });
+            });
+        });
 
         let outcome = request(
             cx,
@@ -1196,18 +1263,15 @@ mod tests {
             None,
             NoMatchBehavior::Error,
             Timeouts {
-                metadata: Duration::ZERO,
+                // Would exit 1 after this long if the check were not up front.
+                panel_load: Duration::from_secs(3600),
                 ..Timeouts::default()
             },
         )
         .await;
-        assert_eq!(outcome.status, 0, "{outcome:?}");
-        let reply = outcome.stdout.unwrap();
-        assert_eq!(reply["kind"], "terminal");
-        assert_eq!(
-            reply["folder_paths"].as_array().map(|paths| paths.len()),
-            Some(1)
-        );
+        assert_eq!(outcome.status, 4, "{outcome:?}");
+        assert!(outcome.stderr.contains("disabled"), "{outcome:?}");
+        assert_eq!(terminal_count(cx, &workspace), 0);
     }
 
     #[gpui::test]
@@ -1315,55 +1379,65 @@ mod tests {
         assert_eq!(pick_linked_root(Path::new("/other"), &linked), None);
     }
 
-    #[test]
-    fn test_git_fallback_resolves_bare_repo_layout() {
-        // Real git: the sandbox layout (bare repo + worktree-branch-*).
-        let dirs = TestDirs::new("git-fallback");
+    fn run_git(args: &[&str], cwd: &Path) {
+        let mut command = util::command::new_command("git");
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com");
+        let output = gpui::block_on(command.output()).expect("git must be installed");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The sandbox layout: `glider.git` (bare) plus `worktree-branch-*`.
+    /// Returns (bare, main worktree, feature worktree).
+    fn make_bare_layout(dirs: &TestDirs) -> (PathBuf, PathBuf, PathBuf) {
+        let source = dirs.dir("source");
+        run_git(&["init", "-q", "-b", "main"], &source);
+        run_git(&["commit", "-q", "--allow-empty", "-m", "init"], &source);
         let bare = dirs.root.join("glider.git");
-        let main_wt = dirs.root.join("worktree-branch-main");
-        let feature_wt = dirs.root.join("worktree-branch-feature");
-        let git = |args: &[&str], cwd: &Path| {
-            let mut command = util::command::new_command("git");
-            command
-                .args(args)
-                .current_dir(cwd)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.com")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.com");
-            gpui::block_on(command.output()).is_ok_and(|output| output.status.success())
-        };
-        let set_up = git(
-            &["init", "--bare", "-q", bare.to_str().unwrap()],
+        run_git(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                source.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
             &dirs.root,
-        ) && git(
+        );
+        run_git(
+            &["worktree", "add", "-q", "../worktree-branch-main", "main"],
+            &bare,
+        );
+        run_git(
             &[
                 "worktree",
                 "add",
                 "-q",
-                "--orphan",
                 "-b",
+                "feature",
+                "../worktree-branch-feature",
                 "main",
-                main_wt.to_str().unwrap(),
             ],
             &bare,
-        ) && git(&["commit", "-q", "--allow-empty", "-m", "init"], &main_wt)
-            && git(
-                &[
-                    "worktree",
-                    "add",
-                    "-q",
-                    "-b",
-                    "feature",
-                    feature_wt.to_str().unwrap(),
-                ],
-                &main_wt,
-            );
-        if !set_up {
-            eprintln!("skipping: git is unavailable or too old for --orphan worktrees");
-            return;
-        }
-        std::fs::create_dir_all(feature_wt.join("crates")).unwrap();
+        );
+        let feature = dirs.root.join("worktree-branch-feature");
+        std::fs::create_dir_all(feature.join("crates")).unwrap();
+        (bare, dirs.root.join("worktree-branch-main"), feature)
+    }
+
+    #[test]
+    fn test_git_fallback_resolves_bare_repo_layout() {
+        let dirs = TestDirs::new("git-fallback");
+        let (bare, main_wt, feature_wt) = make_bare_layout(&dirs);
 
         let (toplevel, common_dir) =
             gpui::block_on(git_toplevel_and_common_dir(&feature_wt.join("crates")))
@@ -1371,5 +1445,85 @@ mod tests {
         assert_eq!(canonical_or_self(&toplevel), canonical_or_self(&feature_wt));
         assert_eq!(canonical_or_self(&common_dir), canonical_or_self(&bare));
         assert!(gpui::block_on(git_toplevel_and_common_dir(&dirs.root)).is_none());
+
+        // The fallback's common dir must match what an open workspace of the
+        // main worktree reports (its repository's common dir).
+        let (_, main_common) = gpui::block_on(git_toplevel_and_common_dir(&main_wt)).unwrap();
+        let open = [RawLinked {
+            linked_roots: vec![],
+            common_dirs: vec![canonical_or_self(&main_common)],
+        }];
+        assert_eq!(
+            pick_by_common_dir(&canonical_or_self(&common_dir), &open),
+            Some(0)
+        );
+        assert_eq!(pick_by_common_dir(Path::new("/unrelated.git"), &open), None);
+    }
+
+    #[gpui::test]
+    async fn test_real_bare_repo_layout_end_to_end(cx: &mut TestAppContext) {
+        let fake_state = init_agent_test(cx);
+        let real_state = Arc::new(AppState {
+            languages: fake_state.languages.clone(),
+            client: fake_state.client.clone(),
+            user_store: fake_state.user_store.clone(),
+            workspace_store: fake_state.workspace_store.clone(),
+            fs: fs::RealFs::new(None, cx.executor()),
+            build_window_options: fake_state.build_window_options,
+            node_runtime: fake_state.node_runtime.clone(),
+            session: fake_state.session.clone(),
+        });
+        let dirs = TestDirs::new("real-bare");
+        let (_bare, main_wt, feature_wt) = make_bare_layout(&dirs);
+
+        let (window, main_ws) = open_window(cx, &real_state, &main_wt).await;
+        // Let the real repository scan report the repo.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|cx| {
+                collect_candidates(cx)
+                    .2
+                    .iter()
+                    .any(|entry| !entry.common_dirs.is_empty())
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "repo never scanned");
+            cx.executor().timer(Duration::from_millis(50)).await;
+        }
+
+        let outcome = request(
+            cx,
+            &real_state,
+            &feature_wt.join("crates"),
+            None,
+            NoMatchBehavior::Error,
+            Timeouts::default(),
+        )
+        .await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert_eq!(workspace_count(cx, window), 2);
+        assert_eq!(
+            displayed_workspace(cx, window),
+            main_ws,
+            "must not activate"
+        );
+        assert_eq!(terminal_count(cx, &main_ws), 0);
+        let reply = outcome.stdout.unwrap();
+        assert_eq!(
+            reply["folder_paths"][0]
+                .as_str()
+                .map(|p| canonical_or_self(Path::new(p))),
+            Some(canonical_or_self(&feature_wt))
+        );
+        cx.run_until_parked();
+        let keys = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.project_group_keys()
+            })
+            .unwrap();
+        assert_eq!(keys.len(), 1, "bare-repo worktrees share one group");
     }
 }
