@@ -47,14 +47,49 @@ if [[ "${1:-}" == patch-plist ]]; then
   patch_plist "$2" "$3" "$4" "$5"; exit 0
 fi
 
+# Resolve a path with symlinks and `..` collapsed; the leaf need not exist.
+realpath_m() { python3 -I -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
+
+# Refuse any output dir that is not strictly inside the (resolved) target dir, and
+# hard-refuse protected locations. $1=out, $2=target_dir. Returns 0 if safe to rm -rf.
+check_out() {
+  local o=$1 t=$2 ro rt home p
+  [[ "$o" == /* ]] || { echo "bundle: --out must be an absolute path: $o" >&2; return 1; }
+  [[ "$t" == /* ]] || { echo "bundle: target dir must be an absolute path: $t" >&2; return 1; }
+  ro=$(realpath_m "$o"); rt=$(realpath_m "$t"); home=$(realpath_m "$HOME")
+  for p in "$ro" "$rt"; do
+    case "$p" in
+      /|/Applications|/Applications/*|/System|/System/*|/usr|/usr/*|/Library|/Library/*) echo "bundle: refusing protected path $p" >&2; return 1 ;;
+      "$home"/Library/Application\ Support/CPZed|"$home"/Library/Application\ Support/CPZed/*) echo "bundle: refusing CPZed state dir $p" >&2; return 1 ;;
+    esac
+    # $HOME itself and its direct children (Documents, code, Library, ...).
+    if [[ "$p" == "$home" || "$(dirname "$p")" == "$home" ]]; then echo "bundle: refusing home or a direct child of home: $p" >&2; return 1; fi
+  done
+  [[ "$ro" == "$rt"/* ]] || { echo "bundle: --out ($ro) must be strictly inside the target dir ($rt)" >&2; return 1; }
+  return 0
+}
+
+# The release binary must embed the full commit SHA it is about to be stamped with.
+verify_sha_embedded() { # binary sha
+  [[ -f "$1" ]] || { echo "bundle: missing binary $1" >&2; return 1; }
+  grep -aqF -- "$2" "$1" || { echo "bundle: $1 does not embed commit $2 (stale build?); rebuild without --skip-build" >&2; return 1; }
+}
+
+case "${1:-}" in
+  check-out) [[ $# -eq 3 ]] || die "usage: bundle check-out <out> <target_dir>" 2; check_out "$2" "$3"; exit $? ;;
+  verify-sha) [[ $# -eq 3 ]] || die "usage: bundle verify-sha <binary> <sha>" 2; verify_sha_embedded "$2" "$3"; exit $? ;;
+esac
+
 n_override=""; out=""; dry=false; skip_build=false
 while [[ $# -gt 0 ]]; do
   case $1 in
     --n) n_override=${2:?}; shift 2 ;;
     --out) out=${2:?}; shift 2 ;;
     --dry-run) dry=true; shift ;;
-    --skip-build) skip_build=true; shift ;;
-    -h|--help) sed -n 2,14p "$0"; exit 0 ;;
+    --skip-build)
+      [[ "${CPZED_TEST_SKIP_BUILD:-}" == 1 ]] || die "--skip-build is for tests only; set CPZED_TEST_SKIP_BUILD=1" 2
+      skip_build=true; shift ;;
+    -h|--help) sed -n 2,26p "$0"; exit 0 ;;
     *) die "unknown argument $1" 2 ;;
   esac
 done
@@ -73,6 +108,7 @@ triple=$(rustc --version --verbose | sed -n 's/^host: //p')
 [[ "$triple" == aarch64-apple-darwin || "$triple" == x86_64-apple-darwin ]] || die "unsupported host $triple"
 
 echo "bundle: sha=$sha version=$cargo_ver-cpzed.$n channel=stable target=$target_dir out=$out"
+check_out "$out" "$target_dir" || die "unsafe --out / target dir (this script rm -rf's the out dir)" 9
 
 # Preflight (all fatal, in this order).
 has_identity=true
@@ -84,6 +120,14 @@ echo "bundle: free disk: ${free_gib} GiB; tracked changes: ${tracked_dirty:-none
 "$here/selfcheck" source >/dev/null || { "$here/selfcheck" source >&2 || true; die "selfcheck source failed: updater gate drifted" 4; }
 $has_identity || die "signing identity '$IDENTITY' not in 'security find-identity -p codesigning'. Create it in Keychain Access (Certificate Assistant > Create a Certificate, type Code Signing, self-signed), then re-run." 3
 [[ -z "$tracked_dirty" ]] || die "tracked files are modified; the build worktree must be clean" 5
+# Unattended-signing probe: a self-signed key shows a keychain "allow" dialog unless its
+# partition list allows codesign. Probe with a timeout so we fail instead of hanging.
+probe=$(mktemp -d); cp /usr/bin/true "$probe/probe"
+if ! perl -e 'alarm 25; exec @ARGV' /usr/bin/codesign --force --sign "$IDENTITY" "$probe/probe" >/dev/null 2>&1; then
+  rm -rf "$probe"
+  die "test codesign with '$IDENTITY' failed or hung (likely a keychain permission dialog). The USER must run once in Terminal, typing their login-keychain password themselves: see docs/fork/CPZED-SIGNING.md (bundle --help)." 10
+fi
+rm -rf "$probe"
 if $dry; then echo "bundle: dry run OK (no build, nothing written)"; exit 0; fi
 (( free_gib >= 100 )) || die "only ${free_gib} GiB free; need >= 100 GiB for a release build" 6
 [[ -d "$target_dir" ]] || mkdir -p "$target_dir"
@@ -107,6 +151,8 @@ if ! $skip_build; then
 fi
 
 echo "bundle: assembling"
+verify_sha_embedded "$target_dir/$triple/release/zed" "$sha" || die "stale zed binary" 11
+check_out "$out" "$target_dir" || die "unsafe --out" 9
 rm -rf "$out"; mkdir -p "$out"
 cp crates/zed/Cargo.toml "$out/Cargo.toml.orig"
 restore() { [[ -f "$out/Cargo.toml.orig" ]] && cp "$out/Cargo.toml.orig" "$repo/crates/zed/Cargo.toml"; }
@@ -119,7 +165,7 @@ restore; trap - EXIT
 
 app="$out/CPZed.app"
 mv "$app_path" "$app"
-cp crates/zed/resources/Document.icns "$app/Contents/Resources/Document.icns" 2>/dev/null || true
+cp crates/zed/resources/Document.icns "$app/Contents/Resources/Document.icns" || die "Document.icns copy failed" 12
 
 # Dev icon (identifies the fork build in the Dock) replaces the stable icon.
 icons=$(mktemp -d); mkdir "$icons/z.iconset"
@@ -138,7 +184,7 @@ gv() { sed -n "s/^$1=\"\(.*\)\"/\1/p" script/bundle-mac | head -1; }
 GIT_VERSION=$(gv GIT_VERSION); GIT_SHA=$(gv GIT_VERSION_SHA)
 if [[ "$triple" == aarch64-apple-darwin ]]; then g_arch=arm64; g_sum=$(gv GIT_ARM64_SHA256); else g_arch=x64; g_sum=$(gv GIT_X64_SHA256); fi
 tmp=$(mktemp -d)
-curl --silent --fail --location --output "$tmp/git.tgz" "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_SHA}-macOS-${g_arch}.tar.gz"
+curl --silent --fail --location --max-time 300 --retry 3 --retry-delay 2 --output "$tmp/git.tgz" "https://github.com/desktop/dugite-native/releases/download/${GIT_VERSION}/dugite-native-${GIT_VERSION}-${GIT_SHA}-macOS-${g_arch}.tar.gz"
 [[ "$(shasum -a 256 "$tmp/git.tgz" | cut -d' ' -f1)" == "$g_sum" ]] || die "bundled git SHA-256 mismatch"
 tar -xz -C "$tmp" -f "$tmp/git.tgz" bin/git
 mv "$tmp/bin/git" "$app/Contents/MacOS/git"; rm -rf "$tmp"
@@ -156,12 +202,15 @@ PY
 # Signing: no provisioning profile (team-bound), so drop the associated-domains entitlement.
 ent="$out/zed.entitlements"
 sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements > "$ent"
-for b in cli git; do /usr/bin/codesign --force --sign "$IDENTITY" "$app/Contents/MacOS/$b"; done
-/usr/bin/codesign --force --entitlements "$ent" --sign "$IDENTITY" "$app/Contents/MacOS/zed"
-/usr/bin/codesign --force --entitlements "$ent" --sign "$IDENTITY" "$app"
+# Same flow as script/bundle-mac: hardened runtime, entitlements on zed and the app.
+for b in cli git; do /usr/bin/codesign --deep --force --options runtime --sign "$IDENTITY" "$app/Contents/MacOS/$b" -v; done
+/usr/bin/codesign --deep --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app/Contents/MacOS/zed" -v
+/usr/bin/codesign --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app" -v
 
 echo "bundle: verifying"
 /usr/bin/codesign --verify --deep --strict "$app"
-/usr/bin/codesign -dv "$app" 2>&1 | grep -F "Authority=$IDENTITY" >/dev/null || die "codesign -dv does not show '$IDENTITY'" 8
+dv=$(/usr/bin/codesign -dv "$app" 2>&1)
+grep -qF "Authority=$IDENTITY" <<<"$dv" || die "codesign -dv does not show '$IDENTITY'" 8
+grep -Eq 'flags=0x[0-9a-f]+\(.*runtime' <<<"$dv" || die "codesign -dv does not show the hardened runtime flag" 8
 "$here/selfcheck" app "$app"
 echo "bundle: built $app ($cargo_ver-cpzed.$n, ${sha:0:7})"

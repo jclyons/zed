@@ -59,7 +59,11 @@ check_app() {
 
   local lock
   lock=$(pb 'Print :LSEnvironment:ZED_UPDATE_EXPLANATION' "$plist")
-  [[ -n "$lock" ]] && ok "LSEnvironment backup lock set" || bad "LSEnvironment ZED_UPDATE_EXPLANATION missing"
+  [[ "$lock" == "$CPZED_UPDATE_EXPLANATION" ]] && ok "LSEnvironment backup lock equals the explanation" || bad "LSEnvironment ZED_UPDATE_EXPLANATION missing or differs: '$lock'"
+  local icns
+  for icns in Zed.icns Document.icns; do
+    [[ -s "$app/Contents/Resources/$icns" ]] && ok "$icns present" || bad "$icns missing or empty"
+  done
 
   # Compile-time lock: the message string must be baked into the binary.
   if grep -aqF -- "$CPZED_UPDATE_EXPLANATION" "$bin"; then ok "explanation string present in binary"

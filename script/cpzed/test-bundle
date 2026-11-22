@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Tests for script/cpzed/{bundle,selfcheck} that need no build. Exit 0 = all pass.
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+fails=0
+t() { local name=$1 want=$2; shift 2; "$@" >/dev/null 2>&1; local rc=$?
+  if { [[ $want == ok && $rc -eq 0 ]] || [[ $want == fail && $rc -ne 0 ]]; }; then echo "pass: $name"; else echo "FAIL: $name (rc=$rc)"; fails=1; fi; }
+
+tgt=$T/target; mkdir -p "$tgt/inside"
+ln -s /Applications "$tgt/link-apps"; ln -s "$HOME" "$tgt/link-home"
+t "out inside target ok"            ok   "$here/bundle" check-out "$tgt/inside/o" "$tgt"
+t "out == /Applications/CPZed.app"  fail "$here/bundle" check-out /Applications/CPZed.app "$tgt"
+t "out == /Applications"            fail "$here/bundle" check-out /Applications "$tgt"
+t "out == HOME"                     fail "$here/bundle" check-out "$HOME" "$tgt"
+t "out == child of HOME"            fail "$here/bundle" check-out "$HOME/code" "$tgt"
+t "out == CPZed state dir"          fail "$here/bundle" check-out "$HOME/Library/Application Support/CPZed/ring" "$tgt"
+t "relative out"                    fail "$here/bundle" check-out relative/dir "$tgt"
+t ".. escape"                       fail "$here/bundle" check-out "$tgt/inside/../../escape" "$tgt"
+t "symlink to /Applications"        fail "$here/bundle" check-out "$tgt/link-apps/CPZed.app" "$tgt"
+t "symlink to HOME"                 fail "$here/bundle" check-out "$tgt/link-home/x" "$tgt"
+t "out == target itself"            fail "$here/bundle" check-out "$tgt" "$tgt"
+t "target dir == HOME"              fail "$here/bundle" check-out "$HOME/x" "$HOME"
+t "target dir == /Applications"     fail "$here/bundle" check-out /Applications/x /Applications
+t "--skip-build without env guard"  fail "$here/bundle" --skip-build --dry-run
+
+sha=0123456789abcdef0123456789abcdef01234567
+printf 'binary %s end' "$sha" > "$T/fresh"; printf 'binary othersha end' > "$T/stale"
+t "binary embedding sha ok"         ok   "$here/bundle" verify-sha "$T/fresh" "$sha"
+t "stale binary rejected"           fail "$here/bundle" verify-sha "$T/stale" "$sha"
+
+# selfcheck: doctored source, LSEnvironment mismatch, missing icns
+repo=$(cd "$here/../.." && pwd)
+t "selfcheck source real"           ok   "$here/selfcheck" source
+sed 's/option_env!("ZED_UPDATE_EXPLANATION").is_none()/true/' "$repo/crates/auto_update/src/auto_update.rs" > "$T/doctored.rs"
+t "selfcheck doctored source"       fail "$here/selfcheck" source --file "$T/doctored.rs"
+app=$T/CPZed.app; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cat > "$app/Contents/Info.plist" <<'P'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>x</string>
+<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>zed</string></array></dict></array></dict></plist>
+P
+"$here/bundle" patch-plist "$app" 1.31.0 $sha 12
+printf 'xx%sxx' "$("$here/selfcheck" explanation)" > "$app/Contents/MacOS/zed"
+echo "{\"sha\":\"$sha\",\"n\":12,\"upstream_base\":\"x\",\"built_at\":\"t\",\"host\":\"h\"}" > "$app/Contents/Resources/cpzed-build.json"
+echo icns > "$app/Contents/Resources/Zed.icns"
+t "selfcheck app missing Document.icns" fail "$here/selfcheck" app "$app"
+echo icns > "$app/Contents/Resources/Document.icns"
+t "selfcheck app good"              ok   "$here/selfcheck" app "$app"
+/usr/libexec/PlistBuddy -c 'Set :LSEnvironment:ZED_UPDATE_EXPLANATION "something else"' "$app/Contents/Info.plist"
+t "selfcheck LSEnvironment differs" fail "$here/selfcheck" app "$app"
+exit $fails
