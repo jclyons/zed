@@ -4,6 +4,14 @@
 //!
 //! Design: `designs/cpzed-3-agent-new.md` (fork-private).
 //!
+//! Target resolution: the deepest open workspace root containing the (canonical)
+//! cwd wins. Otherwise, if cwd is inside a git work tree whose repository is
+//! already open (same git common dir, e.g. only a linked worktree of it is
+//! open), a workspace for the cwd's git *toplevel* (never the raw cwd or a
+//! subdirectory) is added to that repo's window with `OpenMode::Add`, joining
+//! the repo's sidebar group. A cwd that is neither inside an open root nor in
+//! an open repo is "no match" (exit 3 by default).
+//!
 //! Known limitation (tracked as a follow-up): when the CLI launches Zed
 //! itself, this handler can run before session restore has reopened the user's
 //! windows. A cwd inside a project that restore is about to bring back then
@@ -612,7 +620,10 @@ async fn reply_json(
         serde_json::json!({
             "id": terminal_id.to_string(),
             "kind": "terminal",
-            "title": info.as_ref().map(|info| info.title.to_string()),
+            "title": info
+                .as_ref()
+                .map(|info| info.title.to_string())
+                .filter(|title| !title.is_empty()),
             "working_directory": info
                 .and_then(|info| info.working_directory)
                 .unwrap_or_else(|| cwd.to_path_buf())
@@ -1460,24 +1471,20 @@ mod tests {
         assert_eq!(pick_by_common_dir(Path::new("/unrelated.git"), &open), None);
     }
 
-    #[gpui::test]
-    async fn test_real_bare_repo_layout_end_to_end(cx: &mut TestAppContext) {
-        let fake_state = init_agent_test(cx);
-        let real_state = Arc::new(AppState {
-            languages: fake_state.languages.clone(),
-            client: fake_state.client.clone(),
-            user_store: fake_state.user_store.clone(),
-            workspace_store: fake_state.workspace_store.clone(),
+    fn real_app_state(cx: &mut TestAppContext, fake: &Arc<AppState>) -> Arc<AppState> {
+        Arc::new(AppState {
+            languages: fake.languages.clone(),
+            client: fake.client.clone(),
+            user_store: fake.user_store.clone(),
+            workspace_store: fake.workspace_store.clone(),
             fs: fs::RealFs::new(None, cx.executor()),
-            build_window_options: fake_state.build_window_options,
-            node_runtime: fake_state.node_runtime.clone(),
-            session: fake_state.session.clone(),
-        });
-        let dirs = TestDirs::new("real-bare");
-        let (_bare, main_wt, feature_wt) = make_bare_layout(&dirs);
+            build_window_options: fake.build_window_options,
+            node_runtime: fake.node_runtime.clone(),
+            session: fake.session.clone(),
+        })
+    }
 
-        let (window, main_ws) = open_window(cx, &real_state, &main_wt).await;
-        // Let the real repository scan report the repo.
+    async fn wait_for_repo_scan(cx: &mut TestAppContext) {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             cx.run_until_parked();
@@ -1488,11 +1495,220 @@ mod tests {
                     .any(|entry| !entry.common_dirs.is_empty())
             });
             if ready {
-                break;
+                return;
             }
             assert!(std::time::Instant::now() < deadline, "repo never scanned");
             cx.executor().timer(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Non-bare layout: `main/` checkout plus linked worktree `linked/`.
+    fn make_linked_layout(dirs: &TestDirs) -> (PathBuf, PathBuf) {
+        let main = dirs.dir("main");
+        run_git(&["init", "-q", "-b", "main"], &main);
+        run_git(&["commit", "-q", "--allow-empty", "-m", "init"], &main);
+        run_git(&["worktree", "add", "-q", "-b", "feat", "../linked"], &main);
+        std::fs::create_dir_all(main.join("sub")).unwrap();
+        std::fs::create_dir_all(dirs.root.join("linked/sub")).unwrap();
+        (main, dirs.root.join("linked"))
+    }
+
+    #[gpui::test]
+    async fn test_git_fallback_alone_adds_the_worktree_toplevel(cx: &mut TestAppContext) {
+        // The open project is a FakeFs view of the main worktree whose
+        // snapshot knows the common dir but NOT the feature worktree, so only
+        // the `git rev-parse` fallback (real git on the real cwd) can match.
+        let app_state = init_agent_test(cx);
+        let dirs = TestDirs::new("fallback-only");
+        let (bare, main_wt, feature_wt) = make_bare_layout(&dirs);
+        let fs = app_state.fs.as_fake();
+        fs.insert_tree(
+            &main_wt,
+            json!({
+                ".git": format!("gitdir: {}", bare.join("worktrees/worktree-branch-main").display()),
+                "crates": {},
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            &bare.join("worktrees/worktree-branch-main"),
+            json!({ "commondir": "../..", "HEAD": "ref: refs/heads/main" }),
+        )
+        .await;
+        let (window, main_ws) = open_window(cx, &app_state, &main_wt).await;
+        wait_for_repo_scan(cx).await;
+        let (known_linked, known_common) = cx.update(|cx| {
+            let linked = collect_candidates(cx).2;
+            (
+                linked
+                    .iter()
+                    .flat_map(|l| l.linked_roots.clone())
+                    .collect::<Vec<_>>(),
+                linked
+                    .iter()
+                    .flat_map(|l| l.common_dirs.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        assert!(
+            !known_linked
+                .iter()
+                .any(|root| root.starts_with(&feature_wt)),
+            "snapshot must not know the feature worktree: {known_linked:?}"
+        );
+        assert!(
+            known_common.contains(&canonical_or_self(&bare)),
+            "{known_common:?}"
+        );
+
+        let outcome = request(
+            cx,
+            &app_state,
+            &feature_wt.join("crates"),
+            None,
+            NoMatchBehavior::Error,
+            Timeouts::default(),
+        )
+        .await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        cx.run_until_parked();
+        assert_eq!(workspace_count(cx, window), 2);
+        assert_eq!(
+            displayed_workspace(cx, window),
+            main_ws,
+            "must not activate"
+        );
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+        // The new workspace root is the git toplevel, not the cwd subdir.
+        let roots = window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspaces()
+                    .flat_map(|ws| ws.read(cx).root_paths(cx))
+                    .map(|path| canonical_or_self(&path))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert!(roots.contains(&canonical_or_self(&feature_wt)), "{roots:?}");
+        assert!(
+            !roots.iter().any(|root| root.ends_with("crates")),
+            "{roots:?}"
+        );
+        let keys = window
+            .read_with(cx, |multi_workspace, _| {
+                multi_workspace.project_group_keys()
+            })
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_main_checkout_cwd_adds_main_toplevel_when_only_linked_is_open(
+        cx: &mut TestAppContext,
+    ) {
+        let fake_state = init_agent_test(cx);
+        let real_state = real_app_state(cx, &fake_state);
+        let dirs = TestDirs::new("main-from-linked");
+        let (main, linked) = make_linked_layout(&dirs);
+        let (window, linked_ws) = open_window(cx, &real_state, &linked).await;
+        wait_for_repo_scan(cx).await;
+
+        let outcome = request(
+            cx,
+            &real_state,
+            &main.join("sub"),
+            None,
+            NoMatchBehavior::Error,
+            Timeouts::default(),
+        )
+        .await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert_eq!(workspace_count(cx, window), 2);
+        assert_eq!(displayed_workspace(cx, window), linked_ws);
+        let reply = outcome.stdout.unwrap();
+        assert_eq!(
+            reply["folder_paths"][0]
+                .as_str()
+                .map(|p| canonical_or_self(Path::new(p))),
+            Some(canonical_or_self(&main)),
+            "workspace root is the main checkout toplevel, not main/sub"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subdirectory_of_open_linked_worktree_adds_no_workspace(cx: &mut TestAppContext) {
+        let fake_state = init_agent_test(cx);
+        let real_state = real_app_state(cx, &fake_state);
+        let dirs = TestDirs::new("sub-of-linked");
+        let (_main, linked) = make_linked_layout(&dirs);
+        let (window, linked_ws) = open_window(cx, &real_state, &linked).await;
+        wait_for_repo_scan(cx).await;
+
+        let outcome = request(
+            cx,
+            &real_state,
+            &linked.join("sub"),
+            None,
+            NoMatchBehavior::Error,
+            Timeouts::default(),
+        )
+        .await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert_eq!(workspace_count(cx, window), 1);
+        assert_eq!(terminal_count(cx, &linked_ws), 1);
+    }
+
+    #[gpui::test]
+    async fn test_reply_title_is_null_unless_given(cx: &mut TestAppContext) {
+        let app_state = init_agent_test(cx);
+        let dirs = TestDirs::new("title");
+        let root = dirs.dir("project");
+        insert_dirs(&app_state, &root, json!({})).await;
+        let (_window, _workspace) = open_window(cx, &app_state, &root).await;
+
+        let untitled = request(
+            cx,
+            &app_state,
+            &root,
+            None,
+            NoMatchBehavior::Error,
+            Timeouts::default(),
+        )
+        .await;
+        assert_eq!(untitled.status, 0, "{untitled:?}");
+        assert!(untitled.stdout.unwrap()["title"].is_null());
+
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        handle_new_agent_terminal_with_timeouts(
+            root.clone(),
+            None,
+            Some("my agent".to_string()),
+            NoMatchBehavior::Error,
+            app_state.clone(),
+            Timeouts::default(),
+            &sink,
+            &mut async_cx,
+        )
+        .await;
+        let titled = Outcome::from(&sink);
+        assert_eq!(titled.status, 0, "{titled:?}");
+        assert!(
+            titled.stdout.unwrap()["title"]
+                .as_str()
+                .is_some_and(|title| title.contains("my agent"))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_real_bare_repo_layout_end_to_end(cx: &mut TestAppContext) {
+        let fake_state = init_agent_test(cx);
+        let real_state = real_app_state(cx, &fake_state);
+        let dirs = TestDirs::new("real-bare");
+        let (_bare, main_wt, feature_wt) = make_bare_layout(&dirs);
+
+        let (window, main_ws) = open_window(cx, &real_state, &main_wt).await;
+        wait_for_repo_scan(cx).await;
 
         let outcome = request(
             cx,
