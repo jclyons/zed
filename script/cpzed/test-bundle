@@ -9,19 +9,31 @@ t() { local name=$1 want=$2; shift 2; "$@" >/dev/null 2>&1; local rc=$?
 
 tgt=$T/target; mkdir -p "$tgt/inside"
 ln -s /Applications "$tgt/link-apps"; ln -s "$HOME" "$tgt/link-home"
-t "out inside target ok"            ok   "$here/bundle" check-out "$tgt/inside/o" "$tgt"
-t "out == /Applications/CPZed.app"  fail "$here/bundle" check-out /Applications/CPZed.app "$tgt"
-t "out == /Applications"            fail "$here/bundle" check-out /Applications "$tgt"
-t "out == HOME"                     fail "$here/bundle" check-out "$HOME" "$tgt"
-t "out == child of HOME"            fail "$here/bundle" check-out "$HOME/code" "$tgt"
-t "out == CPZed state dir"          fail "$here/bundle" check-out "$HOME/Library/Application Support/CPZed/ring" "$tgt"
-t "relative out"                    fail "$here/bundle" check-out relative/dir "$tgt"
-t ".. escape"                       fail "$here/bundle" check-out "$tgt/inside/../../escape" "$tgt"
-t "symlink to /Applications"        fail "$here/bundle" check-out "$tgt/link-apps/CPZed.app" "$tgt"
-t "symlink to HOME"                 fail "$here/bundle" check-out "$tgt/link-home/x" "$tgt"
-t "out == target itself"            fail "$here/bundle" check-out "$tgt" "$tgt"
-t "target dir == HOME"              fail "$here/bundle" check-out "$HOME/x" "$HOME"
-t "target dir == /Applications"     fail "$here/bundle" check-out /Applications/x /Applications
+# check-out: allowlist (inside repo root, out inside target) + case-insensitive denylist.
+# Fake HOME and fake repo root; the real /Applications is only ever a *string* here.
+FH=$T/home; root=$FH/code/cpzed-sandbox/wt; tgt=$root/target-install
+mkdir -p "$tgt/inside" "$FH/Library/Application Support/CPZed" "$FH/code/cpzed-sandbox/zed.git"
+ln -s /Applications "$tgt/link-apps"; ln -s "$FH" "$tgt/link-home"
+co() { HOME=$FH "$here/bundle" check-out "$@"; }
+t "out inside target ok"             ok   co "$tgt/inside/o" "$tgt" "$root"
+t "default-style out ok"             ok   co "$tgt/cpzed-out" "$tgt" "$root"
+t "out == /Applications/CPZed.app"   fail co /Applications/CPZed.app "$tgt" "$root"
+t "lowercase /applications target"   fail co /applications/CPZed.app /applications /
+t "mixed-case /ApplicationS target"  fail co /ApplicationS/x/CPZed.app /ApplicationS/x /
+t "lowercase /users/<u> home check"  fail env HOME=/Users/zz "$here/bundle" check-out /users/zz/foo /users/zz /
+t "out == HOME"                      fail co "$FH" "$tgt" "$root"
+t "out == child of HOME"             fail co "$FH/code" "$tgt" "$root"
+t "target == fake Application Support" fail co "$FH/Library/Application Support/Zed" "$FH/Library/Application Support" "$root"
+t "target == fake App Support, root widened" fail co "$FH/Library/Application Support/Zed" "$FH/Library/Application Support" "$FH"
+t "target == dir holding zed.git"    fail co "$FH/code/cpzed-sandbox/zed.git" "$FH/code/cpzed-sandbox" "$root"
+t "out == CPZed state dir"           fail co "$FH/Library/Application Support/CPZed/ring" "$tgt" "$root"
+t "relative out"                     fail co relative/dir "$tgt" "$root"
+t ".. escape"                        fail co "$tgt/inside/../../escape" "$tgt" "$root"
+t "symlink to /Applications"         fail co "$tgt/link-apps/CPZed.app" "$tgt" "$root"
+t "symlink to HOME"                  fail co "$tgt/link-home/x" "$tgt" "$root"
+t "out == target itself"             fail co "$tgt" "$tgt" "$root"
+t "target == repo root itself"       fail co "$root/x" "$root" "$root"
+t "target outside repo root"         fail co "$T/elsewhere/o" "$T/elsewhere" "$root"
 t "--skip-build without env guard"  fail "$here/bundle" --skip-build --dry-run
 
 sha=0123456789abcdef0123456789abcdef01234567

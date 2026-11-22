@@ -12,6 +12,15 @@
 # Environment: CPZED_IDENTITY (default "CPZed Local Signing"), CPZED_STATE
 # (default ~/Library/Application Support/CPZed/state.json), CPZED_TARGET_DIR
 # (default <repo>/target-install).
+#
+# ONE-TIME USER STEP (unattended signing): a self-signed key triggers a keychain "allow"
+# dialog on every codesign unless its partition list permits codesign. The USER runs this
+# in a plain Terminal (not a Zed thread, not a Claude session) and types the login-keychain
+# password at security's own prompt; no -k, so it is never on a command line:
+#   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -l "CPZed Local Signing" ~/Library/Keychains/login.keychain-db
+# `bundle` probes with a 20 s test codesign and fails (exit 10) instead of hanging.
+# Exit codes: 3 no identity, 4 selfcheck, 5 dirty tree, 6 disk, 7 cargo running (retry),
+# 9 unsafe --out, 10 signing probe, 11 stale binary. --skip-build needs CPZED_TEST_SKIP_BUILD=1.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -50,23 +59,29 @@ fi
 # Resolve a path with symlinks and `..` collapsed; the leaf need not exist.
 realpath_m() { python3 -I -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1"; }
 
-# Refuse any output dir that is not strictly inside the (resolved) target dir, and
-# hard-refuse protected locations. $1=out, $2=target_dir. Returns 0 if safe to rm -rf.
+# Allowlist (with a denylist as defense in depth). $1=out, $2=target_dir, $3=repo root.
+# Safe to rm -rf only if realpath(target) is strictly inside realpath(root) AND realpath(out)
+# is strictly inside realpath(target). All comparisons are lowercase because APFS is
+# case-insensitive and realpath keeps the caller's spelling.
 check_out() {
-  local o=$1 t=$2 ro rt home p
-  [[ "$o" == /* ]] || { echo "bundle: --out must be an absolute path: $o" >&2; return 1; }
-  [[ "$t" == /* ]] || { echo "bundle: target dir must be an absolute path: $t" >&2; return 1; }
-  ro=$(realpath_m "$o"); rt=$(realpath_m "$t"); home=$(realpath_m "$HOME")
-  for p in "$ro" "$rt"; do
-    case "$p" in
-      /|/Applications|/Applications/*|/System|/System/*|/usr|/usr/*|/Library|/Library/*) echo "bundle: refusing protected path $p" >&2; return 1 ;;
-      "$home"/Library/Application\ Support/CPZed|"$home"/Library/Application\ Support/CPZed/*) echo "bundle: refusing CPZed state dir $p" >&2; return 1 ;;
-    esac
-    # $HOME itself and its direct children (Documents, code, Library, ...).
-    if [[ "$p" == "$home" || "$(dirname "$p")" == "$home" ]]; then echo "bundle: refusing home or a direct child of home: $p" >&2; return 1; fi
-  done
-  [[ "$ro" == "$rt"/* ]] || { echo "bundle: --out ($ro) must be strictly inside the target dir ($rt)" >&2; return 1; }
-  return 0
+  python3 -I - "$1" "$2" "${3:-$repo}" "$HOME" <<'PY'
+import os, sys
+out, tgt, root, home = sys.argv[1:5]
+def die(m): print("bundle: " + m, file=sys.stderr); sys.exit(1)
+for name, v in (("--out", out), ("target dir", tgt), ("repo root", root)):
+    if not v.startswith("/"): die("%s must be an absolute path: %s" % (name, v))
+rp = lambda p: os.path.realpath(p).lower().rstrip("/") or "/"
+ro, rt, rr, rh = rp(out), rp(tgt), rp(root), rp(home)
+inside = lambda child, parent: child.startswith(parent.rstrip("/") + "/")
+state = rh + "/library/application support/cpzed"
+for p in (ro, rt):
+    if p == "/" or any(p == d or inside(p, d) for d in ("/applications", "/system", "/usr", "/library", "/private/etc", "/private/var/db", "/bin", "/sbin", rh + "/library", state)):
+        die("refusing protected path " + p)
+    if p == rh or os.path.dirname(p) == rh:
+        die("refusing home or a direct child of home: " + p)
+if not inside(rt, rr): die("target dir (%s) must be strictly inside the repo root (%s)" % (rt, rr))
+if not inside(ro, rt): die("--out (%s) must be strictly inside the target dir (%s)" % (ro, rt))
+PY
 }
 
 # The release binary must embed the full commit SHA it is about to be stamped with.
@@ -76,7 +91,7 @@ verify_sha_embedded() { # binary sha
 }
 
 case "${1:-}" in
-  check-out) [[ $# -eq 3 ]] || die "usage: bundle check-out <out> <target_dir>" 2; check_out "$2" "$3"; exit $? ;;
+  check-out) [[ $# -ge 3 ]] || die "usage: bundle check-out <out> <target_dir> [repo_root]" 2; check_out "$2" "$3" "${4:-$repo}"; exit $? ;;
   verify-sha) [[ $# -eq 3 ]] || die "usage: bundle verify-sha <binary> <sha>" 2; verify_sha_embedded "$2" "$3"; exit $? ;;
 esac
 
@@ -89,7 +104,7 @@ while [[ $# -gt 0 ]]; do
     --skip-build)
       [[ "${CPZED_TEST_SKIP_BUILD:-}" == 1 ]] || die "--skip-build is for tests only; set CPZED_TEST_SKIP_BUILD=1" 2
       skip_build=true; shift ;;
-    -h|--help) sed -n 2,26p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,24p "$0"; exit 0 ;;
     *) die "unknown argument $1" 2 ;;
   esac
 done
@@ -123,7 +138,7 @@ $has_identity || die "signing identity '$IDENTITY' not in 'security find-identit
 # Unattended-signing probe: a self-signed key shows a keychain "allow" dialog unless its
 # partition list allows codesign. Probe with a timeout so we fail instead of hanging.
 probe=$(mktemp -d); cp /usr/bin/true "$probe/probe"
-if ! perl -e 'alarm 25; exec @ARGV' /usr/bin/codesign --force --sign "$IDENTITY" "$probe/probe" >/dev/null 2>&1; then
+if ! perl -e 'alarm 20; exec @ARGV' /usr/bin/codesign --force --sign "$IDENTITY" "$probe/probe" >/dev/null 2>&1; then
   rm -rf "$probe"
   die "test codesign with '$IDENTITY' failed or hung (likely a keychain permission dialog). The USER must run once in Terminal, typing their login-keychain password themselves: see docs/fork/CPZED-SIGNING.md (bundle --help)." 10
 fi
@@ -151,7 +166,7 @@ if ! $skip_build; then
 fi
 
 echo "bundle: assembling"
-verify_sha_embedded "$target_dir/$triple/release/zed" "$sha" || die "stale zed binary" 11
+for bin in zed cli; do verify_sha_embedded "$target_dir/$triple/release/$bin" "$sha" || die "stale $bin binary" 11; done
 check_out "$out" "$target_dir" || die "unsafe --out" 9
 rm -rf "$out"; mkdir -p "$out"
 cp crates/zed/Cargo.toml "$out/Cargo.toml.orig"
@@ -202,10 +217,11 @@ PY
 # Signing: no provisioning profile (team-bound), so drop the associated-domains entitlement.
 ent="$out/zed.entitlements"
 sed '/com.apple.developer.associated-domains/,+1d' crates/zed/resources/zed.entitlements > "$ent"
+cs() { perl -e 'alarm 120; exec @ARGV' /usr/bin/codesign "$@"; }
 # Same flow as script/bundle-mac: hardened runtime, entitlements on zed and the app.
-for b in cli git; do /usr/bin/codesign --deep --force --options runtime --sign "$IDENTITY" "$app/Contents/MacOS/$b" -v; done
-/usr/bin/codesign --deep --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app/Contents/MacOS/zed" -v
-/usr/bin/codesign --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app" -v
+for b in cli git; do cs --deep --force --options runtime --sign "$IDENTITY" "$app/Contents/MacOS/$b" -v; done
+cs --deep --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app/Contents/MacOS/zed" -v
+cs --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app" -v
 
 echo "bundle: verifying"
 /usr/bin/codesign --verify --deep --strict "$app"
