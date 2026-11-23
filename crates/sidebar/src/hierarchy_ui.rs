@@ -435,9 +435,9 @@ impl Sidebar {
     }
 
     fn set_row_subtree_collapsed(&mut self, key: &RowKey, collapsed: bool, cx: &mut Context<Self>) {
-        self.hierarchy
-            .store
-            .update(cx, |store, cx| store.set_row_collapsed(key, collapsed, cx));
+        self.hierarchy.store.update(cx, |store, cx| {
+            store.set_row_collapsed(key, collapsed, cx).ok();
+        });
     }
 
     fn set_section_collapsed(
@@ -850,7 +850,6 @@ impl Sidebar {
             let key = key.clone();
             let group = layout.group.clone();
             let sidebar = sidebar.clone();
-            let sections = sections.clone();
             menu = menu.submenu("Move to Section", move |mut submenu, _window, _cx| {
                 for (id, name) in sections.clone() {
                     let key = key.clone();
@@ -902,7 +901,7 @@ impl Sidebar {
                 None,
                 move |_window, cx| {
                     store_update(cx, |store, cx| {
-                        store.set_row_collapsed(&key, !collapsed, cx);
+                        store.set_row_collapsed(&key, !collapsed, cx).ok();
                     });
                 },
             );

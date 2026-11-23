@@ -280,7 +280,7 @@ async fn test_nesting_collapse_depth_and_keys(cx: &mut TestAppContext) {
 
     // Collapsed: "+2" and the children are gone.
     edit(&mut cx, |store, cx| {
-        store.set_row_collapsed(&key(parent), true, cx)
+        store.set_row_collapsed(&key(parent), true, cx).ok();
     });
     assert_eq!(
         rows(&sidebar, &mut cx),
@@ -439,7 +439,7 @@ async fn test_real_sequence_survives_restart_and_shows_in_two_windows(cx: &mut T
         let (two, _) = store.create_section(&gb, "Two", cx).unwrap();
         store.set_section(&key(p1), &gb, Some(&one), cx).unwrap();
         store.set_section(&key(p2), &gb, Some(&two), cx).unwrap();
-        store.set_row_collapsed(&key(manager), true, cx);
+        store.set_row_collapsed(&key(manager), true, cx).ok();
         store.set_section_collapsed(&gb, &two, true, cx).unwrap();
     });
 
@@ -471,7 +471,7 @@ async fn test_real_sequence_survives_restart_and_shows_in_two_windows(cx: &mut T
 
     // Expanding the manager after the reload shows the whole tree, sub-builder at depth 2.
     edit(&mut cx1, |store, cx| {
-        store.set_row_collapsed(&key(manager), false, cx)
+        store.set_row_collapsed(&key(manager), false, cx).ok();
     });
     let tree = rows(&sidebar2, &mut cx2);
     assert_eq!(tree[6], "    manager");
@@ -510,7 +510,7 @@ async fn test_collapsed_parent_rolls_up_notifications(cx: &mut TestAppContext) {
         store
             .set_parent(&key(ids[2]), Some(&key(ids[1])), cx)
             .unwrap();
-        store.set_row_collapsed(&key(ids[0]), true, cx);
+        store.set_row_collapsed(&key(ids[0]), true, cx).ok();
     });
     panel.update(&mut cx, |panel, cx| {
         panel.emit_test_terminal_bell(ids[2], cx)
