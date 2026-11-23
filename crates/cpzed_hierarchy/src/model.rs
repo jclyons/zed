@@ -155,6 +155,25 @@ pub struct Hierarchy {
     pub last_seen: BTreeMap<RowKey, i64>,
     #[serde(default, with = "pairs")]
     pub group_last_seen: BTreeMap<GroupKey, i64>,
+    /// Section ids are never reused: a stale id held by the UI or CLI can never hit a newer section.
+    #[serde(default)]
+    pub next_section: u64,
+}
+
+/// What a stored blob turned out to be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadOutcome {
+    /// Nothing stored yet.
+    Missing,
+    Loaded(Hierarchy),
+    /// Unparseable, or an older version. Loads as empty; the raw blob must be backed up before the
+    /// first write replaces it.
+    Unreadable {
+        reason: String,
+    },
+    /// Written by a NEWER build (version above ours). Load empty and never write (read-only), so a
+    /// rollback cannot wipe the newer build's data.
+    FutureVersion(u64),
 }
 
 impl Default for Hierarchy {
@@ -168,6 +187,7 @@ impl Default for Hierarchy {
             collapsed_rows: BTreeSet::new(),
             last_seen: BTreeMap::new(),
             group_last_seen: BTreeMap::new(),
+            next_section: 0,
         }
     }
 }
@@ -181,23 +201,57 @@ impl Hierarchy {
         *self == Hierarchy::default()
     }
 
-    /// Parse a stored blob. A v1 blob, any other version, or malformed JSON loads as an empty
-    /// hierarchy (with a warning). Never panics.
+    /// Parse a stored blob. Anything that is not a readable current-version blob (v1, a future
+    /// version, malformed JSON) gives an empty hierarchy, with a warning. Never panics. The store
+    /// uses [`Hierarchy::load`] instead so it can preserve what it could not read.
     pub fn from_json(text: &str) -> Self {
-        match serde_json::from_str::<Hierarchy>(text) {
-            Ok(h) if h.version == VERSION => h,
-            Ok(h) => {
-                log::warn!(
-                    "cpzed_hierarchy: ignoring stored version {} (want {VERSION})",
-                    h.version
-                );
+        match Self::load(Some(text)) {
+            LoadOutcome::Loaded(h) => h,
+            LoadOutcome::Missing => Hierarchy::default(),
+            LoadOutcome::Unreadable { reason } => {
+                log::warn!("cpzed_hierarchy: ignoring unreadable stored hierarchy: {reason}");
                 Hierarchy::default()
             }
-            Err(error) => {
-                log::warn!("cpzed_hierarchy: ignoring unreadable stored hierarchy: {error}");
+            LoadOutcome::FutureVersion(version) => {
+                log::warn!("cpzed_hierarchy: ignoring stored version {version} (want {VERSION})");
                 Hierarchy::default()
             }
         }
+    }
+
+    /// Classify a stored blob (see [`LoadOutcome`]). Never panics.
+    pub fn load(text: Option<&str>) -> LoadOutcome {
+        let Some(text) = text else {
+            return LoadOutcome::Missing;
+        };
+        let version = serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|value| value.get("version").and_then(|v| v.as_u64()));
+        if let Some(version) = version
+            && version > u64::from(VERSION)
+        {
+            return LoadOutcome::FutureVersion(version);
+        }
+        match serde_json::from_str::<Hierarchy>(text) {
+            Ok(h) if h.version == VERSION => LoadOutcome::Loaded(h),
+            Ok(h) => LoadOutcome::Unreadable {
+                reason: format!("stored version {} (want {VERSION})", h.version),
+            },
+            Err(error) => LoadOutcome::Unreadable {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    /// Key suffix under which an unreadable blob is preserved: one stable key per distinct blob.
+    pub fn backup_suffix(blob: &str) -> String {
+        // FNV-1a: stable across builds (std's hashers are not guaranteed to be).
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in blob.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("{hash:016x}")
     }
 
     pub fn to_json(&self) -> anyhow::Result<String> {
@@ -260,20 +314,19 @@ impl Hierarchy {
 
     // ---- sections -----------------------------------------------------------------------
 
-    fn next_section_id(&self) -> SectionId {
+    pub(crate) fn next_section_id(&mut self) -> SectionId {
         let used: BTreeSet<&str> = self
             .sections
             .values()
             .flatten()
             .map(|s| s.id.0.as_str())
             .collect();
-        let mut n = 1u64;
         loop {
-            let candidate = format!("s{n}");
+            self.next_section += 1;
+            let candidate = format!("s{}", self.next_section);
             if !used.contains(candidate.as_str()) {
                 return SectionId(candidate);
             }
-            n += 1;
         }
     }
 
@@ -506,6 +559,9 @@ impl Hierarchy {
 
     /// Move `row` next to `target` inside `container`.
     ///
+    /// `row_group` is the row's own project; a section or unsectioned container of another
+    /// project is refused (invariant a).
+    ///
     /// `visible` is the container's current visible order; it is materialized first (H6), so the
     /// stored order is exactly what the user saw. Entries stored but not visible keep their
     /// relative order after the visible ones. If `row` is not yet in the container it is moved in
@@ -513,6 +569,7 @@ impl Hierarchy {
     pub fn move_row(
         &mut self,
         row: &RowKey,
+        row_group: &GroupKey,
         target: &RowKey,
         side: Side,
         container: &Container,
@@ -534,8 +591,15 @@ impl Hierarchy {
                 if self.section(group, id).is_none() {
                     return Err(Refusal::UnknownSection);
                 }
+                if group != row_group {
+                    return Err(Refusal::SectionNotInGroup);
+                }
             }
-            Container::Unsectioned(_) => {}
+            Container::Unsectioned(group) => {
+                if group != row_group {
+                    return Err(Refusal::InvalidTarget);
+                }
+            }
         }
 
         // Detach from wherever the row is now, then record membership in the container.
@@ -565,14 +629,11 @@ impl Hierarchy {
         };
 
         let mut list: Vec<RowKey> = Vec::with_capacity(visible.len() + stored.len() + 1);
-        for key in visible {
-            if key != row && !list.contains(key) {
+        let mut present: std::collections::HashSet<&RowKey> =
+            std::collections::HashSet::with_capacity(visible.len() + stored.len());
+        for key in visible.iter().chain(stored.iter()) {
+            if key != row && present.insert(key) {
                 list.push(key.clone());
-            }
-        }
-        for key in stored {
-            if key != *row && !list.contains(&key) {
-                list.push(key);
             }
         }
         let at = list
@@ -649,11 +710,26 @@ impl Hierarchy {
     }
 
     /// Drop rows unseen for [`RETENTION_SECS`], and the sections of groups unseen that long.
+    ///
+    /// Staleness is relative to the hierarchy's own activity, not the wall clock: the reference is
+    /// the newest `last_seen`/`group_last_seen` that is not in the future. So a 30-day absence, or a
+    /// clock that jumped forward, prunes nothing until rows have been seen again; callers must
+    /// `touch_seen` the visible rows and groups before `prune` (the store enforces this). Future
+    /// timestamps (clock moved back) are ignored and never pruned.
+    ///
     /// Empty sections of a group seen recently persist. Children of a pruned row are lifted to its
-    /// nearest surviving ancestor (D4), permanently. Rows or groups that are referenced but have
-    /// no `last_seen` yet start their clock at `now`. Returns the number of pruned rows + groups.
+    /// nearest surviving ancestor (D4), permanently. Rows or groups that are referenced but have no
+    /// `last_seen` yet start their clock at the reference. Returns the number of pruned rows + groups.
     pub fn prune(&mut self, now: i64) -> usize {
-        let cutoff = now - RETENTION_SECS;
+        let reference = self
+            .last_seen
+            .values()
+            .chain(self.group_last_seen.values())
+            .copied()
+            .filter(|seen| *seen <= now)
+            .max()
+            .unwrap_or(now);
+        let cutoff = reference - RETENTION_SECS;
 
         // Everything the structures mention.
         let mut mentioned: BTreeSet<RowKey> = BTreeSet::new();
@@ -670,10 +746,12 @@ impl Hierarchy {
                 .flat_map(|s| s.items.clone()),
         );
         for row in &mentioned {
-            self.last_seen.entry(row.clone()).or_insert(now);
+            self.last_seen.entry(row.clone()).or_insert(reference);
         }
         for group in self.sections.keys().chain(self.unsectioned_order.keys()) {
-            self.group_last_seen.entry(group.clone()).or_insert(now);
+            self.group_last_seen
+                .entry(group.clone())
+                .or_insert(reference);
         }
 
         let stale_rows: BTreeSet<RowKey> = self

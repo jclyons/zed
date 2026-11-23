@@ -18,8 +18,8 @@ mod store;
 pub use arrange::{ArrangeInput, Rollup, RowInfo, Slot, arrange_rows};
 pub use drop::{DragItem, DropAction, DropCtx, DropTarget, Zone, plan_drop};
 pub use model::{
-    Container, GroupKey, Hierarchy, RETENTION_SECS, Refusal, RowKey, Section, SectionId, Side,
-    VERSION,
+    Container, GroupKey, Hierarchy, LoadOutcome, RETENTION_SECS, Refusal, RowKey, Section,
+    SectionId, Side, VERSION,
 };
 pub use validate::Repair;
 

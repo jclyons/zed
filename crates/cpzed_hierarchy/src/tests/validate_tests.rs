@@ -118,3 +118,46 @@ fn drops_membership_when_the_section_is_not_in_the_rows_current_group() {
     );
     assert_eq!(h.sections[&a][0].items, vec![term("stay"), term("unknown")]);
 }
+
+#[test]
+fn repairs_duplicate_section_ids_and_names() {
+    let (a, b) = (g("a"), g("b"));
+    let mut h = Hierarchy::default();
+    let mut dup = section("s1", vec![]);
+    dup.name = "same".into();
+    let mut dup2 = section("s1", vec![]); // same id in another project
+    dup2.name = "SAME".into(); // same name as `dup` (case-insensitive) is only a clash within a project
+    h.sections.insert(
+        a.clone(),
+        vec![dup, {
+            let mut other = section("s2", vec![]);
+            other.name = "Same".into();
+            other
+        }],
+    );
+    h.sections.insert(b, vec![dup2]);
+    let repairs = h.validate(&|_| None);
+    assert!(
+        repairs
+            .iter()
+            .any(|r| matches!(r, Repair::DuplicateSectionId { .. }))
+    );
+    assert!(repairs.iter().any(
+        |r| matches!(r, Repair::DuplicateSectionName { renamed, .. } if renamed == "Same (2)")
+    ));
+    let ids: Vec<_> = h
+        .sections
+        .values()
+        .flatten()
+        .map(|s| s.id.clone())
+        .collect();
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), unique.len());
+    let names: Vec<_> = h.sections[&a]
+        .iter()
+        .map(|s| s.name.to_lowercase())
+        .collect();
+    assert_eq!(names, ["same", "same (2)"]);
+    // Idempotent.
+    assert!(h.validate(&|_| None).is_empty());
+}

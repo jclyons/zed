@@ -19,7 +19,17 @@ fn plan(
             Container::Unsectioned(gr) => h.unsectioned_order.get(gr).cloned().unwrap_or_default(),
         }
     };
-    plan_drop(item, target, zone, h, &DropCtx { visible: &visible })
+    let exists = |k: &RowKey| !matches!(k, RowKey::Terminal(s) | RowKey::Thread(s) if s == "ghost");
+    plan_drop(
+        item,
+        target,
+        zone,
+        h,
+        &DropCtx {
+            visible: &visible,
+            row_exists: &exists,
+        },
+    )
 }
 
 fn row(key: &RowKey, group: &GroupKey) -> DragItem {
@@ -221,7 +231,7 @@ fn terminals_move_across_projects_and_agent_threads_are_refused() {
     let target_row = on_row(&term("elsewhere"), &b);
     for (target, section) in [(&hdr, None), (&sec, Some(sb)), (&target_row, None)] {
         assert_eq!(
-            plan(&row(&term("t"), &a), target, Zone::Into, &h),
+            plan(&row(&term("t"), &a), target, Zone::After, &h),
             Ok(DropAction::MoveTerminalToGroup {
                 key: term("t"),
                 from: a.clone(),
@@ -230,7 +240,7 @@ fn terminals_move_across_projects_and_agent_threads_are_refused() {
             })
         );
         assert_eq!(
-            plan(&row(&thr("agent"), &a), target, Zone::Into, &h),
+            plan(&row(&thr("agent"), &a), target, Zone::After, &h),
             Err(Refusal::AgentThreadAcrossProjects)
         );
     }
@@ -312,4 +322,42 @@ fn section_drags_reorder_within_the_project_only() {
         plan(&drag, &on_row(&term("r"), &a), Zone::Into, &h),
         Err(Refusal::InvalidTarget)
     );
+}
+
+#[test]
+fn into_a_row_of_another_project_nests_for_terminals_and_agents() {
+    let (a, b) = (g("a"), g("b"));
+    let mut h = Hierarchy::default();
+    for key in [term("t"), thr("agent")] {
+        assert_eq!(
+            plan(&row(&key, &a), &on_row(&term("far"), &b), Zone::Into, &h),
+            Ok(DropAction::Nest {
+                child: key.clone(),
+                parent: term("far")
+            })
+        );
+    }
+    // Cycle check still applies across projects.
+    h.set_parent(&term("far"), Some(&term("t"))).unwrap();
+    assert_eq!(
+        plan(
+            &row(&term("t"), &a),
+            &on_row(&term("far"), &b),
+            Zone::Into,
+            &h
+        ),
+        Err(Refusal::Cycle)
+    );
+}
+
+#[test]
+fn a_target_row_that_no_longer_exists_is_refused() {
+    let a = g("a");
+    let h = Hierarchy::default();
+    for zone in [Zone::Into, Zone::Before, Zone::After] {
+        assert_eq!(
+            plan(&row(&term("x"), &a), &on_row(&term("ghost"), &a), zone, &h),
+            Err(Refusal::TargetNotFound)
+        );
+    }
 }

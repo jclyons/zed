@@ -15,6 +15,10 @@ pub enum Repair {
     ParentedInContainer { row: RowKey },
     /// The row's section is in a project other than the row's current one; membership dropped.
     SectionInWrongGroup { row: RowKey, section: SectionId },
+    /// Two sections shared an id; the later one got a fresh id.
+    DuplicateSectionId { old: SectionId, new: SectionId },
+    /// Two sections of a project shared a name (case-insensitive); the later one was renamed.
+    DuplicateSectionName { section: SectionId, renamed: String },
 }
 
 impl Hierarchy {
@@ -23,8 +27,55 @@ impl Hierarchy {
     pub fn validate(&mut self, group_of: &dyn Fn(&RowKey) -> Option<GroupKey>) -> Vec<Repair> {
         let mut repairs = Vec::new();
         self.break_cycles(&mut repairs);
+        self.repair_sections(&mut repairs);
         self.repair_memberships(group_of, &mut repairs);
         repairs
+    }
+
+    fn repair_sections(&mut self, repairs: &mut Vec<Repair>) {
+        // Duplicate ids (across all projects): the first keeps its id.
+        let mut seen_ids: BTreeSet<SectionId> = BTreeSet::new();
+        let mut duplicates: Vec<(GroupKey, usize)> = Vec::new();
+        for (group, sections) in &self.sections {
+            for (index, section) in sections.iter().enumerate() {
+                if !seen_ids.insert(section.id.clone()) {
+                    duplicates.push((group.clone(), index));
+                }
+            }
+        }
+        for (group, index) in duplicates {
+            let new = self.next_section_id();
+            if let Some(section) = self.sections.get_mut(&group).and_then(|s| s.get_mut(index)) {
+                repairs.push(Repair::DuplicateSectionId {
+                    old: std::mem::replace(&mut section.id, new.clone()),
+                    new,
+                });
+            }
+        }
+        // Duplicate names within a project.
+        for sections in self.sections.values_mut() {
+            let mut names: BTreeSet<String> = BTreeSet::new();
+            for section in sections.iter_mut() {
+                if names.insert(section.name.trim().to_lowercase()) {
+                    continue;
+                }
+                let base = section.name.trim().to_string();
+                let mut n = 2;
+                let renamed = loop {
+                    let candidate = format!("{base} ({n})");
+                    if !names.contains(&candidate.to_lowercase()) {
+                        break candidate;
+                    }
+                    n += 1;
+                };
+                names.insert(renamed.to_lowercase());
+                section.name = renamed.clone();
+                repairs.push(Repair::DuplicateSectionName {
+                    section: section.id.clone(),
+                    renamed,
+                });
+            }
+        }
     }
 
     fn break_cycles(&mut self, repairs: &mut Vec<Repair>) {

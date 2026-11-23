@@ -150,7 +150,7 @@ fn move_row_materializes_the_visible_order() {
     let mut h = Hierarchy::default();
     let visible = vec![term("1"), term("2"), term("3")];
     let c = Container::Unsectioned(a.clone());
-    h.move_row(&term("3"), &term("1"), Side::Before, &c, &visible)
+    h.move_row(&term("3"), &a, &term("1"), Side::Before, &c, &visible)
         .unwrap();
     assert_eq!(
         h.unsectioned_order[&a],
@@ -158,18 +158,18 @@ fn move_row_materializes_the_visible_order() {
     );
     // Now the visible order is the stored one; move 3 after 2.
     let visible = h.unsectioned_order[&a].clone();
-    h.move_row(&term("3"), &term("2"), Side::After, &c, &visible)
+    h.move_row(&term("3"), &a, &term("2"), Side::After, &c, &visible)
         .unwrap();
     assert_eq!(
         h.unsectioned_order[&a],
         vec![term("1"), term("2"), term("3")]
     );
     assert_eq!(
-        h.move_row(&term("3"), &term("zzz"), Side::After, &c, &visible),
+        h.move_row(&term("3"), &a, &term("zzz"), Side::After, &c, &visible),
         Err(Refusal::TargetNotFound)
     );
     assert_eq!(
-        h.move_row(&term("3"), &term("3"), Side::After, &c, &visible),
+        h.move_row(&term("3"), &a, &term("3"), Side::After, &c, &visible),
         Err(Refusal::SameTarget)
     );
 }
@@ -183,6 +183,7 @@ fn move_row_into_children_and_section_containers() {
     // Move an unsectioned row before `in-s`: it joins the section.
     h.move_row(
         &term("x"),
+        &a,
         &term("in-s"),
         Side::Before,
         &Container::Section(a.clone(), s.clone()),
@@ -194,6 +195,7 @@ fn move_row_into_children_and_section_containers() {
     h.set_parent(&term("sib"), Some(&term("p"))).unwrap();
     h.move_row(
         &term("x"),
+        &a,
         &term("sib"),
         Side::After,
         &Container::Children(term("p")),
@@ -207,6 +209,7 @@ fn move_row_into_children_and_section_containers() {
     assert_eq!(
         h.move_row(
             &term("p"),
+            &a,
             &term("x"),
             Side::Before,
             &Container::Children(term("x")),
@@ -333,4 +336,138 @@ fn v1_blobs_and_garbage_load_as_empty() {
         Hierarchy::from_json(r#"{"version":2}"#),
         Hierarchy::default()
     );
+}
+
+#[test]
+fn move_row_enforces_the_rows_group() {
+    let (a, b) = (g("a"), g("b"));
+    let mut h = Hierarchy::default();
+    let (sb, _) = h.create_section(&b, "B").unwrap();
+    h.set_section(&term("in-b"), &b, Some(&sb)).unwrap();
+    assert_eq!(
+        h.move_row(
+            &term("x"),
+            &a,
+            &term("in-b"),
+            Side::Before,
+            &Container::Section(b.clone(), sb),
+            &[term("in-b")]
+        ),
+        Err(Refusal::SectionNotInGroup)
+    );
+    assert_eq!(
+        h.move_row(
+            &term("x"),
+            &a,
+            &term("y"),
+            Side::Before,
+            &Container::Unsectioned(b.clone()),
+            &[term("y")]
+        ),
+        Err(Refusal::InvalidTarget)
+    );
+    assert!(h.unsectioned_order.is_empty());
+}
+
+#[test]
+fn section_ids_are_never_reused_after_delete() {
+    let a = g("a");
+    let mut h = Hierarchy::default();
+    let (first, _) = h.create_section(&a, "One").unwrap();
+    h.delete_section(&a, &first).unwrap();
+    let (second, _) = h.create_section(&a, "Two").unwrap();
+    assert_ne!(first, second);
+    let json = h.to_json().unwrap();
+    let mut reloaded = Hierarchy::from_json(&json);
+    let (third, _) = reloaded.create_section(&a, "Three").unwrap();
+    assert!(third != first && third != second);
+}
+
+#[test]
+fn load_classifies_blobs() {
+    use crate::LoadOutcome;
+    assert_eq!(Hierarchy::load(None), LoadOutcome::Missing);
+    let good = Hierarchy::default().to_json().unwrap();
+    assert!(matches!(
+        Hierarchy::load(Some(&good)),
+        LoadOutcome::Loaded(_)
+    ));
+    assert!(matches!(
+        Hierarchy::load(Some("garbage")),
+        LoadOutcome::Unreadable { .. }
+    ));
+    assert!(matches!(
+        Hierarchy::load(Some(r#"{"version":1}"#)),
+        LoadOutcome::Unreadable { .. }
+    ));
+    // A future version is recognised even if its shape is unknown to this build.
+    assert_eq!(
+        Hierarchy::load(Some(r#"{"version":3,"sections":{"new":"shape"}}"#)),
+        LoadOutcome::FutureVersion(3)
+    );
+    // Same version but a RowKey variant this build does not know: unreadable (backed up by the store).
+    assert!(matches!(
+        Hierarchy::load(Some(
+            r#"{"version":2,"parents":[[{"Mystery":"x"},{"Terminal":"y"}]]}"#
+        )),
+        LoadOutcome::Unreadable { .. }
+    ));
+    assert_ne!(Hierarchy::backup_suffix("a"), Hierarchy::backup_suffix("b"));
+}
+
+#[test]
+fn prune_after_absence_or_clock_jump_forward_prunes_nothing_until_rows_are_seen_again() {
+    let a = g("a");
+    let day = 86_400;
+    let t0 = 1_000_000_000;
+    let mut h = Hierarchy::default();
+    let (s, _) = h.create_section(&a, "S").unwrap();
+    h.set_section(&term("x"), &a, Some(&s)).unwrap();
+    h.set_parent(&term("kid"), Some(&term("x"))).unwrap();
+    h.touch_seen(&[term("x"), term("kid")], std::slice::from_ref(&a), t0);
+    let before = h.clone();
+    // 400 days later (absence or forward clock jump), nothing has been seen since: keep everything.
+    assert_eq!(h.prune(t0 + 400 * day), 0);
+    assert_eq!(h, before);
+    // Seen again at the new time: only now do unseen rows fall behind (here: none are older).
+    h.touch_seen(&[term("x")], std::slice::from_ref(&a), t0 + 400 * day);
+    assert_eq!(h.prune(t0 + 400 * day), 1); // `kid`, unseen for 400 days relative to activity
+    assert!(h.section(&a, &s).is_some());
+}
+
+#[test]
+fn prune_ignores_timestamps_in_the_future() {
+    let day = 86_400;
+    let t0 = 1_000_000_000;
+    let mut h = Hierarchy::default();
+    h.set_parent(&term("future"), Some(&term("p"))).unwrap();
+    h.touch_seen(&[term("future")], &[], t0 + 1000 * day); // clock was ahead once
+    h.touch_seen(&[term("p")], &[], t0);
+    // The clock went back to t0 + 5d: the future stamp is neither the reference nor stale.
+    assert_eq!(h.prune(t0 + 5 * day), 0);
+    assert!(h.last_seen.contains_key(&term("future")));
+}
+
+#[test]
+fn move_row_scales_linearly_in_the_container_size() {
+    let a = g("a");
+    let n = 20_000;
+    let visible: Vec<RowKey> = (0..n).map(|i| term(&format!("r{i}"))).collect();
+    let mut h = Hierarchy::default();
+    let container = Container::Unsectioned(a.clone());
+    let start = std::time::Instant::now();
+    h.move_row(
+        &visible[n - 1],
+        &a,
+        &visible[0],
+        Side::Before,
+        &container,
+        &visible,
+    )
+    .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(h.unsectioned_order[&a].len(), n);
+    assert_eq!(h.unsectioned_order[&a][0], visible[n - 1]);
+    // Was ~9 s in debug when quadratic; generous bound so a loaded machine cannot flake it.
+    assert!(elapsed.as_secs() < 2, "took {elapsed:?}");
 }

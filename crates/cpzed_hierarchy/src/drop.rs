@@ -31,6 +31,9 @@ pub enum DropTarget {
 }
 
 pub struct DropCtx<'a> {
+    /// Is this row currently present (open thread, live terminal)? A drop onto a row that is not
+    /// is refused with `TargetNotFound`, so no link to a phantom parent is ever stored.
+    pub row_exists: &'a dyn Fn(&RowKey) -> bool,
     /// The visible order of a container, as the user currently sees it. Embedded in
     /// [`DropAction::Reorder`] so the applier can materialize it (H6).
     pub visible: &'a dyn Fn(&Container) -> Vec<RowKey>,
@@ -179,11 +182,11 @@ fn plan_row_drop(
             if target_key == key {
                 return Err(Refusal::SameTarget);
             }
-            if target_group != group {
-                // A row of another project counts as a drop onto that project.
-                return cross_project(key, group, target_group, None);
+            if !(ctx.row_exists)(target_key) {
+                return Err(Refusal::TargetNotFound);
             }
             match zone {
+                // Nesting across projects is allowed (D1): the child renders under its parent.
                 Zone::Into => {
                     if h.would_cycle(key, target_key) {
                         return Err(Refusal::Cycle);
@@ -192,6 +195,10 @@ fn plan_row_drop(
                         child: key.clone(),
                         parent: target_key.clone(),
                     })
+                }
+                // Before/After a row of another project counts as a drop onto that project.
+                Zone::Before | Zone::After if target_group != group => {
+                    cross_project(key, group, target_group, None)
                 }
                 Zone::Before | Zone::After => {
                     let container = container_of(h, target_key, group);

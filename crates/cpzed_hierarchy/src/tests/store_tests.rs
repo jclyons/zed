@@ -121,3 +121,97 @@ async fn touch_seen_is_quiet_and_flush_writes_immediately(cx: &mut TestAppContex
     store.update(cx, |s, cx| s.touch_seen(&[term("t")], &[g("a")], 1_100, cx));
     assert_eq!(store.read_with(cx, |s, _| s.hierarchy().clone()), before);
 }
+
+#[gpui::test]
+async fn unreadable_blob_is_backed_up_before_the_first_write_replaces_it(cx: &mut TestAppContext) {
+    let db = KeyValueStore::open_test_db("cpzed_hierarchy_backup").await;
+    let blob = r#"{"version":2,"parents":[[{"Mystery":"x"},{"Terminal":"y"}]]}"#;
+    db.scoped(KVP_SCOPE)
+        .write(KVP_KEY.to_string(), blob.to_string())
+        .await
+        .unwrap();
+    let store = cx.new(|cx| HierarchyStore::new(db.clone(), cx));
+    assert!(store.read_with(cx, |s, _| s.hierarchy().is_empty() && !s.is_read_only()));
+    store.update(cx, |s, cx| {
+        s.set_parent(&term("c"), Some(&term("p")), cx).unwrap();
+    });
+    cx.executor().advance_clock(WRITE_DEBOUNCE * 2);
+    cx.run_until_parked();
+    let backup = db
+        .scoped(KVP_SCOPE)
+        .read(&HierarchyStore::backup_key(blob))
+        .unwrap();
+    assert_eq!(backup.as_deref(), Some(blob));
+    let current = db.scoped(KVP_SCOPE).read(KVP_KEY).unwrap().unwrap();
+    assert_eq!(Hierarchy::from_json(&current).parents.len(), 1);
+}
+
+#[gpui::test]
+async fn future_version_blob_is_never_overwritten(cx: &mut TestAppContext) {
+    let db = KeyValueStore::open_test_db("cpzed_hierarchy_future").await;
+    let blob = r#"{"version":3,"sections":"a shape this build cannot read"}"#;
+    db.scoped(KVP_SCOPE)
+        .write(KVP_KEY.to_string(), blob.to_string())
+        .await
+        .unwrap();
+    let store = cx.new(|cx| HierarchyStore::new(db.clone(), cx));
+    assert!(store.read_with(cx, |s, _| s.is_read_only()));
+    store.update(cx, |s, cx| {
+        s.set_parent(&term("c"), Some(&term("p")), cx).unwrap();
+        s.touch_seen(&[term("c")], &[g("a")], 5_000, cx);
+    });
+    cx.executor().advance_clock(WRITE_DEBOUNCE * 2);
+    cx.run_until_parked();
+    let flushed = store.update(cx, |s, cx| s.flush(cx));
+    flushed.await;
+    assert_eq!(store.read_with(cx, |s, _| s.write_count()), 0);
+    assert_eq!(
+        db.scoped(KVP_SCOPE).read(KVP_KEY).unwrap().as_deref(),
+        Some(blob)
+    );
+    assert_eq!(
+        db.scoped(KVP_SCOPE)
+            .read(&HierarchyStore::backup_key(blob))
+            .unwrap(),
+        None
+    );
+}
+
+#[gpui::test]
+async fn flush_if_dirty_writes_pending_edits_without_waiting_for_the_debounce(
+    cx: &mut TestAppContext,
+) {
+    let db = KeyValueStore::open_test_db("cpzed_hierarchy_quit").await;
+    let store = cx.new(|cx| HierarchyStore::new(db.clone(), cx));
+    // Clean store: nothing to flush.
+    store.update(cx, |s, cx| s.flush_if_dirty(cx)).await;
+    assert_eq!(store.read_with(cx, |s, _| s.write_count()), 0);
+    store.update(cx, |s, cx| {
+        s.set_parent(&term("c"), Some(&term("p")), cx).unwrap();
+    });
+    // No clock advance: the debounce has not fired. This is what the app-quit hook calls.
+    store.update(cx, |s, cx| s.flush_if_dirty(cx)).await;
+    let stored = db.scoped(KVP_SCOPE).read(KVP_KEY).unwrap().unwrap();
+    assert_eq!(Hierarchy::from_json(&stored).parents.len(), 1);
+    // And now it is clean again.
+    let writes = store.read_with(cx, |s, _| s.write_count());
+    store.update(cx, |s, cx| s.flush_if_dirty(cx)).await;
+    assert_eq!(store.read_with(cx, |s, _| s.write_count()), writes);
+}
+
+#[gpui::test]
+async fn prune_is_a_no_op_until_rows_have_been_touched(cx: &mut TestAppContext) {
+    let db = KeyValueStore::open_test_db("cpzed_hierarchy_prune").await;
+    let store = cx.new(|cx| HierarchyStore::new(db, cx));
+    let a = g("a");
+    store.update(cx, |s, cx| {
+        s.edit(cx, |h| {
+            h.touch_seen(&[term("old")], std::slice::from_ref(&a), 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.prune(1_000_000_000, cx), 0);
+        s.touch_seen(&[term("fresh")], &[], 1_000_000_000, cx);
+        assert_eq!(s.prune(1_000_000_000, cx), 2); // `old` and group `a`
+    });
+}

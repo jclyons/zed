@@ -8,10 +8,12 @@
 use std::time::Duration;
 
 use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Context, Entity, Global, Task};
+use gpui::{App, AppContext as _, Context, Entity, Global, Subscription, Task};
 use util::ResultExt as _;
 
-use crate::{Container, GroupKey, Hierarchy, Refusal, Repair, RowKey, SectionId, Side};
+use crate::{
+    Container, GroupKey, Hierarchy, LoadOutcome, Refusal, Repair, RowKey, SectionId, Side,
+};
 
 pub const KVP_SCOPE: &str = "cpzed_sidebar_hierarchy";
 pub const KVP_KEY: &str = "v2";
@@ -29,6 +31,13 @@ pub struct HierarchyStore {
     db: KeyValueStore,
     write_task: Option<Task<()>>,
     writes_started: usize,
+    /// Edits not yet written.
+    dirty: bool,
+    /// The stored blob came from a newer build: never write, so a rollback cannot wipe it.
+    read_only: bool,
+    /// True once `touch_seen` ran: `prune` is a no-op before that (see [`Hierarchy::prune`]).
+    touched: bool,
+    _quit_subscription: Option<Subscription>,
 }
 
 impl HierarchyStore {
@@ -51,27 +60,72 @@ impl HierarchyStore {
         cx.try_global::<GlobalHierarchyStore>().map(|g| g.0.clone())
     }
 
-    /// Load from `db`. A v1 blob, malformed JSON or a read error gives an empty hierarchy. Stored
-    /// invariants are repaired (cycles, duplicate memberships; group checks need
-    /// [`Self::validate`] with live groups).
+    /// The key under which an unreadable stored blob is preserved before it is replaced.
+    pub fn backup_key(blob: &str) -> String {
+        format!("{KVP_KEY}.backup.{}", Hierarchy::backup_suffix(blob))
+    }
+
+    /// Load from `db`.
+    ///
+    /// - Nothing stored: empty.
+    /// - Readable v2 blob: loaded, invariants repaired (cycles, duplicates; the group check needs
+    ///   [`Self::validate`] with live groups).
+    /// - Unreadable or older blob (v1, garbage, an unknown RowKey variant): empty, and the raw blob
+    ///   is first copied to [`Self::backup_key`] (queued ahead of any later write).
+    /// - Written by a NEWER version: empty and READ-ONLY. Nothing is ever written, so rolling back
+    ///   a deploy does not destroy the newer build's data.
     pub fn new(db: KeyValueStore, cx: &mut Context<Self>) -> Self {
         let stored = db.scoped(KVP_SCOPE).read(KVP_KEY).log_err().flatten();
-        let mut hierarchy = stored
-            .as_deref()
-            .map(Hierarchy::from_json)
-            .unwrap_or_default();
+        let mut read_only = false;
+        let mut backup: Option<String> = None;
+        let mut hierarchy = match Hierarchy::load(stored.as_deref()) {
+            LoadOutcome::Missing => Hierarchy::default(),
+            LoadOutcome::Loaded(hierarchy) => hierarchy,
+            LoadOutcome::Unreadable { reason } => {
+                log::warn!(
+                    "cpzed_hierarchy: stored hierarchy unreadable ({reason}); backing it up and starting empty"
+                );
+                backup = stored;
+                Hierarchy::default()
+            }
+            LoadOutcome::FutureVersion(version) => {
+                log::warn!(
+                    "cpzed_hierarchy: stored version {version} is newer than this build; staying read-only"
+                );
+                read_only = true;
+                Hierarchy::default()
+            }
+        };
+        if let Some(blob) = backup {
+            let db = db.clone();
+            let key = Self::backup_key(&blob);
+            cx.background_spawn(async move {
+                db.scoped(KVP_SCOPE).write(key, blob).await.log_err();
+            })
+            .detach();
+        }
         let repairs = hierarchy.validate(&|_| None);
+        let quit = cx.on_app_quit(|this, cx| this.flush_if_dirty(cx));
         let mut this = Self {
             hierarchy,
             db,
             write_task: None,
             writes_started: 0,
+            dirty: false,
+            read_only,
+            touched: false,
+            _quit_subscription: Some(quit),
         };
         if !repairs.is_empty() {
             log::warn!("cpzed_hierarchy: repaired stored hierarchy on load: {repairs:?}");
             this.schedule_write(cx);
         }
         this
+    }
+
+    /// True when the stored data came from a newer build; edits then apply in memory only.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn hierarchy(&self) -> &Hierarchy {
@@ -96,12 +150,17 @@ impl HierarchyStore {
     }
 
     fn schedule_write(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.dirty = true;
         let db = self.db.clone();
         self.write_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(WRITE_DEBOUNCE).await;
             let json = this
                 .update(cx, |this, _| {
                     this.writes_started += 1;
+                    this.dirty = false;
                     this.hierarchy.to_json()
                 })
                 .ok();
@@ -116,7 +175,11 @@ impl HierarchyStore {
 
     /// Write now, cancelling any pending debounced write (for quit and tests).
     pub fn flush(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        if self.read_only {
+            return Task::ready(());
+        }
         self.write_task = None;
+        self.dirty = false;
         self.writes_started += 1;
         let db = self.db.clone();
         let json = self.hierarchy.to_json().log_err();
@@ -128,6 +191,16 @@ impl HierarchyStore {
                     .log_err();
             }
         })
+    }
+
+    /// Flush only when there are unwritten edits. Registered as the app-quit hook, so the last
+    /// <= [`WRITE_DEBOUNCE`] of edits is not lost; sidebars may also call it on window close.
+    pub fn flush_if_dirty(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        if self.dirty {
+            self.flush(cx)
+        } else {
+            Task::ready(())
+        }
     }
 
     // ---- edits (each calls the pure op, then notifies) ------------------------------------
@@ -210,13 +283,16 @@ impl HierarchyStore {
     pub fn move_row(
         &mut self,
         row: &RowKey,
+        row_group: &GroupKey,
         target: &RowKey,
         side: Side,
         container: &Container,
         visible: &[RowKey],
         cx: &mut Context<Self>,
     ) -> Result<(), Refusal> {
-        self.edit(cx, |h| h.move_row(row, target, side, container, visible))
+        self.edit(cx, |h| {
+            h.move_row(row, row_group, target, side, container, visible)
+        })
     }
 
     pub fn cross_project_move(
@@ -253,6 +329,7 @@ impl HierarchyStore {
         now: i64,
         cx: &mut Context<Self>,
     ) {
+        self.touched = true;
         let stale =
             |seen: Option<&i64>| seen.is_none_or(|seen| now - *seen >= TOUCH_GRANULARITY_SECS);
         let rows: Vec<RowKey> = rows
@@ -272,8 +349,12 @@ impl HierarchyStore {
         self.schedule_write(cx);
     }
 
-    /// Lazy 30-day prune. Notifies only if something was removed.
+    /// Lazy 30-day prune. Notifies only if something was removed. A no-op until `touch_seen` has
+    /// run in this session (callers must record the visible rows first; see [`Hierarchy::prune`]).
     pub fn prune(&mut self, now: i64, cx: &mut Context<Self>) -> usize {
+        if !self.touched {
+            return 0;
+        }
         let pruned = self.hierarchy.prune(now);
         if pruned > 0 {
             self.schedule_write(cx);
