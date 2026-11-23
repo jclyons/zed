@@ -344,3 +344,49 @@ async fn a_project_not_opened_this_session_survives_a_long_absence(cx: &mut Test
     assert!(!pruned.sections.contains_key(&b));
     assert!(!pruned.parents.contains_key(&term("kid")));
 }
+
+#[gpui::test]
+async fn a_failed_backup_write_goes_read_only_and_leaves_the_blob_untouched(
+    cx: &mut TestAppContext,
+) {
+    let db = KeyValueStore::open_test_db("cpzed_hierarchy_backup_fails").await;
+    let blob = "unreadable, and the backup cannot be written";
+    db.scoped(KVP_SCOPE)
+        .write(KVP_KEY.to_string(), blob.to_string())
+        .await
+        .unwrap();
+    // A fake failing KVP: writes of any `v2.backup.*` key abort (like a full disk would).
+    db.write(|connection| -> anyhow::Result<()> {
+        connection.exec(
+            "CREATE TRIGGER fail_backup_writes BEFORE INSERT ON scoped_kv_store \
+             WHEN NEW.key LIKE 'v2.backup.%' BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )?()
+    })
+    .await
+    .unwrap();
+
+    let store = cx.new(|cx| HierarchyStore::new(db.clone(), cx));
+    assert!(store.read_with(cx, |s, _| s.is_read_only()));
+    store.update(cx, |s, cx| {
+        assert_eq!(
+            s.set_parent(&term("c"), Some(&term("p")), cx),
+            Err(Refusal::ReadOnly)
+        );
+    });
+    cx.executor().advance_clock(WRITE_DEBOUNCE * 2);
+    cx.run_until_parked();
+    store.update(cx, |s, cx| s.flush(cx)).await;
+    store.update(cx, |s, cx| s.flush_if_dirty(cx)).await;
+    assert_eq!(store.read_with(cx, |s, _| s.write_count()), 0);
+    // The original blob is byte-identical, and no backup was recorded.
+    assert_eq!(
+        db.scoped(KVP_SCOPE).read(KVP_KEY).unwrap().as_deref(),
+        Some(blob)
+    );
+    assert_eq!(
+        db.scoped(KVP_SCOPE)
+            .read(&HierarchyStore::backup_key(blob))
+            .unwrap(),
+        None
+    );
+}
