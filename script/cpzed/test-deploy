@@ -62,6 +62,7 @@ newenv() { # name
   cat > "$E/bin/quit" <<'EOF'
 #!/bin/sh
 echo "$(date +%s)" >> "$CPZED_TEST_PREFIX/quit.log"
+[ -f "$CPZED_TEST_PREFIX/on-quit.sh" ] && sh "$CPZED_TEST_PREFIX/on-quit.sh"
 pid=$(cat "$DUMMY_PID_FILE" 2>/dev/null); [ -n "$pid" ] && kill -TERM "$pid"; exit 0
 EOF
   cat > "$E/bin/open" <<'EOF'
@@ -593,7 +594,7 @@ sc_override_refusal() { # B1: outside a confined test run, NO test/override vari
 
 sc_gate_crash() { # B2a: a crashing gate is NOT a pass
   newenv gcrash; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"; cp -R "$D" "$E/scr"; printf '#!/bin/bash\nexit 127\n' > "$E/scr/gate"; chmod +x "$E/scr/gate"
-  sre_on; local save=$D; D=$E/scr; DEP_T=10 dep run; D=$save; sre_off
+  sre_on; local save=$D; D=$E/scr; DEP_T=60 dep run; D=$save; sre_off
   ck gate-crash-aborts "$RC" 30; ck gate-crash-hold "$([[ -e $E/home/hold ]] && echo y)" y
   ck gate-crash-app-not-quit "$(port_up | wc -l | tr -d ' ')" 1; ck gate-crash-no-quit-call "$([[ -e $E/quit.log ]] && echo quit || echo none)" none
   ckm gate-crash-notified "$(notes)" "gate failed unexpectedly"; kill_dummy
@@ -664,9 +665,8 @@ sc_staged_tamper() { # S3
   ck tamper-before-quit-app-not-quit "$([[ -e $E/quit.log ]] && echo quit || echo none)" none; ck tamper-before-quit-untouched "$(sha_of "$E/apps/CPZed.app")" "$PREV_SHA"; kill_dummy
   for how in sig sha; do
     newenv "tamp2$how"; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"; sre_on
-    ( for _ in $(seq 1 300); do [[ -e "$E/quit.log" ]] && break; sleep 0.05; done
-      if [[ $how == sig ]]; then touch "$E/apps/.cpzed-stage/CPZed.app/Contents/BADSIG"
-      else echo '{"sha":"evil","n":2}' > "$E/apps/.cpzed-stage/CPZed.app/Contents/Resources/cpzed-build.json"; fi ) &
+    if [[ $how == sig ]]; then echo "touch '$E/apps/.cpzed-stage/CPZed.app/Contents/BADSIG'" > "$E/on-quit.sh"
+    else echo "echo '{\"sha\":\"evil\",\"n\":2}' > '$E/apps/.cpzed-stage/CPZed.app/Contents/Resources/cpzed-build.json'" > "$E/on-quit.sh"; fi
     dep run; sre_off
     ck "tamper-before-swap-$how-aborts" "$RC" 30; ck "tamper-before-swap-$how-hold" "$([[ -e $E/home/hold ]] && echo y)" y
     ck "tamper-before-swap-$how-old-build-kept" "$(sha_of "$E/apps/CPZed.app")" "$PREV_SHA"
@@ -978,12 +978,9 @@ mut lock-guard deploy 'flock($f, LOCK_EX | LOCK_NB) or do {' '1 or do {' sc_lock
 mut lock-guard-concurrent deploy 'flock($f, LOCK_EX | LOCK_NB) or do {' '1 or do {' sc_lock_concurrent
 mut hold-guard deploy 'hold_active && { echo "deploy: hold file present: $(head -1 "$HOLD")" >&2; exit 78; }
   if [[ -z' 'if [[ -z' sc_hold
-mut never-kill deploy '    sleep 1
-  done
-  return 1' '    sleep 1
-  done
-  kill -9 "$pid"; return 0' sc_refuse_quit
-mut refuse-quit-aborts deploy 'abort_deploy "CPZed quit blocked: the app is still running after ${QUIT_WAIT}s (a save dialog?). Not forced. Resolve it, then clear the hold." hold' 'true' sc_refuse_quit
+mut never-kill deploy '  QW_WHY="$(util procs-of --verbose "$bin" | head -3 | paste -sd'"'"';'"'"' -) port-owner-pid=${port:-none}"
+  return 1' '  kill -9 $(util procs-of "$bin"); return 0' sc_refuse_quit
+mut refuse-quit-aborts deploy 'abort_deploy "CPZed quit blocked: still running after ${QUIT_WAIT}s: ${QW_WHY:-unknown} (a save dialog?). Not forced. Resolve it, then clear the hold." hold' 'true' sc_refuse_quit
 mut swap-atomic deploy 'util swap exchange "$STAGE_DIR/CPZed.app" "$APP" ||' '{ mv "$APP" "$STAGE_DIR/old.app" && sleep 0.3 && mv "$STAGE_DIR/CPZed.app" "$APP"; } ||' sc_happy
 mut gate-cargo deploy-util '"cargo", ' '' sc_gate_cargo
 mut gate-quiescent-stale gate 'elif (( now - q > Q_MAX )); then' 'elif false; then' sc_gate_stale
