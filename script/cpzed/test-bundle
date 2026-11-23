@@ -137,7 +137,7 @@ git -C "$R" init -q; echo "/target-install/" >> "$R/.git/info/exclude"
 git -C "$R" add -A; git -C "$R" -c user.name=t -c user.email=t@t commit -qm init
 sha=$(git -C "$R" rev-parse HEAD); triple=$(rustc --version --verbose | sed -n 's/^host: //p')
 bd=$R/target-install/$triple/release; mkdir -p "$bd"; touch "$R/target-install/.metadata_never_index"
-mkbins() { printf 'zed %s %s' "$1" "$("$here/selfcheck" explanation)" > "$bd/zed"; printf 'cli %s' "$1" > "$bd/cli"; }
+mkbins() { printf 'zed %s %s' "$1" "$("$here/selfcheck" explanation)" > "$bd/zed"; cp /usr/bin/true "$bd/cli"; chmod 755 "$bd/cli"; }  # real Mach-O, embeds no SHA (like the real macOS cli)
 mkbins "$sha"
 mkdir -p "$T/gitpkg/bin"; echo '#!/bin/sh' > "$T/gitpkg/bin/git"; tar -czf "$S/git.tgz" -C "$T/gitpkg" bin/git
 cat > "$S/security" <<'X'
@@ -191,6 +191,17 @@ t "E2E signing probe fails -> 10"        ok   rrc 10 "keychain permission" STUB_
 t "E2E stale binary -> 11"               ok   bash -c 'printf "stale" > "$1"' _ "$bd/zed"
 t "E2E stale binary rc 11"               ok   rrc 11 "stale zed binary" -- --skip-build
 mkbins "$sha"
+# cli: needs no SHA, but must be an executable Mach-O
+t "E2E cli without the SHA passes the cli check" ok bash -c '! grep -aqF "$2" "$1"' _ "$bd/cli" "$sha"
+printf 'zed no sha here %s' "$("$here/selfcheck" explanation)" > "$bd/zed"
+t "E2E zed WITHOUT the sha -> 11"        ok   rrc 11 "stale zed binary" -- --skip-build
+mkbins "$sha"; printf 'not a mach-o' > "$bd/cli"; chmod 755 "$bd/cli"
+t "E2E non-Mach-O cli -> 13"             ok   rrc 13 "not a Mach-O" -- --skip-build
+mkbins "$sha"; chmod 644 "$bd/cli"
+t "E2E non-executable cli -> 13"         ok   rrc 13 "not executable" -- --skip-build
+mkbins "$sha"; rm -f "$bd/cli"
+t "E2E missing cli -> 13"                ok   rrc 13 "missing or not executable" -- --skip-build
+mkbins "$sha"
 rm -rf "$R/target-install/cpzed-out"
 t "N7 git sha mismatch -> 1"             ok   rrc 1 "SHA-256 mismatch" CPZED_TEST_GIT_SHA256=0000 -- --skip-build
 t "N7 no git extracted after a mismatch" ok   test ! -e "$R/target-install/cpzed-out/CPZed.app/Contents/MacOS/git"
@@ -211,7 +222,9 @@ t "S1 all three together refused"            ok rprod 2 "not a test run" CPZED_C
 t "S1 flag without env var refused"          ok rrc 2 "tests only" CPZED_TEST_SKIP_BUILD= -- --skip-build --dry-run
 # cargo/rustc detection: fake long-running processes
 mkdir -p "$T/fc"; printf '#!/bin/bash\nsleep 40\n' > "$T/fc/cargo"; printf '#!/bin/bash\nsleep 40\n' > "$T/fc/sccache"; chmod +x "$T/fc/"*
-waitps() { local i; for i in $(seq 50); do ps -axo command= | grep -F -- "$1" | grep -qv grep && return 0; sleep 0.2; done; return 1; }
+# A miss is a SETUP error (fails the run), not a silent pass of the following test.
+waitps() { local i p; for i in $(seq 50); do for p in "$@"; do ps -axo command= | grep -F -- "$p" | grep -qv grep && return 0; done; sleep 0.2; done
+  echo "FAIL: SETUP: process never appeared: $*"; fails=1; return 1; }
 "$T/fc/sccache" --server "$R/target-install" & p1=$!; "$T/fc/cargo" build --target-dir /somewhere/else/glider-ci & p2=$!
 waitps "--target-dir /somewhere/else/glider-ci"; waitps "sccache --server"
 t "E2E sccache + unrelated cargo do not exit 7" ok rrc 0 "bundle: built" -- --skip-build
@@ -219,7 +232,7 @@ t "E2E all 4 sign calls use the hardened runtime" ok test "$(grep -c -e "--force
 t "E2E curl has --max-time and --retry"  ok   grep -q -e "--max-time 300 --retry 3" "$STUB_LOG"
 t "E2E built plist has -cpzed.1"         ok   grep -q "1.31.0-cpzed.1" <(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$R/target-install/cpzed-out/CPZed.app/Contents/Info.plist")
 "$T/fc/cargo" build --target-dir "$R/target-install" & p3=$!
-waitps "build --target-dir $R/target-install" || waitps "--target-dir ${R#/private}/target-install"
+waitps "build --target-dir $R/target-install" "--target-dir ${R#/private}/target-install"
 t "E2E cargo using our target dir -> 7"  ok   rrc 7 "using" -- --skip-build
 kill $p1 $p2 $p3 2>/dev/null; wait 2>/dev/null
 exit $fails
