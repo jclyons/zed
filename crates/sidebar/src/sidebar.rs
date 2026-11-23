@@ -2174,6 +2174,15 @@ impl Sidebar {
         } else {
             self.hierarchy.row_layout.clear();
         }
+        self.hierarchy.seen_rows = current_terminal_ids
+            .iter()
+            .map(|id| hierarchy_ui::terminal_key(*id))
+            .chain(
+                current_thread_ids
+                    .iter()
+                    .map(|id| hierarchy_ui::thread_key(*id)),
+            )
+            .collect();
 
         notified_threads.retain(|id| current_thread_ids.contains(id));
 

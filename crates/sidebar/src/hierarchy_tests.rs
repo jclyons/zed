@@ -523,3 +523,224 @@ async fn test_collapsed_parent_rolls_up_notifications(cx: &mut TestAppContext) {
         assert!(layout.rollup.notified, "the grandchild's dot rolls up");
     });
 }
+
+fn set_editor_text(sidebar: &Entity<Sidebar>, text: &str, cx: &mut VisualTestContext) {
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        let editor = sidebar
+            .hierarchy
+            .section_edit
+            .as_ref()
+            .expect("section editor is open")
+            .editor
+            .clone();
+        editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+    });
+}
+
+fn confirm_edit(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) {
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.confirm_section_edit(window, cx)
+    });
+    cx.run_until_parked();
+}
+
+fn notice(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) -> Option<String> {
+    sidebar.read_with(cx, |sidebar, _| {
+        sidebar.hierarchy.notice.as_ref().map(|n| n.to_string())
+    })
+}
+
+// Review B1: the first subthread and the first section must be creatable from the row menu on
+// the starting state (empty hierarchy, no row layout).
+#[gpui::test]
+async fn test_row_menu_creates_first_subthread_and_section_from_empty_hierarchy(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let top = add_terminal(&mut cx, "top", "/project-a", 10);
+    let low = add_terminal(&mut cx, "low", "/project-a", 20);
+    refresh(&sidebar, &mut cx);
+    let weak = sidebar.downgrade();
+    let ga = group("/project-a");
+
+    let items = sidebar.read_with(&cx, |s, cx| s.row_menu_items(&key(low), cx));
+    assert!(
+        items.iter().any(|item| matches!(item,
+            hierarchy_ui::RowMenuItem::MakeSubthreadOf(c) if c.iter().any(|(k, _)| *k == key(top)))),
+        "Make Subthread Of offers the other row: {items:?}"
+    );
+    assert!(
+        items.iter().any(|item| matches!(item,
+            hierarchy_ui::RowMenuItem::MoveToSection { group, .. } if *group == ga)),
+        "Move to Section is offered with the row's own project: {items:?}"
+    );
+
+    // Nest through the same action the menu entry runs.
+    cx.update(|_, cx| hierarchy_ui::set_parent_action(&weak, cx, &key(low), Some(&key(top))));
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  top", "    low"]
+    );
+
+    // "New Section…" through the editor the menu opens, moving the row into it.
+    sidebar.update_in(&mut cx, |sidebar, window, cx| {
+        sidebar.new_section_in(ga.clone(), Some((key(top), ga.clone())), window, cx)
+    });
+    set_editor_text(&sidebar, "Personas", &mut cx);
+    confirm_edit(&sidebar, &mut cx);
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        [
+            "[project-b]",
+            "[project-a]",
+            "  § Personas",
+            "    top",
+            "      low"
+        ]
+    );
+    assert_eq!(notice(&sidebar, &mut cx), None);
+}
+
+// Review S3: refusals are shown, not swallowed.
+#[gpui::test]
+async fn test_refusals_are_surfaced(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let top = add_terminal(&mut cx, "top", "/project-a", 10);
+    let low = add_terminal(&mut cx, "low", "/project-a", 20);
+    let ga = group("/project-a");
+    let weak = sidebar.downgrade();
+
+    // A cycle.
+    cx.update(|_, cx| hierarchy_ui::set_parent_action(&weak, cx, &key(low), Some(&key(top))));
+    cx.update(|_, cx| hierarchy_ui::set_parent_action(&weak, cx, &key(top), Some(&key(low))));
+    assert!(
+        notice(&sidebar, &mut cx).is_some_and(|n| n.contains("ancestor")),
+        "cycle refusal is shown"
+    );
+    // The next successful edit clears it.
+    cx.update(|_, cx| hierarchy_ui::set_parent_action(&weak, cx, &key(low), None));
+    assert_eq!(notice(&sidebar, &mut cx), None);
+
+    // An empty name keeps the editor open and says why.
+    sidebar.update_in(&mut cx, |sidebar, window, cx| {
+        sidebar.new_section_in(ga.clone(), None, window, cx)
+    });
+    set_editor_text(&sidebar, "   ", &mut cx);
+    confirm_edit(&sidebar, &mut cx);
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("empty")));
+    assert!(sidebar.read_with(&cx, |s, _| s.hierarchy.section_edit.is_some()));
+
+    // A duplicate name on rename.
+    edit(&mut cx, |store, cx| {
+        store.create_section(&ga, "Alpha", cx).unwrap();
+        store.create_section(&ga, "Beta", cx).unwrap();
+    });
+    let beta = cx.update(|_, cx| {
+        HierarchyStore::global(cx)
+            .read(cx)
+            .hierarchy()
+            .clone_section_id(&ga, "Beta")
+            .unwrap()
+    });
+    sidebar.update_in(&mut cx, |sidebar, window, cx| {
+        sidebar.begin_section_edit(
+            ga.clone(),
+            hierarchy_ui::SectionEditKind::Rename(beta),
+            "Beta",
+            window,
+            cx,
+        )
+    });
+    set_editor_text(&sidebar, "alpha", &mut cx);
+    confirm_edit(&sidebar, &mut cx);
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("already exists")));
+}
+
+// A hierarchy saved by a newer CPZed is read-only: visible banner, no menu actions, edits say so.
+#[gpui::test]
+async fn test_read_only_hierarchy_is_visible_and_refuses_edits(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let top = add_terminal(&mut cx, "top", "/project-a", 10);
+    let low = add_terminal(&mut cx, "low", "/project-a", 20);
+    let db = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx));
+    db.scoped(cpzed_hierarchy::KVP_SCOPE)
+        .write(
+            cpzed_hierarchy::KVP_KEY.to_string(),
+            r#"{"version":99}"#.to_string(),
+        )
+        .await
+        .unwrap();
+    cx.update(|_, cx| {
+        HierarchyStore::global(cx).update(cx, |store, cx| *store = HierarchyStore::new(db, cx))
+    });
+    refresh(&sidebar, &mut cx);
+
+    sidebar.update(&mut cx, |sidebar, cx| {
+        assert!(sidebar.hierarchy.store.read(cx).is_read_only());
+        assert!(
+            sidebar.render_section_edit_bar(cx).is_some(),
+            "the read-only banner is rendered"
+        );
+    });
+    let items = sidebar.read_with(&cx, |s, cx| s.row_menu_items(&key(low), cx));
+    assert!(matches!(
+        items.as_slice(),
+        [hierarchy_ui::RowMenuItem::ReadOnly]
+    ));
+    let weak = sidebar.downgrade();
+    cx.update(|_, cx| hierarchy_ui::set_parent_action(&weak, cx, &key(low), Some(&key(top))));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("read-only")));
+}
+
+// Review N3: the sidebar keys terminals with `Display`; `to_key_string` is crate-private in
+// agent_ui, so pin the shape it promises: lowercase hyphenated uuid.
+#[gpui::test]
+fn test_terminal_key_is_a_hyphenated_uuid(_cx: &mut TestAppContext) {
+    let RowKey::Terminal(text) = key(TerminalId::test_new()) else {
+        panic!("terminal key");
+    };
+    assert_eq!(text.len(), 36);
+    for (ix, ch) in text.chars().enumerate() {
+        if [8, 13, 18, 23].contains(&ix) {
+            assert_eq!(ch, '-', "{text}");
+        } else {
+            assert!(ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase(), "{text}");
+        }
+    }
+}
+
+// Review S1: rows hidden in a collapsed subtree still count as seen (30-day prune).
+#[gpui::test]
+async fn test_hidden_rows_are_still_recorded_as_seen(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let top = add_terminal(&mut cx, "top", "/project-a", 10);
+    let low = add_terminal(&mut cx, "low", "/project-a", 20);
+    edit(&mut cx, |store, cx| {
+        store.set_parent(&key(low), Some(&key(top)), cx).unwrap();
+        store.set_row_collapsed(&key(top), true, cx).ok();
+    });
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  top +1"]
+    );
+    sidebar.read_with(&cx, |sidebar, _| {
+        assert!(sidebar.hierarchy.seen_rows.contains(&key(low)));
+    });
+    let stored = cx.update(|_, cx| {
+        HierarchyStore::global(cx)
+            .read(cx)
+            .hierarchy()
+            .last_seen
+            .contains_key(&key(low))
+    });
+    assert!(stored, "the hidden row has a last_seen entry");
+}

@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cpzed_hierarchy::{
-    ArrangeInput, GroupKey, Hierarchy, HierarchyStore, Rollup, RowInfo, RowKey, SectionId, Slot,
-    arrange_rows,
+    ArrangeInput, GroupKey, Hierarchy, HierarchyStore, Refusal, Rollup, RowInfo, RowKey, SectionId,
+    Slot, arrange_rows,
 };
 use editor::Editor;
 use gpui::{Entity, Subscription, WeakEntity};
@@ -65,6 +65,10 @@ pub(crate) struct HierarchyUi {
     pub store: Entity<HierarchyStore>,
     pub row_layout: HashMap<RowKey, RowLayout>,
     pub section_edit: Option<SectionEdit>,
+    /// The last refused edit, shown in the bar until the next edit succeeds.
+    pub notice: Option<SharedString>,
+    /// Every row the last rebuild saw (including collapsed subtrees), for the 30-day prune.
+    pub seen_rows: Vec<RowKey>,
     pub _store_subscription: Subscription,
 }
 
@@ -314,10 +318,60 @@ fn rollup_label(rollup: &Rollup, include_count: bool) -> String {
     parts.join(" · ")
 }
 
-fn store_update(cx: &mut App, f: impl FnOnce(&mut HierarchyStore, &mut Context<HierarchyStore>)) {
-    if let Some(store) = HierarchyStore::try_global(cx) {
-        store.update(cx, f);
-    }
+/// Run a store edit and surface a refusal in the sidebar (never swallow it).
+pub(crate) fn edit_store<T>(
+    sidebar: &WeakEntity<Sidebar>,
+    cx: &mut App,
+    edit: impl FnOnce(&mut HierarchyStore, &mut Context<HierarchyStore>) -> Result<T, Refusal>,
+) -> Option<T> {
+    let store = HierarchyStore::try_global(cx)?;
+    let result = store.update(cx, edit);
+    sidebar
+        .update(cx, |sidebar, cx| sidebar.note_refusal(result, cx))
+        .ok()
+        .flatten()
+}
+
+/// Make `child` a subthread of `parent` (or un-nest it with `None`).
+pub(crate) fn set_parent_action(
+    sidebar: &WeakEntity<Sidebar>,
+    cx: &mut App,
+    child: &RowKey,
+    parent: Option<&RowKey>,
+) {
+    edit_store(sidebar, cx, |store, cx| store.set_parent(child, parent, cx));
+}
+
+/// Put a row in a section of its own project, or in the unsectioned area with `None`.
+pub(crate) fn set_section_action(
+    sidebar: &WeakEntity<Sidebar>,
+    cx: &mut App,
+    row: &RowKey,
+    group: &GroupKey,
+    section: Option<&SectionId>,
+) {
+    edit_store(sidebar, cx, |store, cx| {
+        store.set_section(row, group, section, cx)
+    });
+}
+
+/// What the row context menu offers. Built from the live sidebar, so it also works on the
+/// starting state (no hierarchy, no `row_layout`).
+#[derive(Clone, Debug)]
+pub(crate) enum RowMenuItem {
+    MakeSubthreadOf(Vec<(RowKey, SharedString)>),
+    RemoveFromParent,
+    MoveToSection {
+        group: GroupKey,
+        sections: Vec<(SectionId, String)>,
+    },
+    RemoveFromSection {
+        group: GroupKey,
+    },
+    ToggleSubtree {
+        collapsed: bool,
+    },
+    ReadOnly,
 }
 
 impl Sidebar {
@@ -330,13 +384,18 @@ impl Sidebar {
             store,
             row_layout: HashMap::new(),
             section_edit: None,
+            notice: None,
+            seen_rows: Vec::new(),
             _store_subscription: subscription,
         }
     }
 
-    /// Quietly record that the visible rows and groups were seen (drives the 30-day prune).
+    /// Quietly record every row the last rebuild saw (visible or hidden in a collapsed subtree or
+    /// section) and every project header, so a long-collapsed subtree is not pruned. Rows of
+    /// collapsed PROJECT groups are only known for terminals: do not wire `prune` before that
+    /// is solved.
     pub(crate) fn touch_hierarchy_seen(&mut self, cx: &mut Context<Self>) {
-        let mut rows: Vec<RowKey> = Vec::new();
+        let mut rows: Vec<RowKey> = self.hierarchy.seen_rows.clone();
         let mut groups: Vec<GroupKey> = Vec::new();
         for entry in &self.contents.entries {
             match entry {
@@ -348,6 +407,27 @@ impl Sidebar {
         self.hierarchy.store.update(cx, |store, cx| {
             store.touch_seen(&rows, &groups, now, cx);
         });
+    }
+
+    /// Show a refusal (or clear the notice after a success). Returns the success value.
+    pub(crate) fn note_refusal<T>(
+        &mut self,
+        result: Result<T, Refusal>,
+        cx: &mut Context<Self>,
+    ) -> Option<T> {
+        match result {
+            Ok(value) => {
+                if self.hierarchy.notice.take().is_some() {
+                    cx.notify();
+                }
+                Some(value)
+            }
+            Err(refusal) => {
+                self.hierarchy.notice = Some(SharedString::from(format!("{refusal}")));
+                cx.notify();
+                None
+            }
+        }
     }
 
     /// Wrap a rendered thread or terminal row with its indent, chevron, depth badge, rollup and
@@ -435,9 +515,11 @@ impl Sidebar {
     }
 
     fn set_row_subtree_collapsed(&mut self, key: &RowKey, collapsed: bool, cx: &mut Context<Self>) {
-        self.hierarchy.store.update(cx, |store, cx| {
-            store.set_row_collapsed(key, collapsed, cx).ok();
-        });
+        let result = self
+            .hierarchy
+            .store
+            .update(cx, |store, cx| store.set_row_collapsed(key, collapsed, cx));
+        self.note_refusal(result, cx);
     }
 
     fn set_section_collapsed(
@@ -447,9 +529,10 @@ impl Sidebar {
         collapsed: bool,
         cx: &mut Context<Self>,
     ) {
-        self.hierarchy.store.update(cx, |store, cx| {
-            store.set_section_collapsed(group, id, collapsed, cx).ok();
+        let result = self.hierarchy.store.update(cx, |store, cx| {
+            store.set_section_collapsed(group, id, collapsed, cx)
         });
+        self.note_refusal(result, cx);
     }
 
     pub(crate) fn render_section_header(
@@ -544,9 +627,10 @@ impl Sidebar {
                     .entry("Delete Section", None, {
                         let group = group.clone();
                         let id = id.clone();
+                        let sidebar = sidebar.clone();
                         move |_window, cx| {
-                            store_update(cx, |store, cx| {
-                                store.delete_section(&group, &id, cx).ok();
+                            edit_store(&sidebar, cx, |store, cx| {
+                                store.delete_section(&group, &id, cx)
                             });
                         }
                     })
@@ -556,11 +640,10 @@ impl Sidebar {
                         {
                             let group = group.clone();
                             let id = id.clone();
+                            let sidebar = sidebar.clone();
                             move |_window, cx| {
-                                store_update(cx, |store, cx| {
-                                    store
-                                        .set_section_collapsed(&group, &id, !collapsed, cx)
-                                        .ok();
+                                edit_store(&sidebar, cx, |store, cx| {
+                                    store.set_section_collapsed(&group, &id, !collapsed, cx)
                                 });
                             }
                         },
@@ -684,29 +767,35 @@ impl Sidebar {
         cx.notify();
     }
 
-    fn confirm_section_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(edit) = self.hierarchy.section_edit.take() else {
+    pub(crate) fn confirm_section_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.hierarchy.section_edit.as_ref() else {
             return;
         };
         let name = edit.editor.read(cx).text(cx).trim().to_string();
-        if !name.is_empty() {
-            let group = edit.group.clone();
-            self.hierarchy
-                .store
-                .update(cx, |store, cx| match edit.kind {
-                    SectionEditKind::New { then_move } => {
-                        if let Ok((id, _)) = store.create_section(&group, &name, cx)
-                            && let Some((row, row_group)) = then_move
-                        {
-                            store.set_section(&row, &row_group, Some(&id), cx).ok();
-                        }
+        let group = edit.group.clone();
+        let result = match &edit.kind {
+            SectionEditKind::New { then_move } => {
+                let then_move = then_move.clone();
+                self.hierarchy.store.update(cx, |store, cx| {
+                    let (id, _) = store.create_section(&group, &name, cx)?;
+                    if let Some((row, row_group)) = then_move {
+                        store.set_section(&row, &row_group, Some(&id), cx)?;
                     }
-                    SectionEditKind::Rename(id) => {
-                        store.rename_section(&group, &id, &name, cx).ok();
-                    }
-                });
+                    Ok(())
+                })
+            }
+            SectionEditKind::Rename(id) => {
+                let id = id.clone();
+                self.hierarchy
+                    .store
+                    .update(cx, |store, cx| store.rename_section(&group, &id, &name, cx))
+            }
+        };
+        // A refused edit keeps the bar open with the reason; a successful one closes it.
+        if self.note_refusal(result, cx).is_some() {
+            self.hierarchy.section_edit = None;
+            window.focus(&self.focus_handle, cx);
         }
-        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -717,6 +806,7 @@ impl Sidebar {
     }
 
     pub(crate) fn render_section_edit_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = cx.theme().colors();
         if self.hierarchy.store.read(cx).is_read_only() {
             return Some(
                 h_flex()
@@ -731,33 +821,60 @@ impl Sidebar {
                     .into_any_element(),
             );
         }
-        let edit = self.hierarchy.section_edit.as_ref()?;
-        let colors = cx.theme().colors();
+        let notice = self.hierarchy.notice.clone();
+        let edit = self.hierarchy.section_edit.as_ref();
+        if notice.is_none() && edit.is_none() {
+            return None;
+        }
         Some(
-            h_flex()
+            v_flex()
                 .w_full()
-                .px_2()
-                .py_1()
-                .gap_2()
                 .border_t_1()
                 .border_color(colors.border)
-                .child(
-                    Label::new(match edit.kind {
-                        SectionEditKind::New { .. } => "New section",
-                        SectionEditKind::Rename(_) => "Rename section",
-                    })
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
-                .child(div().flex_1().min_w_0().child(edit.editor.clone()))
-                .capture_action(
-                    cx.listener(|this, _: &editor::actions::Newline, window, cx| {
-                        this.confirm_section_edit(window, cx);
-                    }),
-                )
-                .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
-                    this.cancel_section_edit(window, cx);
-                }))
+                .when_some(notice, |this, notice| {
+                    this.child(
+                        div()
+                            .id("hierarchy-notice")
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.hierarchy.notice = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                Label::new(notice)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Warning),
+                            ),
+                    )
+                })
+                .when_some(edit, |this, edit| {
+                    this.child(
+                        h_flex()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .gap_2()
+                            .child(
+                                Label::new(match edit.kind {
+                                    SectionEditKind::New { .. } => "New section",
+                                    SectionEditKind::Rename(_) => "Rename section",
+                                })
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            )
+                            .child(div().flex_1().min_w_0().child(edit.editor.clone()))
+                            .capture_action(cx.listener(
+                                |this, _: &editor::actions::Newline, window, cx| {
+                                    this.confirm_section_edit(window, cx);
+                                },
+                            ))
+                            .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                                this.cancel_section_edit(window, cx);
+                            })),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -781,6 +898,85 @@ impl Sidebar {
             .collect()
     }
 
+    /// The group a row belongs to: its layout when arranged, else the nearest project header
+    /// above it (the starting state has no layout).
+    fn row_group(&self, key: &RowKey) -> Option<GroupKey> {
+        if let Some(layout) = self.hierarchy.row_layout.get(key) {
+            return Some(layout.group.clone());
+        }
+        let ix = self
+            .contents
+            .entries
+            .iter()
+            .position(|entry| entry_row_key(entry).as_ref() == Some(key))?;
+        self.contents.entries[..ix]
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                ListEntry::ProjectHeader { key, .. } => Some(group_key(key)),
+                _ => None,
+            })
+    }
+
+    /// What the row context menu offers for `key`.
+    pub(crate) fn row_menu_items(&self, key: &RowKey, cx: &App) -> Vec<RowMenuItem> {
+        if self.hierarchy.store.read(cx).is_read_only() {
+            return vec![RowMenuItem::ReadOnly];
+        }
+        let Some(group) = self.row_group(key) else {
+            return Vec::new();
+        };
+        let hierarchy = self.hierarchy.store.read(cx).hierarchy();
+        let layout = self.hierarchy.row_layout.get(key);
+        let mut items = Vec::new();
+
+        let candidates: Vec<(RowKey, SharedString)> = self
+            .visible_row_titles()
+            .into_iter()
+            .filter(|(candidate, _)| !hierarchy.would_cycle(key, candidate))
+            .collect();
+        if !candidates.is_empty() {
+            items.push(RowMenuItem::MakeSubthreadOf(candidates));
+        }
+        if hierarchy.parents.contains_key(key) {
+            items.push(RowMenuItem::RemoveFromParent);
+        } else {
+            items.push(RowMenuItem::MoveToSection {
+                sections: hierarchy
+                    .sections
+                    .get(&group)
+                    .map(|sections| {
+                        sections
+                            .iter()
+                            .map(|s| (s.id.clone(), s.name.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                group: group.clone(),
+            });
+            if hierarchy.section_of(key).is_some() {
+                items.push(RowMenuItem::RemoveFromSection { group });
+            }
+        }
+        if let Some(layout) = layout.filter(|layout| layout.has_children) {
+            items.push(RowMenuItem::ToggleSubtree {
+                collapsed: layout.collapsed,
+            });
+        }
+        items
+    }
+
+    /// Open the "New Section…" editor, optionally moving `then_move` into it afterwards.
+    pub(crate) fn new_section_in(
+        &mut self,
+        group: GroupKey,
+        then_move: Option<(RowKey, GroupKey)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_section_edit(group, SectionEditKind::New { then_move }, "", window, cx);
+    }
+
     /// Append the hierarchy block to a row's context menu.
     pub(crate) fn append_row_menu(
         menu: ContextMenu,
@@ -788,123 +984,81 @@ impl Sidebar {
         key: &RowKey,
         cx: &mut App,
     ) -> ContextMenu {
-        let Some(store) = HierarchyStore::try_global(cx) else {
-            return menu;
-        };
-        if store.read(cx).is_read_only() {
-            return menu.separator().label(READ_ONLY_NOTICE);
-        }
-        let snapshot = sidebar
-            .read_with(cx, |sidebar, _| {
-                let layout = sidebar.hierarchy.row_layout.get(key)?.clone();
-                Some((layout, sidebar.visible_row_titles()))
-            })
-            .ok()
-            .flatten();
-        let Some((layout, visible)) = snapshot else {
-            return menu;
-        };
-        let hierarchy = store.read(cx).hierarchy().clone();
-        let has_parent = hierarchy.parents.contains_key(key);
-        let current_section = hierarchy.section_of(key).map(|(_, id)| id.clone());
-        let sections: Vec<(SectionId, String)> = hierarchy
-            .sections
-            .get(&layout.group)
-            .map(|sections| {
-                sections
-                    .iter()
-                    .map(|s| (s.id.clone(), s.name.clone()))
-                    .collect()
-            })
+        let items = sidebar
+            .read_with(cx, |sidebar, cx| sidebar.row_menu_items(key, cx))
             .unwrap_or_default();
-        let candidates: Vec<(RowKey, SharedString)> = visible
-            .into_iter()
-            .filter(|(candidate, _)| !hierarchy.would_cycle(key, candidate))
-            .collect();
-
+        if items.is_empty() {
+            return menu;
+        }
         let mut menu = menu.separator();
-
-        if !candidates.is_empty() {
+        for item in items {
             let key = key.clone();
-            menu = menu.submenu("Make Subthread Of", move |mut submenu, _window, _cx| {
-                for (candidate, title) in candidates.clone() {
-                    let key = key.clone();
-                    submenu = submenu.entry(title, None, move |_window, cx| {
-                        store_update(cx, |store, cx| {
-                            store.set_parent(&key, Some(&candidate), cx).ok();
-                        });
-                    });
-                }
-                submenu
-            });
-        }
-        if has_parent {
-            let key = key.clone();
-            menu = menu.entry("Remove from Parent", None, move |_window, cx| {
-                store_update(cx, |store, cx| {
-                    store.set_parent(&key, None, cx).ok();
-                });
-            });
-        } else {
-            let remove_key = key.clone();
-            let key = key.clone();
-            let group = layout.group.clone();
             let sidebar = sidebar.clone();
-            menu = menu.submenu("Move to Section", move |mut submenu, _window, _cx| {
-                for (id, name) in sections.clone() {
-                    let key = key.clone();
-                    let group = group.clone();
-                    submenu = submenu.entry(name, None, move |_window, cx| {
-                        store_update(cx, |store, cx| {
-                            store.set_section(&key, &group, Some(&id), cx).ok();
-                        });
-                    });
+            menu = match item {
+                RowMenuItem::ReadOnly => menu.label(READ_ONLY_NOTICE),
+                RowMenuItem::MakeSubthreadOf(candidates) => {
+                    menu.submenu("Make Subthread Of", move |mut submenu, _window, _cx| {
+                        for (candidate, title) in candidates.clone() {
+                            let key = key.clone();
+                            let sidebar = sidebar.clone();
+                            submenu = submenu.entry(title, None, move |_window, cx| {
+                                set_parent_action(&sidebar, cx, &key, Some(&candidate));
+                            });
+                        }
+                        submenu
+                    })
                 }
-                let key = key.clone();
-                let group = group.clone();
-                let sidebar = sidebar.clone();
-                submenu.entry("New Section…", None, move |window, cx| {
-                    sidebar
-                        .update(cx, |sidebar, cx| {
-                            sidebar.begin_section_edit(
-                                group.clone(),
-                                SectionEditKind::New {
-                                    then_move: Some((key.clone(), group.clone())),
-                                },
-                                "",
-                                window,
-                                cx,
-                            );
+                RowMenuItem::RemoveFromParent => {
+                    menu.entry("Remove from Parent", None, move |_window, cx| {
+                        set_parent_action(&sidebar, cx, &key, None);
+                    })
+                }
+                RowMenuItem::MoveToSection { group, sections } => {
+                    menu.submenu("Move to Section", move |mut submenu, _window, _cx| {
+                        for (id, name) in sections.clone() {
+                            let key = key.clone();
+                            let group = group.clone();
+                            let sidebar = sidebar.clone();
+                            submenu = submenu.entry(name, None, move |_window, cx| {
+                                set_section_action(&sidebar, cx, &key, &group, Some(&id));
+                            });
+                        }
+                        let key = key.clone();
+                        let group = group.clone();
+                        let sidebar = sidebar.clone();
+                        submenu.entry("New Section…", None, move |window, cx| {
+                            sidebar
+                                .update(cx, |sidebar, cx| {
+                                    sidebar.new_section_in(
+                                        group.clone(),
+                                        Some((key.clone(), group.clone())),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
                         })
-                        .ok();
-                })
-            });
-            if current_section.is_some() {
-                let key = remove_key;
-                let group = layout.group.clone();
-                menu = menu.entry("Remove from Section", None, move |_window, cx| {
-                    store_update(cx, |store, cx| {
-                        store.set_section(&key, &group, None, cx).ok();
-                    });
-                });
-            }
-        }
-        if layout.has_children {
-            let key = key.clone();
-            let collapsed = layout.collapsed;
-            menu = menu.entry(
-                if collapsed {
-                    "Expand Subthreads"
-                } else {
-                    "Collapse Subthreads"
-                },
-                None,
-                move |_window, cx| {
-                    store_update(cx, |store, cx| {
-                        store.set_row_collapsed(&key, !collapsed, cx).ok();
-                    });
-                },
-            );
+                    })
+                }
+                RowMenuItem::RemoveFromSection { group } => {
+                    menu.entry("Remove from Section", None, move |_window, cx| {
+                        set_section_action(&sidebar, cx, &key, &group, None);
+                    })
+                }
+                RowMenuItem::ToggleSubtree { collapsed } => menu.entry(
+                    if collapsed {
+                        "Expand Subthreads"
+                    } else {
+                        "Collapse Subthreads"
+                    },
+                    None,
+                    move |_window, cx| {
+                        edit_store(&sidebar, cx, |store, cx| {
+                            store.set_row_collapsed(&key, !collapsed, cx)
+                        });
+                    },
+                ),
+            };
         }
         menu
     }
