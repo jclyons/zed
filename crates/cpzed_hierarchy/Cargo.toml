@@ -1,0 +1,32 @@
+[package]
+name = "cpzed_hierarchy"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+description = "CPZed fork: project sections, subthread links and manual row order for the Threads Sidebar"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[features]
+default = ["store"]
+# The gpui-backed `HierarchyStore`. Without it the crate is pure logic and its
+# tests build in seconds: `cargo test -p cpzed_hierarchy --no-default-features`.
+store = ["dep:gpui", "dep:db", "dep:util"]
+# Needed only to run the store tests: `cargo test -p cpzed_hierarchy --features test-support`.
+test-support = ["store", "db/test-support", "gpui/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+db = { workspace = true, optional = true }
+gpui = { workspace = true, optional = true }
+util = { workspace = true, optional = true }
