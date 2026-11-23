@@ -503,16 +503,19 @@ sc_interval_run() {
   start_app "$E/apps/CPZed.app"; dep run; ck interval-defers "$RC" 10; ckm interval-msg "$OUT" "minimum interval"; ck interval-no-build "$(cat "$E/bundle.log" 2>/dev/null | wc -l | tr -d ' ')" 0
   export CPZED_MIN_INTERVAL_S=0; kill_dummy
 }
-sc_ditto_wait() { # the swap must happen AFTER Glider's archiver exited; with the wait disabled it would happen while it runs
-  newenv ditto; install_prev; mkpr 1; export CPZED_DITTO_WAIT_S=90
-  local d; d=$(fake_tool ditto "sleep 25; date +%s > $E/ditto.end")
+sc_ditto_wait() { # marker-driven: the archiver blocks on a marker; NO quit while it runs; quit only after it exited
+  newenv ditto; install_prev; mkpr 1
+  local d dp; d=$(fake_tool ditto "while [ ! -e $E/archiver.release ]; do sleep 0.2; done; date +%s > $E/ditto.end")
   start_app "$E/apps/CPZed.app"; sre_on
   ( "$d" -c -k --keepParent "$E/apps/CPZed.app" "$E/out.zip" >/dev/null 2>&1 & ); poll 20 pgrep -f "$E/fake/ditto/ditto"
-  dep run; sre_off
-  ck ditto-deploy-ok "$RC" 0
-  poll 60 test -f "$E/ditto.end"                       # the archiver's exit marker (it may still be running if the wait was skipped)
-  local launched_new end; launched_new=$(tail -1 "$E/open.log" | cut -d' ' -f1); end=$(cat "$E/ditto.end" 2>/dev/null)
-  ck ditto-new-app-launched-only-after-archiver-exit "$([[ -n "$end" && "$launched_new" -ge "$end" ]] && echo y)" y; kill_dummy
+  CPZED_DITTO_WAIT_S=120 "$D/deploy" run >"$E/dep.out" 2>&1 & dp=$!
+  poll 90 grep -q '\[restarting\]' "$E/notify.log"
+  sleep 8                                  # an unguarded deploy quits within ~2 s of this notice
+  ck ditto-no-quit-while-archiver-runs "$([[ -e $E/quit.log ]] && echo quit || echo none)" none
+  touch "$E/archiver.release"; wait "$dp"; local rc=$?; sre_off
+  ck ditto-deploy-ok "$rc" 0
+  local q end launched; q=$(head -1 "$E/quit.log" 2>/dev/null); end=$(cat "$E/ditto.end" 2>/dev/null); launched=$(tail -1 "$E/open.log" | cut -d' ' -f1)
+  ck ditto-quit-and-launch-after-archiver-exit "$([[ -n "$end" && -n "$q" && "$q" -ge "$end" && "$launched" -ge "$end" ]] && echo y)" y; kill_dummy
 }
 
 sc_first_swap() {
@@ -543,7 +546,7 @@ sc_first_swap() {
   ck firstswap-stock-present-nothing-installed "$([[ -e $E/apps/CPZed.app ]] && echo y || echo n)" n; kill_dummy
   # stock removed but the user never confirmed: must NOT proceed (the marker is the user's go)
   newenv fsnomark; mkstock; mkpr 1; mkapp "$E/apps/Zed.app" 0 "$(printf '%040d' 77)" "$E/stock-build.json"; start_app "$E/apps/Zed.app"; sre_on
-  ( for _ in $(seq 1 150); do grep -q '\[first-swap\]' "$E/notify.log" 2>/dev/null && break; sleep 0.2; done; rm -rf "$E/apps/Zed.app" ) & dep run --first-swap; sre_off
+  ( for _ in $(seq 1 150); do grep -q '\[first-swap\]' "$E/notify.log" 2>/dev/null && break; sleep 0.2; done; rm -rf "$E/apps/Zed.app" ) & CPZED_FIRST_SWAP_WAIT_S=8 dep run --first-swap; sre_off
   ck firstswap-no-marker-aborts "$RC" 30; ck firstswap-no-marker-nothing-installed "$([[ -e $E/apps/CPZed.app ]] && echo y || echo n)" n; kill_dummy
   # --first-swap refuses when CPZed.app already exists; plain deploy refuses when it is missing
   newenv fsex; install_prev; mkpr 1; dep run --first-swap; ck firstswap-refuses-existing "$RC" 30; ckm firstswap-refuses-existing-msg "$OUT" "already exists"; ck firstswap-refuses-existing-built-nothing "$(cat "$E/bundle.log" 2>/dev/null | wc -l | tr -d ' ')" 0
@@ -590,7 +593,7 @@ sc_override_refusal() { # B1: outside a confined test run, NO test/override vari
   out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX= "$D/deploy" status 2>&1); ck empty-test-prefix-refused "$?" 2
   out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX=/Applications "$D/deploy" status 2>&1); ck prefix-applications-refused "$?" 99
   out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX=/applications "$D/deploy" status 2>&1); ck prefix-applications-lowercase-refused "$?" 99
-  out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX="$E/nope" CPZED_HOME_DIR="$E/nope/h" CPZED_APP_DIR="$E/nope/a" CPZED_DATA_DIR="$E/nope/d" CPZED_CONF_DIR="$E/nope/c" CPZED_QUIT_CMD=/bin/true CPZED_OPEN_CMD=/bin/true CPZED_NOTIFY_CMD=/bin/true "$D/deploy" status 2>&1); ck prefix-nonexistent-refused "$?" 99
+  out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX="$E/nope" CPZED_PORT=47998 CPZED_HOME_DIR="$E/nope/h" CPZED_APP_DIR="$E/nope/a" CPZED_DATA_DIR="$E/nope/d" CPZED_CONF_DIR="$E/nope/c" CPZED_QUIT_CMD=/bin/true CPZED_OPEN_CMD=/bin/true CPZED_NOTIFY_CMD=/bin/true "$D/deploy" status 2>&1); ck prefix-nonexistent-refused "$?" 99
   out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_IDENTITY=Someone "$D/deploy" status 2>&1); ck identity-var-allowed "$?" 0
 }
 
@@ -601,16 +604,23 @@ sc_gate_crash() { # B2a: a crashing gate is NOT a pass
   ck gate-crash-app-not-quit "$(port_up | wc -l | tr -d ' ')" 1; ck gate-crash-no-quit-call "$([[ -e $E/quit.log ]] && echo quit || echo none)" none
   ckm gate-crash-notified "$(notes)" "gate failed unexpectedly"; kill_dummy
 }
-sc_gate_recheck_after_ditto() { # B2b: the user comes back during the archiver wait: re-check before the quit
+sc_gate_recheck_after_ditto() { # B2b, marker-driven: the user returns as the archiver exits; the quit must wait for them
   newenv recheck; install_prev; mkpr 1
-  printf '#!/bin/sh\n[ -e "$CPZED_TEST_PREFIX/user-back" ] && echo 30 || echo 99999\n' > "$E/bin/hid"; chmod +x "$E/bin/hid"; export CPZED_HID_IDLE_CMD="$E/bin/hid"
-  local d; d=$(fake_tool ditto "sleep 9"); ( "$d" -c -k --keepParent "$E/apps/CPZed.app" "$E/out.zip" >/dev/null 2>&1 & )
-  ( for _ in $(seq 1 300); do grep -q '\[restarting\]' "$E/notify.log" 2>/dev/null && break; sleep 0.1; done
-    sleep 1; touch "$E/user-back"; sleep 8; rm -f "$E/user-back"; date +%s > "$E/user-gone" ) & local bg=$!
-  start_app "$E/apps/CPZed.app"; sre_on; DEP_T=60 dep run; sre_off; wait "$bg" 2>/dev/null
-  ck recheck-deploy-ok "$RC" 0
-  local q g; q=$(head -1 "$E/quit.log" 2>/dev/null); g=$(cat "$E/user-gone" 2>/dev/null)
-  ck recheck-quit-only-after-user-left "$([[ -n "$q" && -n "$g" && "$q" -ge "$g" ]] && echo y)" y; kill_dummy
+  printf '#!/bin/sh\necho call >> "$CPZED_TEST_PREFIX/hid.calls"\n[ -e "$CPZED_TEST_PREFIX/user-back" ] && echo 30 || echo 99999\n' > "$E/bin/hid"; chmod +x "$E/bin/hid"; export CPZED_HID_IDLE_CMD="$E/bin/hid"
+  local d dp; d=$(fake_tool ditto "while [ ! -e $E/archiver.release ]; do sleep 0.2; done; touch $E/user-back; date +%s > $E/ditto.end")
+  start_app "$E/apps/CPZed.app"; sre_on; touch "$E/hid.calls"
+  ( "$d" -c -k --keepParent "$E/apps/CPZed.app" "$E/out.zip" >/dev/null 2>&1 & ); poll 20 pgrep -f "$E/fake/ditto/ditto"
+  CPZED_DITTO_WAIT_S=120 "$D/deploy" run >"$E/dep.out" 2>&1 & dp=$!
+  poll 90 grep -q '\[restarting\]' "$E/notify.log"
+  local n0; n0=$(wc -l < "$E/hid.calls")
+  poll 60 eval '[ "$(wc -l < "$E/hid.calls")" -gt "'"$n0"'" ]'          # the pre-quit gate check ran: the deploy is now in the archiver wait
+  sleep 0.5; touch "$E/archiver.release"; poll 30 test -f "$E/ditto.end"
+  sleep 6                                  # unguarded, the quit follows the archiver's exit at once
+  ck recheck-no-quit-while-user-is-back "$([[ -e $E/quit.log ]] && echo quit || echo none)" none
+  rm -f "$E/user-back"; date +%s > "$E/user-gone"; wait "$dp"; local rc=$?; sre_off
+  ck recheck-deploy-ok "$rc" 0
+  local q g; q=$(head -1 "$E/quit.log" 2>/dev/null); g=$(cat "$E/user-gone")
+  ck recheck-quit-only-after-user-left "$([[ -n "$q" && "$q" -ge "$g" ]] && echo y)" y; kill_dummy
 }
 
 sc_first_swap_stock() { # B3: --first-swap needs a verified stock archive BEFORE anything is quit
@@ -815,6 +825,12 @@ sc_n14_spaces() { # a bundle path with a SPACE is matched from the kernel's argv
   python3 -I "$D/deploy-util" same-exe "$(cat "$E/sp.pid")" "$E/sp ace/CPZed.app/Contents/MacOS/zed"; ck space-path-same-exe "$?" 0
   ck space-path-other-exe-not-matched "$(python3 -I "$D/deploy-util" procs-of "$E/other.app/Contents/MacOS/zed" | grep -c .)" 0
   kill -9 "$(cat "$E/sp.pid")" 2>/dev/null
+  # a RELATIVE script path (started with ./zed from its own directory) is resolved against the process cwd
+  ( cd "$E/sp ace/CPZed.app/Contents/MacOS" && DUMMY_NO_LISTEN=1 DUMMY_PID_FILE="$E/rel.pid" nohup python3 -I ./zed >/dev/null 2>&1 & ); poll 20 test -s "$E/rel.pid"
+  ck relative-exec-path-resolved "$(python3 -I "$D/deploy-util" procs-of "$E/sp ace/CPZed.app/Contents/MacOS/zed" | grep -c .)" 1; kill -9 "$(cat "$E/rel.pid")" 2>/dev/null
+  # --crash-handler is excluded only as the FIRST argument; anywhere else the process still counts as an instance
+  ( cd "$E" && DUMMY_NO_LISTEN=1 DUMMY_PID_FILE="$E/ch.pid" nohup python3 -I "$E/sp ace/CPZed.app/Contents/MacOS/zed" foo --crash-handler >/dev/null 2>&1 & ); poll 20 test -s "$E/ch.pid"
+  ck crash-handler-not-first-arg-still-counts "$(python3 -I "$D/deploy-util" procs-of "$E/sp ace/CPZed.app/Contents/MacOS/zed" | grep -c .)" 1; kill -9 "$(cat "$E/ch.pid")" 2>/dev/null
 }
 
 sc_x1_slow_exit() { # an app that closes its port and exits ~2 s later is WAITED for (by process), not held
@@ -1077,22 +1093,20 @@ mut n4-assert-stopped-before-swap deploy 'assert_stopped "$old_app" "$APP"   # a
 mut n4-assert-stopped-both deploy 'assert_stopped "$old_app" "$APP"   # and once more, right before the rename' ':' sc_n4_processes deploy '  assert_stopped "$old_app" "$APP"
   # Data backup' '  # Data backup'
 
-mut n12-crash-handler deploy-util '"--crash-handler" not in r["cmd"].split()]' 'True]' sc_n12_n13
+mut n12-crash-handler deploy-util '        if first == "--crash-handler":
+            continue' '        pass' sc_n12_n13
+mut n12-crash-handler-first-arg-only deploy-util 'if first == "--crash-handler":' 'if "--crash-handler" in argv:' sc_n14_spaces
+mut n14-relative-exec-path deploy-util '                if not os.path.isabs(t):
+                    c = cwd_of(pid)
+                    if c:
+                        t = os.path.join(c, t)' '                pass' sc_n14_spaces
 mut n13-midrun-state deploy-lib.sh 'st_set()  { python3 -I "${UTIL[0]}" state "$STATE" set "$1" "$2" || state_fail; }' 'st_set()  { python3 -I "${UTIL[0]}" state "$STATE" set "$1" "$2"; }' sc_n12_n13
 
 mut first-strict-fork-only deploy-util '            ok, why = commit_eligible(c, sj, ledger, ghcmd)
             if not ok:
                 print("blocked by %s: %s (the first deploy needs every fork-only commit approved)" % (c, why)); return 1' '            ok = True' sc_first_strict
 mut first-needs-upstream deploy-util 'print("blocked: cannot list the fork-only commits: %s is missing (fetch the upstream remote)" % upstream); return 1' 'pass' sc_first_strict
-mut n14-kernel-argv deploy-util '        for t in argv[1:]:
-            if not t.startswith("-"):
-                return norm_path(t), argv
-        return "", argv
-    return norm_path(path), argv' '        for t in " ".join(argv[1:]).split():
-            if not t.startswith("-"):
-                return norm_path(t), argv
-        return "", argv
-    return norm_path(path), argv' sc_n14_spaces
+mut n14-kernel-argv deploy-util '        for i, t in enumerate(argv[1:], 1):' '        for i, t in enumerate(" ".join(argv[1:]).split(), 1):' sc_n14_spaces
 mut x1-wait-for-process deploy 'if [[ -z "$(port_pid)" && -z "$(util procs-of "$bin")" ]]; then return 0; fi' 'if [[ -z "$(port_pid)" ]]; then return 0; fi' sc_x1_slow_exit
 mut x4-snapshot-guard deploy 'cl=$(util claudes "$main") || abort_deploy "cannot enumerate the sessions under the app; not quitting" hold' 'cl=$(util claudes "$main")' sc_x4_snapshot_failclosed
 mut signal-handler-branch deploy '  elif (( SWAPPED == 1 || APP_QUIT == 1 )); then' '  elif false; then' sc_signal_after_quit

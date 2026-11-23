@@ -286,28 +286,51 @@ def procargs(pid):
     argv = [x.decode(errors="replace") for x in rest.split(b"\0")[:argc]]
     return path.decode(errors="replace"), argv
 
+def pidpath(pid):
+    """The kernel's absolute path of the running executable (proc_pidpath), or None."""
+    import ctypes
+    try:
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        buf = ctypes.create_string_buffer(4096)
+        n = lib.proc_pidpath(int(pid), buf, 4096)
+        return buf.value.decode(errors="replace") if n > 0 else None
+    except OSError:
+        return None
+
 def exe_and_argv(pid):
-    """(normalised executable, argv). For interpreted scripts the executable is the script path."""
+    """(normalised executable, argv, index of the executable's own token in argv). The executable is the kernel's
+    proc_pidpath (never a relative exec path); for an interpreted script it is the script, resolved against the
+    process's cwd when the token is relative."""
     pa = procargs(pid)
     if pa is None:
         return None
     path, argv = pa
-    if is_interp(os.path.basename(path)):
-        for t in argv[1:]:
+    real = pidpath(pid) or path
+    if is_interp(os.path.basename(real)):
+        for i, t in enumerate(argv[1:], 1):
             if not t.startswith("-"):
-                return norm_path(t), argv
-        return "", argv
-    return norm_path(path), argv
+                if not os.path.isabs(t):
+                    c = cwd_of(pid)
+                    if c:
+                        t = os.path.join(c, t)
+                return norm_path(t), argv, i
+        return "", argv, -1
+    return norm_path(real), argv, 0
 
 def procs_of(path):
-    """[(pid, argv)] of processes running PATH. Zed's own `--crash-handler` helper runs the same executable and may
-    outlive the app for a moment: it is not an instance."""
+    """[(pid, argv)] of processes running PATH. Zed's own `--crash-handler` helper runs the same executable (it is
+    spawned with `--crash-handler` as its first argument) and may outlive the app for a moment: it is not an instance."""
     want = norm_path(path)
     out = []
     for pid in ps_table():
         r = exe_and_argv(pid)
-        if r and r[0] == want and "--crash-handler" not in r[1]:
-            out.append((pid, r[1]))
+        if not r or r[0] != want:
+            continue
+        _exe, argv, idx = r
+        first = argv[idx + 1] if 0 <= idx < len(argv) - 1 else None
+        if first == "--crash-handler":
+            continue
+        out.append((pid, argv))
     return out
 
 def same_exe(pid, path):
