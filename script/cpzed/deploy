@@ -56,8 +56,17 @@ sign_app() { # app: re-seal after a re-stamp, keeping the existing entitlements
     --sign "${CPZED_IDENTITY:-CPZed Local Signing}" "$1"; local rc=$?
   rm -f "$ent"; return $rc
 }
-verify_app() { # app
-  if [[ -n "${CPZED_VERIFY_CMD:-}" ]]; then dl_run CPZED_VERIFY_CMD "$1"; else /usr/bin/codesign --verify --deep --strict "$1"; fi
+CODESIGN=${CPZED_CODESIGN_CMD:-/usr/bin/codesign}
+verify_app() { # a CPZed build: valid signature, signed by OUR identity (whole-line Authority) with the hardened runtime
+  if [[ -n "${CPZED_VERIFY_CMD:-}" ]]; then dl_run CPZED_VERIFY_CMD "$1"; return; fi
+  local id=${CPZED_IDENTITY:-CPZed Local Signing} dv
+  "$CODESIGN" --verify --deep --strict "$1" 2>/dev/null || return 1
+  dv=$("$CODESIGN" -dvv "$1" 2>&1) || return 1
+  grep -qxF "Authority=$id" <<<"$dv" || return 1
+  grep -Eq 'flags=0x[0-9a-f]+\(.*runtime' <<<"$dv" || return 1
+}
+verify_stock_app() { # the retired stock app is signed by Zed Industries: signature validity only
+  if [[ -n "${CPZED_VERIFY_CMD:-}" ]]; then dl_run CPZED_VERIFY_CMD "$1"; else "$CODESIGN" --verify --deep --strict "$1"; fi
 }
 lsreg() {
   if [[ -n "${CPZED_LSREGISTER_CMD:-}" ]]; then dl_run CPZED_LSREGISTER_CMD -f "$1" || true
@@ -74,17 +83,35 @@ thread_count() { # app -> count (0 when the app is not answering)
   rm -f "$o"; echo "${c:-0}"
 }
 
-# Politely quit and wait; 0 = exited, 1 = refused (nothing was killed).
-quit_and_wait() {
-  local pid; pid=$(port_pid)
-  [[ -n "$pid" ]] || return 0
+# Politely quit APP and wait. 0 = nothing of it is running any more, 1 = it refused (nothing was killed),
+# 2 = a FOREIGN process owns the port (the quit is never aimed at it). The app is identified by its executable
+# path, not by the port: a CPZed that runs without listening is still quit (N4).
+quit_and_wait() { # app
+  local bin=$1/Contents/MacOS/zed pids port
+  port=$(port_pid)
+  if [[ -n "$port" ]] && ! util same-exe "$port" "$bin"; then return 2; fi
+  pids=$(util procs-of "$bin")
+  [[ -z "$pids$port" ]] && return 0
   quit_app >/dev/null 2>&1 || true
   local end=$(( $(ts) + QUIT_WAIT ))
   while (( $(ts) < end )); do
-    if [[ -z "$(port_pid)" ]] && ! pid_alive "$pid"; then return 0; fi
+    if [[ -z "$(port_pid)" && -z "$(util procs-of "$bin")" ]]; then return 0; fi
     sleep 1
   done
   return 1
+}
+# No process may be running from either bundle's executable when we are about to swap (a quit race, a second
+# instance, a hung start). Refuse and hold; nothing is killed.
+assert_stopped() { # app...
+  local app p
+  for app in "$@"; do
+    p=$(util procs-of "$app/Contents/MacOS/zed")
+    if [[ -n "$p" ]]; then
+      hold_set "a process is running from $app/Contents/MacOS/zed (pid ${p//$'\n'/,}); not swapping"
+      notify urgent "CPZed deploy stopped before the swap: a process is still running from $app (pid ${p//$'\n'/,}). Hold set; nothing was killed."
+      st_set phase aborted; exit 30
+    fi
+  done
 }
 
 # ---------------------------------------------------------------- lock ----
@@ -119,7 +146,9 @@ do_rollback() { # reason ; never returns
   st_set phase rollback; st_set failed_sha "$failed_sha"
   log "ROLLBACK: $reason"
   notify rollback "CPZed $failed_n failed its health check ($reason); rolling back"
-  quit_and_wait || { hold_set "rollback: app refused to quit"; notify urgent "CPZed rollback blocked: the app will not quit. Hold set; nothing was killed."; exit 40; }
+  quit_and_wait "$APP" || { hold_set "rollback: app refused to quit or a foreign process owns the port"; notify urgent "CPZed rollback blocked: the app will not quit (or the port belongs to another process). Hold set; nothing was killed."; exit 40; }
+  assert_stopped_rollback() { local p; p=$(util procs-of "$APP/Contents/MacOS/zed"); [[ -z "$p" ]] || { hold_set "rollback: a process still runs from $APP"; notify urgent "CPZed rollback blocked: a process still runs from $APP. Hold set; nothing was killed."; exit 40; }; }
+  assert_stopped_rollback
   prev=""
   if [[ -d "$STAGE_DIR/CPZed.app" && "$(st_get first_swap)" != 1 ]]; then prev=$STAGE_DIR/CPZed.app
   else
@@ -147,7 +176,8 @@ do_rollback() { # reason ; never returns
         exit 20
       fi
       log "previous build failed its health check too: $(tail -1 "$LOGDIR/health-rollback.out")"
-      quit_and_wait || { hold_set "rollback: previous build refused to quit"; notify urgent "CPZed rollback blocked: nothing was killed. Hold set."; exit 40; }
+      quit_and_wait "$APP" || { hold_set "rollback: previous build refused to quit"; notify urgent "CPZed rollback blocked: nothing was killed. Hold set."; exit 40; }
+      assert_stopped_rollback
     else
       log "previous build could not be restored (restamp/sign/verify/swap failed)"
     fi
@@ -158,7 +188,7 @@ do_rollback() { # reason ; never returns
   if [[ ! -d "$STOCK_APP" ]]; then
     if [[ -n "$sz" ]]; then
       mkdir -p "$HOME_DIR/tmp"; local x; x=$(mktemp -d "$HOME_DIR/tmp/stock.XXXXXX")
-      if ditto -x -k "$sz" "$x" && [[ -d "$x/Zed.app" ]] && verify_app "$x/Zed.app"; then
+      if ditto -x -k "$sz" "$x" && [[ -d "$x/Zed.app" ]] && verify_stock_app "$x/Zed.app"; then
         # stage on the same volume as /Applications, then rename in (nothing exists at Zed.app)
         mkdir -p "$STAGE_DIR"; rm_in "$STAGE_DIR/Zed.app" "$STAGE_DIR" 2>/dev/null
         ditto "$x/Zed.app" "$STAGE_DIR/Zed.app" && util swap rename "$STAGE_DIR/Zed.app" "$STOCK_APP"
@@ -197,6 +227,32 @@ run_pipeline() { # args: [--first-swap]
   echo "$$" > "$LOCK"; LOCK_HELD=1
   trap 'lock_release' EXIT
   trap '[[ -n "${CHILD:-}" ]] && kill "$CHILD" 2>/dev/null; lock_release; exit 143' TERM INT HUP
+
+  # B5: an unreadable or invalid state.json is NEVER treated as empty (it would reset n, deployed_sha, phase and the
+  # interval history, and the next write would persist that). Only a MISSING file is empty.
+  local chk
+  if ! chk=$(util state "$STATE" check 2>&1); then
+    hold_set "state.json is corrupt or invalid: $chk"
+    notify urgent "CPZed deploy refused: state.json is corrupt or invalid ($chk). Hold set. Repair or remove it only after checking $APP."
+    exit 30
+  fi
+  if ((! first)) && [[ -d "$APP" ]]; then
+    # The installed app is the truth about what is deployed: derive deployed_sha and a floor for n from it.
+    local asha an dep n0
+    asha=$(app_sha "$APP"); an=$(app_n "$APP")
+    if [[ ! "$asha" =~ ^[0-9a-f]{40}$ || ! "$an" =~ ^[0-9]+$ ]]; then
+      hold_set "installed $APP has no valid cpzed-build.json (sha='$asha' n='$an')"
+      notify urgent "CPZed deploy refused: the installed app has no valid cpzed-build.json. Hold set."; exit 30
+    fi
+    dep=$(st_get deployed_sha)
+    if [[ -z "$dep" ]]; then st_set deployed_sha "$asha"
+    elif [[ "$dep" != "$asha" ]]; then
+      hold_set "state deployed_sha ${dep:0:7} disagrees with the installed app ${asha:0:7}"
+      notify urgent "CPZed deploy refused: state.json says ${dep:0:7} but the installed app is ${asha:0:7}. Hold set."; exit 30
+    fi
+    n0=$(st_get n); [[ "$n0" =~ ^[0-9]+$ ]] || n0=1
+    (( n0 > an )) || st_set n $((an + 1))
+  fi
 
   # A dead deploy: restart only if it never touched the app.
   local ph; ph=$(st_get phase)
@@ -306,10 +362,13 @@ run_pipeline() { # args: [--first-swap]
   # ---- quit (polite, never forced) ----
   st_set phase quitting
   local old_app=$APP; ((first)) && old_app=$STOCK_APP
-  if ! quit_and_wait; then
+  quit_and_wait "$old_app"; rc=$?
+  if (( rc == 2 )); then abort_deploy "the single-instance port $PORT belongs to a process that is not $old_app/Contents/MacOS/zed; the quit was NOT sent. Resolve it, then clear the hold." hold; fi
+  if (( rc != 0 )); then
     abort_deploy "CPZed quit blocked: the app is still running after ${QUIT_WAIT}s (a save dialog?). Not forced. Resolve it, then clear the hold." hold
   fi
 
+  assert_stopped "$old_app" "$APP"
   # Data backup AFTER the quit: Zed's SQLite (WAL) is quiescent now, so the copy is consistent (N2).
   "$here/backup" data >/dev/null || { relaunch_old "$old_app"; abort_deploy "post-quit data backup failed; the old app was relaunched, nothing swapped" hold; }
 
@@ -335,6 +394,7 @@ run_pipeline() { # args: [--first-swap]
   if ! verify_staged "$target" "$n"; then
     relaunch_old "$old_app"; abort_deploy "the staged bundle failed re-verification right before the swap (tampered or corrupt); old app relaunched, nothing swapped" hold
   fi
+  assert_stopped "$old_app" "$APP"   # and once more, right before the rename
   st_set phase swapping
   if ((first)); then
     util swap rename "$STAGE_DIR/CPZed.app" "$APP" || { st_set phase aborted; hold_set "first swap rename failed"; notify urgent "CPZed first swap rename failed; hold set."; exit 30; }
@@ -380,5 +440,6 @@ case "${1:-}" in
     util eligible "$REPO" "$LEDGER" "$GH" --base fork/main ${d:+--deployed "$d"} --quiet-s "$COALESCE" ;;
   quiescent) dl_init; st_set quiescent_at "$(ts)" ;;
   status) exec "$here/which" ;;
+  verify-app) dl_init; verify_app "${2:?usage: deploy verify-app APP}" ;;
   *) sed -n 2,12p "$0" >&2; exit 64 ;;
 esac

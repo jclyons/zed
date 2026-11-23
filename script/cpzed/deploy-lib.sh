@@ -63,6 +63,18 @@ dl_confine() {
     local lq; lq=$(_dl_rp "$p" | tr A-Z a-z)
     case "$lq/" in "$lp"/*) ;; *) dl_die "TEST CONFINEMENT: $p is outside $pre" 99 ;; esac
   done
+  # S5: the prefix must be a directory under a temp root and must not equal or CONTAIN any real default location
+  local tr ok=0 r
+  for tr in "$(_dl_rp "${TMPDIR:-/tmp}")" /private/tmp /private/var/folders; do
+    case "$lp/" in "$(printf %s "$tr" | tr A-Z a-z)"/*) ok=1;; esac
+  done
+  ((ok)) || dl_die "TEST CONFINEMENT: the prefix $pre is not under a temp root (TMPDIR, /tmp)" 99
+  for r in "$HOME" "$HOME/Library" "$HOME/Library/Application Support" "$HOME/.config" /Applications /Library /Users; do
+    r=$(_dl_rp "$r" | tr A-Z a-z)
+    case "$r/" in "$lp"/*) dl_die "TEST CONFINEMENT: the prefix $pre equals or contains the real location $r" 99;; esac
+  done
+  # N11: a test run must name its own port, never the real single-instance port
+  [[ -n "${CPZED_PORT:-}" ]] || dl_die "TEST CONFINEMENT: CPZED_PORT must be set under a test prefix" 99
   [[ -n "${CPZED_QUIT_CMD:-}" && -n "${CPZED_OPEN_CMD:-}" && -n "${CPZED_NOTIFY_CMD:-}" ]] \
     || dl_die "TEST CONFINEMENT: CPZED_QUIT_CMD, CPZED_OPEN_CMD and CPZED_NOTIFY_CMD must be set under a test prefix (no real osascript/open)" 99
 }

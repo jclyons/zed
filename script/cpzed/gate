@@ -38,8 +38,8 @@ check_once() {
   out=$(util interval "$STATE" "$MIN_INTERVAL" "$PER_DAY") || reasons+=("$out")
   main=$(port_pid)
   if [[ -n "$main" ]]; then
-    out=$(util busy "$main")
-    [[ -z "$out" ]] || while IFS= read -r l; do reasons+=("build/test running under app: $l"); done <<<"$out"
+    if ! out=$(util busy "$main"); then reasons+=("cannot enumerate build/test processes under the app")   # fail CLOSED
+    elif [[ -n "$out" ]]; then while IFS= read -r l; do reasons+=("build/test running under app: $l"); done <<<"$out"; fi
   fi
   q=$(st_get quiescent_at); now=$(ts)
   if [[ ! "$q" =~ ^[0-9]+$ ]]; then reasons+=("no quiescent_at handshake from the sre")

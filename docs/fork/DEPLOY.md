@@ -73,6 +73,24 @@ at most 2 per day; rollbacks are exempt.
   section 5 step 5, confirmed by cpzed-manager).
 - The data backup is taken after the quit, when the SQLite files are quiescent.
 
+## Safety properties added in review round 2
+
+- **A lost or corrupt `state.json` fails closed.** Only a MISSING file is an empty state. An unreadable, truncated,
+  garbage, wrong-typed or non-object file makes `deploy run` set `hold`, notify urgently and exit 30; it is never
+  rewritten. With CPZed.app installed, `deployed_sha` comes from the installed app's `cpzed-build.json`, and `n`
+  is at least that build's n plus 1; a state that disagrees with the installed app, or an installed app without a
+  valid `cpzed-build.json`, also holds. The first-deploy leniency applies only to the attended `--first-swap`.
+- **Test prefix** must be a directory under a temp root that equals or contains none of the real HOME, `~/Library`,
+  Application Support, `~/.config`, `/Applications`; `CPZED_PORT` is required under a prefix.
+- **`gate` fails closed** when `deploy-util busy` or `claudes` fails.
+- **`verify_app`** pins `Authority=<identity>` as a whole line and the hardened-runtime flag, besides
+  `codesign --verify --deep --strict` (stock is verified for signature validity only).
+- **The app is identified by its executable path, not by the port** (N4): the quit is never aimed at a process on the
+  port that is not `$APP/Contents/MacOS/zed`; a running-but-not-listening instance is still quit; and right after
+  the quit and again right before the rename no process may run from either bundle's executable (a quit race holds).
+  Paths are compared resolved and case-insensitively. Not covered: a process started from a copy of the bundle
+  at another path.
+
 ## Not in this ticket
 
 R5 (Glider archive check) and the R6 poll are T9 and land after this merges. `bundle`/`selfcheck` are T1 (PR #6);

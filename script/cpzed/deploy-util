@@ -2,7 +2,7 @@
 """script/cpzed/deploy-util: small, testable helpers for the CPZed deploy pipeline (CPZED-23).
 
 Subcommands (all argv-only; nothing is ever passed through a shell):
-  state <file> get K | set K V | setj K JSON | del K | addhist JSON | dump
+  state <file> check | get K | set K V | setj K JSON | del K | addhist JSON | dump   (a corrupt file is an error, exit 3)
   swap exchange A B      one atomic renamex_np(RENAME_SWAP) of two .app directories
   swap rename SRC DST    renamex_np(RENAME_EXCL): DST must not exist
   swap rm PATH ROOT ANCHOR...   remove PATH only if strictly inside ROOT, ROOT is an allowlisted dir name and a direct child of an ANCHOR
@@ -15,6 +15,8 @@ Subcommands (all argv-only; nothing is ever passed through a shell):
   restamp APP N SHA      re-stamp a bundle's version for a rollback build (plist + cpzed-build.json)
   interval FILE MIN_S MAX_PER_DAY [NOW]   exit 0 when the min interval and daily cap allow a deploy
   eligible REPO LEDGER GH [--base REF] [--deployed SHA] [--quiet-s S] [--now T]
+  procs-of PATH          pids of processes whose executable (or interpreted script) is PATH (resolved, case-insensitive)
+  same-exe PID PATH      exit 0 when PID's executable is PATH
   json-count FILE        number of entries in a JSON array (or the only list value) read from FILE
 Never forces anything, never kills anything.
 """
@@ -22,21 +24,58 @@ import fcntl, json, os, plistlib, re, shlex, subprocess, sys, tempfile, time
 
 # ---------------------------------------------------------------- state ----
 
+class StateError(Exception):
+    pass
+
+HEX = re.compile(r"^[0-9a-f]{7,64}$")
+
+def validate_state(d):
+    def isint(v): return isinstance(v, int) and not isinstance(v, bool)
+    def num(v): return isint(v) or (isinstance(v, str) and v.isdigit())
+    if "n" in d and not (num(d["n"]) and int(d["n"]) >= 1): raise StateError("n must be an integer >= 1")
+    for k in ("phase", "last_blocked", "stock_zip", "first_swap"):
+        if k in d and not isinstance(d[k], (str, int)): raise StateError(k + " must be a string")
+    for k in ("deployed_sha", "failed_sha", "target_sha"):
+        if k in d and not (isinstance(d[k], str) and (d[k] == "" or HEX.match(d[k]))): raise StateError(k + " must be a hex sha or empty")
+    if "history" in d:
+        if not isinstance(d["history"], list) or not all(isinstance(h, dict) and isint(h.get("at", 0)) for h in d["history"]):
+            raise StateError("history must be a list of objects with an integer 'at'")
+    if "sessions" in d and not isinstance(d["sessions"], list): raise StateError("sessions must be a list")
+    if "quiescent_at" in d and not num(d["quiescent_at"]):
+        raise StateError("quiescent_at must be an integer")
+
 def state_load(path):
+    """A MISSING file is an empty state. Anything else that is not a valid state object is an error:
+    never treat a corrupt state as empty (it would be written back and reset n, deployed_sha, phase)."""
     try:
-        with open(path) as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
+        f = open(path)
+    except FileNotFoundError:
         return {}
+    except OSError as e:
+        raise StateError("cannot read %s: %s" % (path, e))
+    with f:
+        try:
+            d = json.load(f)
+        except ValueError as e:
+            raise StateError("%s is not valid JSON: %s" % (path, e))
+    if not isinstance(d, dict):
+        raise StateError("%s does not hold a JSON object" % path)
+    validate_state(d)
+    return d
 
 def state_op(path, argv):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     lk = open(path + ".flock", "a")
     fcntl.flock(lk, fcntl.LOCK_EX)
     try:
-        d = state_load(path)
+        try:
+            d = state_load(path)
+        except StateError as e:
+            print("state: " + str(e), file=sys.stderr)
+            return 3
         op = argv[0]
+        if op == "check":
+            return 0
         if op == "get":
             v = d.get(argv[1])
             print("" if v is None else v if isinstance(v, str) else json.dumps(v))
@@ -182,12 +221,16 @@ INTERPRETERS = {"sh", "bash", "zsh", "dash", "python", "python3", "perl", "node"
 BUSY_NAMES = {"cargo", "rustc", "cc", "clang", "clang++", "ld", "xcodebuild", "swift", "swiftc", "npm", "pnpm",
               "pytest", "nextest", "cargo-nextest"}
 
+def is_interp(name):
+    n = name.lower()
+    return n in INTERPRETERS or n.startswith("python")
+
 def tool_name(cmd):
     toks = cmd.split()
     if not toks:
         return ""
     n = os.path.basename(toks[0])
-    if n in INTERPRETERS:
+    if is_interp(n):
         for t in toks[1:]:
             if t.startswith("-"):
                 continue
@@ -220,6 +263,29 @@ def session_of(argv):
                     return a.split("=", 1)[1]
     return None
 
+def norm_path(p):
+    """APFS is case-insensitive and paths may be symlinked: compare resolved, lower-cased paths."""
+    return os.path.realpath(p).lower()
+
+def exe_of_row(r):
+    toks = r["cmd"].split()
+    if not toks:
+        return ""
+    if is_interp(os.path.basename(toks[0])):
+        for t in toks[1:]:
+            if not t.startswith("-"):
+                return norm_path(t)
+        return ""
+    return norm_path(toks[0])
+
+def procs_of(path):
+    want = norm_path(path)
+    return [r["pid"] for r in ps_table().values() if exe_of_row(r) == want]
+
+def same_exe(pid, path):
+    r = ps_table().get(int(pid))
+    return bool(r) and exe_of_row(r) == norm_path(path)
+
 # ----------------------------------------------------------- restamp -------
 
 def restamp(app, n, sha):
@@ -248,7 +314,11 @@ def restamp(app, n, sha):
 
 def interval_ok(statefile, min_s, per_day, now=None):
     now = int(now or time.time())
-    hist = [h for h in state_load(statefile).get("history", []) if h.get("kind") == "deploy"]
+    try:
+        st = state_load(statefile)
+    except StateError as e:
+        print("state unreadable: %s" % e); return 1
+    hist = [h for h in st.get("history", []) if h.get("kind") == "deploy"]
     if hist:
         last = max(h["at"] for h in hist)
         if now - last < min_s:
@@ -359,6 +429,12 @@ def main(a):
         for r in descendants(int(a[1])):
             print(json.dumps(r))
         return 0
+    if c == "procs-of":
+        for p in procs_of(a[1]):
+            print(p)
+        return 0
+    if c == "same-exe":
+        return 0 if same_exe(a[1], a[2]) else 1
     if c == "busy":
         for r in descendants(int(a[1])):
             if is_busy(r):
@@ -383,7 +459,11 @@ def main(a):
                 print("%s %.2f" % (p, cpu_seconds(r["time"])))
         return 0
     if c == "resume":
-        for s in state_load(a[1]).get("sessions", []):
+        try:
+            sess = state_load(a[1]).get("sessions", [])
+        except StateError as e:
+            print("state: %s" % e, file=sys.stderr); return 3
+        for s in sess:
             cwd = shlex.quote(s.get("cwd") or "~")
             h = s.get("session")
             print("cd %s && claude %s" % (cwd, "--resume " + shlex.quote(h) if h else "--continue"))
