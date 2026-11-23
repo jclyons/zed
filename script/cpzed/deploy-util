@@ -15,7 +15,8 @@ Subcommands (all argv-only; nothing is ever passed through a shell):
   restamp APP N SHA      re-stamp a bundle's version for a rollback build (plist + cpzed-build.json)
   interval FILE MIN_S MAX_PER_DAY [NOW]   exit 0 when the min interval and daily cap allow a deploy
   eligible REPO LEDGER GH [--base REF] [--deployed SHA] [--quiet-s S] [--now T]
-  procs-of PATH          pids of processes whose executable (or interpreted script) is PATH (resolved, case-insensitive)
+  procs-of [--verbose] PATH   pids (and argv) of processes running PATH, read from the kernel (resolved, case-insensitive)
+  included REPO UPSTREAM TARGET   the fork-only first-parent commits a deploy of TARGET carries
   same-exe PID PATH      exit 0 when PID's executable is PATH
   json-count FILE        number of entries in a JSON array (or the only list value) read from FILE
 Never forces anything, never kills anything.
@@ -267,24 +268,51 @@ def norm_path(p):
     """APFS is case-insensitive and paths may be symlinked: compare resolved, lower-cased paths."""
     return os.path.realpath(p).lower()
 
-def exe_of_row(r):
-    toks = r["cmd"].split()
-    if not toks:
-        return ""
-    if is_interp(os.path.basename(toks[0])):
-        for t in toks[1:]:
+def procargs(pid):
+    """(exec_path, argv) straight from the kernel (sysctl KERN_PROCARGS2): exact strings, spaces preserved."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, int(pid))        # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 8:
+        return None
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = buf.raw[:size.value]
+    argc = int.from_bytes(raw[:4], "little")
+    path, _, rest = raw[4:].partition(b"\0")
+    rest = rest.lstrip(b"\0")
+    argv = [x.decode(errors="replace") for x in rest.split(b"\0")[:argc]]
+    return path.decode(errors="replace"), argv
+
+def exe_and_argv(pid):
+    """(normalised executable, argv). For interpreted scripts the executable is the script path."""
+    pa = procargs(pid)
+    if pa is None:
+        return None
+    path, argv = pa
+    if is_interp(os.path.basename(path)):
+        for t in argv[1:]:
             if not t.startswith("-"):
-                return norm_path(t)
-        return ""
-    return norm_path(toks[0])
+                return norm_path(t), argv
+        return "", argv
+    return norm_path(path), argv
 
 def procs_of(path):
+    """[(pid, argv)] of processes running PATH. Zed's own `--crash-handler` helper runs the same executable and may
+    outlive the app for a moment: it is not an instance."""
     want = norm_path(path)
-    return [r["pid"] for r in ps_table().values() if exe_of_row(r) == want]
+    out = []
+    for pid in ps_table():
+        r = exe_and_argv(pid)
+        if r and r[0] == want and "--crash-handler" not in r[1]:
+            out.append((pid, r[1]))
+    return out
 
 def same_exe(pid, path):
-    r = ps_table().get(int(pid))
-    return bool(r) and exe_of_row(r) == norm_path(path)
+    r = exe_and_argv(pid)
+    return bool(r) and r[0] == norm_path(path)
 
 # ----------------------------------------------------------- restamp -------
 
@@ -375,7 +403,7 @@ def commit_eligible(c, subject, ledger, ghcmd):
         return False, "PR #%d head %s != ledger sha" % (n, pr.get("headRefOid"))
     return True, "PR #%d" % n
 
-def eligible(repo, ledger_path, ghcmd, base="fork/main", deployed=None, quiet_s=1800, now=None, window=50):
+def eligible(repo, ledger_path, ghcmd, base="fork/main", deployed=None, quiet_s=1800, now=None, window=50, upstream="origin/main"):
     now = int(now or time.time())
     try:
         ledger = json.load(open(ledger_path))
@@ -410,6 +438,16 @@ def eligible(repo, ledger_path, ghcmd, base="fork/main", deployed=None, quiet_s=
                 target = c; break
         if target is None:
             print("blocked: no eligible commit in the last %d on %s" % (window, base)); return 1
+        # The first deploy ships every fork-only commit up to the target: ALL of them must be approved, not just the target.
+        if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", upstream], capture_output=True).returncode != 0:
+            print("blocked: cannot list the fork-only commits: %s is missing (fetch the upstream remote)" % upstream); return 1
+        for l in git(repo, "rev-list", "--first-parent", "--reverse", "--format=%H%x09%ct%x09%s", "%s..%s" % (upstream, target)).splitlines():
+            if "\t" not in l:
+                continue
+            c, _t, sj = l.split("\t", 2)
+            ok, why = commit_eligible(c, sj, ledger, ghcmd)
+            if not ok:
+                print("blocked by %s: %s (the first deploy needs every fork-only commit approved)" % (c, why)); return 1
     if now - tip_time < quiet_s:
         print("coalescing: %s tip is %ds old, need %ds quiet" % (base, now - tip_time, quiet_s)); return 4
     print(target)
@@ -430,8 +468,15 @@ def main(a):
             print(json.dumps(r))
         return 0
     if c == "procs-of":
-        for p in procs_of(a[1]):
-            print(p)
+        verbose = "--verbose" in a
+        for p, argv in procs_of([x for x in a[1:] if x != "--verbose"][0]):
+            print("%d %s" % (p, (os.path.basename(argv[0]) + " " + " ".join(argv[1:]))[:300]) if verbose else p)
+        return 0
+    if c == "included":      # included REPO UPSTREAM TARGET: the fork-only first-parent commits a deploy of TARGET carries
+        try:
+            print(git(a[1], "log", "--first-parent", "--reverse", "--format=%h %s", "%s..%s" % (a[2], a[3])).strip())
+        except RuntimeError as e:
+            print("(cannot list: %s)" % e)
         return 0
     if c == "same-exe":
         return 0 if same_exe(a[1], a[2]) else 1
@@ -476,7 +521,7 @@ def main(a):
         kw, i = {}, 4
         while i < len(a):
             k = a[i]
-            kw[{"--base": "base", "--deployed": "deployed", "--quiet-s": "quiet_s", "--now": "now", "--window": "window"}[k]] = a[i + 1]
+            kw[{"--base": "base", "--deployed": "deployed", "--quiet-s": "quiet_s", "--now": "now", "--window": "window", "--upstream": "upstream"}[k]] = a[i + 1]
             i += 2
         for k in ("quiet_s", "now", "window"):
             if k in kw: kw[k] = int(kw[k])

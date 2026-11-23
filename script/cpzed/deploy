@@ -86,6 +86,7 @@ thread_count() { # app -> count (0 when the app is not answering)
 # Politely quit APP and wait. 0 = nothing of it is running any more, 1 = it refused (nothing was killed),
 # 2 = a FOREIGN process owns the port (the quit is never aimed at it). The app is identified by its executable
 # path, not by the port: a CPZed that runs without listening is still quit (N4).
+QW_WHY=""
 quit_and_wait() { # app
   local bin=$1/Contents/MacOS/zed pids port
   port=$(port_pid)
@@ -98,6 +99,7 @@ quit_and_wait() { # app
     if [[ -z "$(port_pid)" && -z "$(util procs-of "$bin")" ]]; then return 0; fi
     sleep 1
   done
+  QW_WHY="$(util procs-of --verbose "$bin" | head -3 | paste -sd';' -) port-owner-pid=${port:-none}"
   return 1
 }
 # No process may be running from either bundle's executable when we are about to swap (a quit race, a second
@@ -105,21 +107,41 @@ quit_and_wait() { # app
 assert_stopped() { # app...
   local app p
   for app in "$@"; do
-    p=$(util procs-of "$app/Contents/MacOS/zed")
+    p=$(util procs-of --verbose "$app/Contents/MacOS/zed" | head -3 | paste -sd';' -)
     if [[ -n "$p" ]]; then
-      hold_set "a process is running from $app/Contents/MacOS/zed (pid ${p//$'\n'/,}); not swapping"
-      notify urgent "CPZed deploy stopped before the swap: a process is still running from $app (pid ${p//$'\n'/,}). Hold set; nothing was killed."
+      hold_set "a process is running from $app/Contents/MacOS/zed ($p); not swapping"
+      notify urgent "CPZed deploy stopped before the swap: a process is still running from $app ($p). Hold set; nothing was killed."
       st_set phase aborted; exit 30
     fi
   done
 }
 
 # ---------------------------------------------------------------- lock ----
-LOCK_HELD=0; CHILD=
+LOCK_HELD=0; CHILD=; APP_QUIT=0; SWAPPED=0; OLD_APP=""; IN_ROLLBACK=0
 # One deploy at a time: a kernel flock on $LOCK.flock, held on fd 200 for the life of the run (S1). `run` re-execs
 # itself under perl, which takes the lock non-blocking and dup2s it to fd 200; there is no stale-lock takeover to
 # race, and a reused pid cannot hold it. $LOCK itself is only an informational pid file.
 lock_release() { [[ $LOCK_HELD == 1 && "$(cat "$LOCK" 2>/dev/null)" == "$$" ]] && rm -f "$LOCK"; LOCK_HELD=0; }
+
+# A TERM/INT/HUP must never leave the editor down silently: if the app was quit and the swap is not done,
+# relaunch the old app, hold and notify; after the swap just hold and notify.
+on_signal() {
+  trap '' TERM INT HUP
+  [[ -n "${CHILD:-}" ]] && kill "$CHILD" 2>/dev/null
+  local ph; ph=$(python3 -I "${UTIL[0]}" state "$STATE" get phase 2>/dev/null)
+  if (( IN_ROLLBACK == 1 )); then
+    hold_set "deploy interrupted by a signal during a rollback (phase '$ph')"
+    notify urgent "CPZed deploy was interrupted during a ROLLBACK (phase '$ph'): the editor may be down. Hold set. Check $APP, and use the stock archive in $HOME_DIR/stock if needed."
+  elif (( SWAPPED == 1 )); then
+    hold_set "deploy interrupted by a signal after the swap (phase '$ph')"
+    notify urgent "CPZed deploy was interrupted after the swap (phase '$ph'): the new build is installed at $APP but was not health-checked. Hold set."
+  elif (( APP_QUIT == 1 )); then
+    [[ -d "$OLD_APP" ]] && open_app "$OLD_APP"
+    hold_set "deploy interrupted by a signal in phase '$ph' after the app was quit; the old app was relaunched"
+    notify urgent "CPZed deploy was interrupted in phase '$ph' after the app was quit. $([[ -d "$OLD_APP" ]] && echo "The old app ($OLD_APP) was relaunched." || echo "The old app is not present ($OLD_APP): the editor is DOWN."). Hold set."
+  fi
+  lock_release; exit 143
+}
 
 # --------------------------------------------------------------- stages ---
 relaunch_old() { # best effort: bring the app that was quit back
@@ -143,6 +165,7 @@ make_resume_text() {
 do_rollback() { # reason ; never returns
   local reason=$1 failed_n failed_sha prev n2 pre_threads prev_sha prev_zip
   failed_n=$(st_get build_n); failed_sha=$(st_get target_sha); pre_threads=$(st_get pre_threads); pre_threads=${pre_threads:-0}
+  IN_ROLLBACK=1
   st_set phase rollback; st_set failed_sha "$failed_sha"
   log "ROLLBACK: $reason"
   notify rollback "CPZed $failed_n failed its health check ($reason); rolling back"
@@ -226,7 +249,7 @@ run_pipeline() { # args: [--first-swap]
   fi
   echo "$$" > "$LOCK"; LOCK_HELD=1
   trap 'lock_release' EXIT
-  trap '[[ -n "${CHILD:-}" ]] && kill "$CHILD" 2>/dev/null; lock_release; exit 143' TERM INT HUP
+  trap 'on_signal' TERM INT HUP
 
   # B5: an unreadable or invalid state.json is NEVER treated as empty (it would reset n, deployed_sha, phase and the
   # interval history, and the next write would persist that). Only a MISSING file is empty.
@@ -265,6 +288,7 @@ run_pipeline() { # args: [--first-swap]
 
   # ---- eligibility, coalesce, interval ----
   git -C "$REPO" fetch -q fork main 2>/dev/null || log "fetch fork main failed; using the local ref"
+  git -C "$REPO" fetch -q origin main 2>/dev/null || log "fetch of the upstream remote failed; using the local ref"
   local deployed target rc
   deployed=$(st_get deployed_sha)
   target=$(util eligible "$REPO" "$LEDGER" "$GH" --base fork/main ${deployed:+--deployed "$deployed"} --quiet-s "$COALESCE"); rc=$?
@@ -327,7 +351,7 @@ run_pipeline() { # args: [--first-swap]
     [[ "$(app_sha "$STAGE_DIR/CPZed.app")" == "$target" ]] || abort_deploy "staged copy does not match"
     "$here/backup" ring-add "$STAGE_DIR/CPZed.app" >/dev/null || abort_deploy "ring zip failed"
     st_set phase staged
-    notify ready "CPZed $n/${target:0:7} ready, will restart when sessions are idle"
+    notify ready "CPZed $n/${target:0:7} ready, will restart when sessions are idle$([[ -z "$deployed" ]] && printf '\nIncludes (fork-only commits): %s' "$(util included "$REPO" origin/main "$target" | paste -sd';' - | cut -c1-600)")"
   fi
 
   # ---- gate, snapshot, pre-quit notice, re-gate ----
@@ -362,12 +386,13 @@ run_pipeline() { # args: [--first-swap]
   # ---- quit (polite, never forced) ----
   st_set phase quitting
   local old_app=$APP; ((first)) && old_app=$STOCK_APP
-  quit_and_wait "$old_app"; rc=$?
+  OLD_APP=$old_app; quit_and_wait "$old_app"; rc=$?
   if (( rc == 2 )); then abort_deploy "the single-instance port $PORT belongs to a process that is not $old_app/Contents/MacOS/zed; the quit was NOT sent. Resolve it, then clear the hold." hold; fi
   if (( rc != 0 )); then
-    abort_deploy "CPZed quit blocked: the app is still running after ${QUIT_WAIT}s (a save dialog?). Not forced. Resolve it, then clear the hold." hold
+    abort_deploy "CPZed quit blocked: still running after ${QUIT_WAIT}s: ${QW_WHY:-unknown} (a save dialog?). Not forced. Resolve it, then clear the hold." hold
   fi
 
+  APP_QUIT=1
   assert_stopped "$old_app" "$APP"
   # Data backup AFTER the quit: Zed's SQLite (WAL) is quiescent now, so the copy is consistent (N2).
   "$here/backup" data >/dev/null || { relaunch_old "$old_app"; abort_deploy "post-quit data backup failed; the old app was relaunched, nothing swapped" hold; }
@@ -376,7 +401,7 @@ run_pipeline() { # args: [--first-swap]
   if ((first)); then
     st_set phase "waiting-first-swap"; rm -f "$HOME_DIR/first-swap-confirm"
     local l1="sudo rm -rf \"$STOCK_APP\""
-    notify first-swap "CPZed first swap: stock Zed is quit. Run this in a plain Terminal, then create the marker: $l1  &&  touch \"$HOME_DIR/first-swap-confirm\""
+    notify first-swap "CPZed first swap: stock Zed is quit. This build includes (fork-only commits): $(util included "$REPO" origin/main "$target" | paste -sd';' - | cut -c1-600). Run this in a plain Terminal, then create the marker: $l1  &&  touch \"$HOME_DIR/first-swap-confirm\""
     echo "FIRST SWAP: run:  $l1"; echo "then:  touch \"$HOME_DIR/first-swap-confirm\""
     local fend=$(( $(ts) + FS_WAIT ))
     while [[ ! -e "$HOME_DIR/first-swap-confirm" ]] && (( $(ts) < fend )); do sleep 1; done
@@ -401,6 +426,7 @@ run_pipeline() { # args: [--first-swap]
   else
     util swap exchange "$STAGE_DIR/CPZed.app" "$APP" || { relaunch_old "$APP"; abort_deploy "atomic swap failed; old build relaunched"; }
   fi
+  SWAPPED=1; APP_QUIT=0
   lsreg "$APP"; retarget_cli "$APP/Contents/MacOS/cli"
 
   # ---- relaunch + health ----
@@ -412,6 +438,7 @@ run_pipeline() { # args: [--first-swap]
   if (( rc != 0 )); then do_rollback "$(tail -1 <<<"$hout")"; fi
 
   # ---- pass ----
+  SWAPPED=0; APP_QUIT=0
   rm_in "$STAGE_DIR/CPZed.app" "$STAGE_DIR" 2>/dev/null || true
   st_hist "{\"kind\":\"deploy\",\"n\":$n,\"sha\":\"$target\",\"at\":$(ts)}"
   st_set deployed_sha "$target"; st_set phase done; st_del failed_sha

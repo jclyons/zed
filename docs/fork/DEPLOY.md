@@ -88,8 +88,23 @@ at most 2 per day; rollbacks are exempt.
 - **The app is identified by its executable path, not by the port** (N4): the quit is never aimed at a process on the
   port that is not `$APP/Contents/MacOS/zed`; a running-but-not-listening instance is still quit; and right after
   the quit and again right before the rename no process may run from either bundle's executable (a quit race holds).
-  Paths are compared resolved and case-insensitively. Not covered: a process started from a copy of the bundle
-  at another path.
+  Paths are compared resolved and case-insensitively. The executable and argv come from the kernel
+  (`sysctl KERN_PROCARGS2`), so a bundle path with spaces matches; an interpreted script is identified by its script
+  path. Zed's own `--crash-handler` helper (same executable) is not counted as a running instance. Known limit: a
+  process started from a copy of the bundle at another path is not seen. A hold names the pid and argv still running.
+- **Mid-run state corruption** (the file turns unreadable after the start check): the next state write is refused,
+  and `deploy` sets `hold`, notifies and exits 30 instead of carrying on. Reads of a corrupt file return empty, but
+  the pipeline writes its phase at every step, so it stops at the next transition (before the quit or the swap).
+
+## Safety properties added in review round 3
+
+- **A signal never leaves the editor down silently.** `deploy` traps TERM/INT/HUP: if the app was quit and the swap
+  is not done it relaunches the old app, sets `hold` and notifies urgently; after the swap or during a rollback it
+  sets `hold` and notifies (nothing is guessed).
+- **The first deploy is strict too.** It ships every fork-only first-parent commit up to the target
+  (`origin/main..target`), so every one of them must have an approved ledger entry; the `ready` and first-swap
+  notices list the included commits.
+- A session-snapshot failure aborts before the quit; `quit_and_wait` waits for the process (not just the port) to exit.
 
 ## Not in this ticket
 

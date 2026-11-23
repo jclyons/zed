@@ -85,10 +85,13 @@ ts() { date +%s; }
 log() { local l; l="$(date '+%F %T') ${DL_NAME:-deploy}[$$]: $*"; echo "$l" >&2; [[ -d "$LOGDIR" ]] && echo "$l" >> "$LOGDIR/deploy.log" || true; }
 
 st_get()  { python3 -I "${UTIL[0]}" state "$STATE" get "$1"; }
-st_set()  { python3 -I "${UTIL[0]}" state "$STATE" set "$1" "$2"; }
-st_setj() { python3 -I "${UTIL[0]}" state "$STATE" setj "$1" "$2"; }
-st_del()  { python3 -I "${UTIL[0]}" state "$STATE" del "$1"; }
-st_hist() { python3 -I "${UTIL[0]}" state "$STATE" addhist "$1"; }
+# N13: a write that is refused because state.json turned corrupt mid-run stops the run (hold + urgent): it is never
+# silently skipped. (Writers run in the main shell, never in a $( ) subshell.)
+state_fail() { hold_set "state.json became unreadable or invalid during the run"; notify urgent "CPZed deploy stopped: state.json became unreadable or invalid during the run. Hold set; the file was not overwritten."; exit 30; }
+st_set()  { python3 -I "${UTIL[0]}" state "$STATE" set "$1" "$2" || state_fail; }
+st_setj() { python3 -I "${UTIL[0]}" state "$STATE" setj "$1" "$2" || state_fail; }
+st_del()  { python3 -I "${UTIL[0]}" state "$STATE" del "$1" || state_fail; }
+st_hist() { python3 -I "${UTIL[0]}" state "$STATE" addhist "$1" || state_fail; }
 util()    { python3 -I "${UTIL[0]}" "$@"; }
 # the only delete primitive: path strictly inside root; root allowlisted AND a direct child of HOME_DIR or APP_DIR
 rm_in()   { util swap rm "$1" "$2" "$HOME_DIR" "$APP_DIR"; }

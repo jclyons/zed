@@ -53,7 +53,7 @@ newenv() { # name
   export CPZED_QUIT_CMD="$E/bin/quit" CPZED_OPEN_CMD="$E/bin/open" CPZED_NOTIFY_CMD="$E/bin/notify"
   export CPZED_SIGN_CMD="$E/bin/sign" CPZED_VERIFY_CMD="$E/bin/verify" CPZED_SELFCHECK_CMD="$E/bin/selfcheck"
   export CPZED_LSREGISTER_CMD=/usr/bin/true CPZED_BUNDLE_CMD="$E/bin/bundle" CPZED_GH_CMD="$E/bin/gh"
-  export CPZED_GATE_INTERVAL_S=0.5 CPZED_GATE_CPU_WINDOW_S=0.5 CPZED_PREQUIT_DELAY_S=0.5 CPZED_QUIT_WAIT_S=3
+  export CPZED_GATE_INTERVAL_S=0.5 CPZED_GATE_CPU_WINDOW_S=0.5 CPZED_PREQUIT_DELAY_S=0.5 CPZED_QUIT_WAIT_S=6
   export CPZED_HEALTH_ALIVE_S=0.5 CPZED_HEALTH_BUDGET_S=4 CPZED_HID_IDLE_CMD="/bin/echo 99999" CPZED_COALESCE_S=0
   export CPZED_FIRST_SWAP_WAIT_S=3 CPZED_DITTO_WAIT_S=10 CPZED_BUILD_RETRY_S=1 CPZED_MIN_INTERVAL_S=0
   export CPZED_PROMPT_PROCS="FakeSecurityAgent" CPZED_TEST_THREADS=$E/threads.json DUMMY_PID_FILE=$E/dummy.pid
@@ -91,11 +91,20 @@ EOF
   chmod +x "$E"/bin/*
   cat > "$E/dummy_zed.py" <<'EOF'
 import json, os, signal, socket, subprocess, sys, time
+if "--crash-handler" in sys.argv:          # Zed's helper: same exe, no instance
+    while True: time.sleep(0.2)
 here = os.path.dirname(os.path.abspath(__file__))
 b = json.load(open(os.path.join(here, "..", "Resources", "dummy.json")))
 port = int(os.environ["CPZED_PORT"]); log = os.environ.get("CPZED_ZED_LOG")
-if b.get("refuse_quit"): signal.signal(signal.SIGTERM, signal.SIG_IGN)
+s = None
+def slow(*a):
+    try: s.close()
+    except Exception: pass
+    time.sleep(b.get("slow_exit", 0)); sys.exit(0)
+if b.get("slow_exit"): signal.signal(signal.SIGTERM, slow)
+elif b.get("refuse_quit"): signal.signal(signal.SIGTERM, signal.SIG_IGN)
 else: signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+
 if os.environ.get("DUMMY_NO_LISTEN"): b["no_listen"] = True
 if log and b.get("panic"): open(log, "a").write("thread 'main' panicked at src/x.rs:1:1: boom\n")
 if log and b.get("keychain"): open(log, "a").write("ERROR errSecAuthFailed -25293 failed to read credentials\n")
@@ -138,7 +147,8 @@ EOF
   # git fixture: bare fork + clone with a `fork` remote; commit subjects carry (#N)
   git init -q --bare "$E/fork.git"; git init -q "$E/repo"
   ( cd "$E/repo" && git config user.email t@t && git config user.name t && git remote add fork "$E/fork.git" \
-    && echo a > a && git add a && git commit -qm "base" && git branch -M main && git push -q fork main ) >/dev/null 2>&1
+    && echo a > a && git add a && git commit -qm "base" && git branch -M main && git push -q fork main \
+    && git init -q --bare "$E/up.git" && git remote add origin "$E/up.git" && git push -q origin main ) >/dev/null 2>&1
   echo '{"prs": []}' > "$E/ledger.json"
   PREV_SHA=$(git -C "$E/repo" rev-parse HEAD)
 }
@@ -168,8 +178,17 @@ sre_on()  { ( while :; do python3 -I "$D/deploy-util" state "$E/home/state.json"
 SRE=
 sre_off() { [[ -n "$SRE" ]] && { kill "$SRE" 2>/dev/null; wait "$SRE" 2>/dev/null; }; SRE=; return 0; }
 dep() { # args -> RC, OUT   (runs `deploy run` in the foreground with a hard 60 s cap)
-  OUT=$(perl -e '$SIG{ALRM}=sub{kill "TERM",-$$; exit 124}; setpgrp(0,0); alarm shift; system(@ARGV); exit($? >> 8)' "${DEP_T:-40}" "$D/deploy" "$@" 2>&1); RC=$?
+  OUT=$(perl -e '$SIG{ALRM}=sub{kill "TERM",-$$; exit 124}; setpgrp(0,0); alarm shift; system(@ARGV); exit($? >> 8)' "${DEP_T:-150}" "$D/deploy" "$@" 2>&1); RC=$?
 }
+poll() { # seconds cmd... : run cmd until it succeeds (bounded)
+  local end=$(( $(date +%s) + $1 )); shift
+  while ! "$@" >/dev/null 2>&1; do (( $(date +%s) >= end )) && return 1; sleep 0.2; done; return 0
+}
+gate_until() { # want_rc tries : refresh quiescent_at and run `gate check` until it returns want_rc (bounded); sets OUT, RC
+  local want=$1 i
+  for i in $(seq 1 ${2:-15}); do sets quiescent_at "$(date +%s)"; OUT=$("$D/gate" check 2>&1); RC=$?; [[ $RC == "$want" ]] && return 0; sleep 0.5; done; return 1
+}
+have_pid() { [[ -s "$E/dummy.pid" ]]; }
 kill_dummy() { [[ -f "$E/dummy.pid" ]] && kill -9 "$(cat "$E/dummy.pid")" 2>/dev/null; pkill -9 -f "$E/" 2>/dev/null; sleep 0.2; rm -f "$E/dummy.pid"; }
 start_app() { "$E/bin/open" "$1"; local i; for i in $(seq 1 40); do lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
 port_up() { lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1; }
@@ -232,7 +251,7 @@ sc_detach() {
   newenv detach; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"
   # a fake terminal: its own session; we HUP its whole process group after starting the deploy
   perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' bash -c "$D/deploy start >$E/start.out 2>&1; sleep 30" &
-  local term=$!; sleep 2
+  local term=$!; poll 30 test -s "$E/home/deploy.pid"
   local pid; pid=$(cat "$E/home/deploy.pid" 2>/dev/null)
   ck detach-pidfile "$([[ -n $pid ]] && echo y)" y
   local psess pgid tty parent_pgid
@@ -268,11 +287,10 @@ sc_gate_cargo() {
   gate_env gcargo; kill_dummy
   local cargo; cargo=$(fake_tool cargo "sleep 60")
   beh "{\"children\":[{\"argv\":[\"$cargo\"]}]}"; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"
-  sleep 0.5; sets quiescent_at "$(date +%s)"
-  OUT=$("$D/gate" check 2>&1); RC=$?; ck gate-busy-with-cargo "$RC" 1; ckm gate-names-cargo "$OUT" "build/test running"
+  poll 20 pgrep -f "$E/fake/cargo/cargo"; gate_until 1; ck gate-busy-with-cargo "$RC" 1; ckm gate-names-cargo "$OUT" "build/test running"
   kill_dummy; pkill -f "$E/fake" 2>/dev/null
   beh '{}'; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"; sets quiescent_at "$(date +%s)"
-  OUT=$("$D/gate" check 2>&1); ck gate-quiet-without-cargo "$?" 0; kill_dummy
+  gate_until 0; ck gate-quiet-without-cargo "$RC" 0; kill_dummy
 }
 sc_gate_stale() {
   gate_env gstale; sets quiescent_at "$(( $(date +%s) - 500 ))"
@@ -287,10 +305,10 @@ sc_gate_claude_cpu() {
   local busy idle; busy=$(fake_tool claude 'while :; do :; done'); idle=$(fake_tool claudeidle 'sleep 60')
   mkdir -p "$E/fake/c"; cp "$idle" "$E/fake/c/claude"
   beh "{\"children\":[{\"argv\":[\"$busy\",\"--resume\",\"x\"]}]}"; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"
-  sleep 0.5; sets quiescent_at "$(date +%s)"; OUT=$("$D/gate" check 2>&1); RC=$?
+  poll 20 pgrep -f "$E/fake/claude/claude"; CPZED_GATE_CPU_WINDOW_S=2 gate_until 1 20
   ck gate-busy-claude-blocks "$RC" 1; ckm gate-cpu-msg "$OUT" "CPU"; kill_dummy; pkill -9 -f "$E/fake" 2>/dev/null
   beh "{\"children\":[{\"argv\":[\"$E/fake/c/claude\"]}]}"; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"
-  sleep 0.5; sets quiescent_at "$(date +%s)"; OUT=$("$D/gate" check 2>&1); ck gate-idle-claude-passes "$?" 0; kill_dummy; pkill -9 -f "$E/fake" 2>/dev/null
+  poll 20 pgrep -f "$E/fake/c/claude"; gate_until 0; ck gate-idle-claude-passes "$RC" 0; kill_dummy; pkill -9 -f "$E/fake" 2>/dev/null
 }
 sc_gate_hid() {
   gate_env ghid; sets quiescent_at "$(date +%s)"; export CPZED_HID_IDLE_CMD="/bin/echo 30"
@@ -314,7 +332,7 @@ sc_gate_notice() { # waits while busy, sends the (shortened) 4 h notice, never f
 sc_eligible() {
   newenv elig; local out
   mkpr 1; out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0); ck elig-ok "$out" "$COMMIT"
-  mkpr 2 dirty; out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0); ck elig-not-clean-falls-back "$out" "$(git -C "$E/repo" rev-parse HEAD~1)"
+  mkpr 2 dirty; out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0); ck elig-first-deploy-ships-only-up-to-the-approved-target "$out" "$(git -C "$E/repo" rev-parse HEAD~1)"
   newenv elig2; mkpr 1 clean dirty; out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0); ck elig-tester-not-clean "${out%%:*}" "blocked"
   newenv elig3; mkpr 1 clean clean true; out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0); ck elig-hold "${out%%:*}" "blocked"
   newenv elig4; mkpr 1 clean clean false false; out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0); ck elig-not-user-approved "${out%%:*}" "blocked"
@@ -381,7 +399,7 @@ sc_refuse_quit() {
   mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA" "$E/refuser.json"
   start_app "$E/apps/CPZed.app"; local pid; pid=$(cat "$E/dummy.pid"); sre_on
   dep run; sre_off
-  ck refuse-aborts "$RC" 30; ck refuse-hold-set "$([[ -e $E/home/hold ]] && echo y)" y
+  ck refuse-aborts "$RC" 30; ckm refuse-names-the-process "$(notes)" "MacOS/zed"; ck refuse-hold-set "$([[ -e $E/home/hold ]] && echo y)" y
   ck refuse-app-NOT-killed "$(kill -0 "$pid" 2>/dev/null && echo alive || echo dead)" alive
   ck refuse-still-listening "$(port_up | wc -l | tr -d ' ')" 1
   ck refuse-installed-untouched "$(sha_of "$E/apps/CPZed.app")" "$PREV_SHA"
@@ -487,7 +505,7 @@ sc_interval_run() {
 sc_ditto_wait() {
   newenv ditto; install_prev; mkpr 1
   local d; d=$(fake_tool ditto "sleep 8; date +%s > $E/ditto.end")
-  ( "$d" -c -k --keepParent "$E/apps/CPZed.app" "$E/out.zip" >/dev/null 2>&1 & ); sleep 0.5
+  ( "$d" -c -k --keepParent "$E/apps/CPZed.app" "$E/out.zip" >/dev/null 2>&1 & ); poll 20 pgrep -f "$E/fake/ditto/ditto"
   start_app "$E/apps/CPZed.app"; sre_on; dep run; sre_off
   ck ditto-deploy-ok "$RC" 0
   local launched_new; launched_new=$(tail -1 "$E/open.log" | cut -d' ' -f1)
@@ -628,14 +646,14 @@ sc_claude_quote() { # S2: an unbalanced quote in a claude argv must not blind th
   gate_env gquote; kill_dummy
   local busy idle; busy=$(fake_tool claude 'while :; do :; done'); mkdir -p "$E/fake/c"; printf '#!/bin/sh\nsleep 60\n' > "$E/fake/c/claude"; chmod +x "$E/fake/c/claude"
   beh "{\"children\":[{\"argv\":[\"$busy\",\"-p\",\"don't stop\"]}]}"; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"
-  sleep 0.5; sets quiescent_at "$(date +%s)"; OUT=$("$D/gate" check 2>&1); ck quote-busy-claude-blocks "$?" 1; ckm quote-busy-cpu-msg "$OUT" "CPU"; kill_dummy; pkill -9 -f "$E/fake" 2>/dev/null
+  poll 20 pgrep -f "$E/fake/claude/claude"; CPZED_GATE_CPU_WINDOW_S=2 gate_until 1 20; ck quote-busy-claude-blocks "$RC" 1; ckm quote-busy-cpu-msg "$OUT" "CPU"; kill_dummy; pkill -9 -f "$E/fake" 2>/dev/null
   beh "{\"children\":[{\"argv\":[\"$E/fake/c/claude\",\"-p\",\"don't stop\"],\"cwd\":\"$E/data\"}]}"; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"
-  sleep 0.5; sets quiescent_at "$(date +%s)"; OUT=$("$D/gate" check 2>&1); ck quote-idle-claude-passes "$?" 0
+  poll 20 pgrep -f "$E/fake/c/claude"; gate_until 0; ck quote-idle-claude-passes "$RC" 0
   ck quote-session-listed "$(python3 -I "$D/deploy-util" claudes "$(cat "$E/dummy.pid")" | python3 -I -c 'import json,sys;print(len(json.load(sys.stdin)))')" 1; kill_dummy; pkill -9 -f "$E/fake" 2>/dev/null
   # util failure => blocked (fail CLOSED)
   cp -R "$D" "$E/scr2"; mv "$E/scr2/deploy-util" "$E/scr2/deploy-util.real"
   printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys, os' "if sys.argv[1] == 'claudes': sys.exit(1)" "sys.exit(subprocess.call([sys.executable, '-I', os.path.dirname(os.path.abspath(__file__)) + '/deploy-util.real'] + sys.argv[1:]))" > "$E/scr2/deploy-util"; chmod +x "$E/scr2/deploy-util"
-  beh '{}'; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"; sleep 0.5; sets quiescent_at "$(date +%s)"
+  beh '{}'; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"; sets quiescent_at "$(date +%s)"
   OUT=$("$E/scr2/gate" check 2>&1); ck util-failure-blocks-gate "$?" 1; ckm util-failure-msg "$OUT" "cannot enumerate"; kill_dummy
 }
 
@@ -695,7 +713,7 @@ sc_prefix_s5() { # S5 + N11: the test prefix must be fresh, under a temp root, a
   newenv pfx; mkdir -p "$E/fakehome/Library/Application Support" "$E/fakehome/.config"
   local p rc notemp
   pf() { # prefix [port]
-    local pr=$1; env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX="$pr" CPZED_HOME_DIR="$pr/h" CPZED_APP_DIR="$pr/a" CPZED_DATA_DIR="$pr/d" CPZED_CONF_DIR="$pr/c" \
+    local pr=$1; env -i PATH="$PATH" HOME="$E/fakehome" ${TMPDIR:+TMPDIR="$TMPDIR"} CPZED_TEST_PREFIX="$pr" CPZED_HOME_DIR="$pr/h" CPZED_APP_DIR="$pr/a" CPZED_DATA_DIR="$pr/d" CPZED_CONF_DIR="$pr/c" \
       ${2:+CPZED_PORT=$2} CPZED_QUIT_CMD=/bin/true CPZED_OPEN_CMD=/bin/true CPZED_NOTIFY_CMD=/bin/true "$D/deploy" status >/dev/null 2>&1
   }
   mkdir -p "$E/ok"; pf "$E/ok" 47999; ck prefix-fresh-temp-dir-ok "$?" 0
@@ -710,7 +728,7 @@ sc_prefix_s5() { # S5 + N11: the test prefix must be fresh, under a temp root, a
 sc_busy_failclosed() { # N9
   gate_env gbusy; kill_dummy; cp -R "$D" "$E/scr3"; mv "$E/scr3/deploy-util" "$E/scr3/deploy-util.real"
   printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys, os' "if sys.argv[1] == 'busy': sys.exit(1)" "sys.exit(subprocess.call([sys.executable, '-I', os.path.dirname(os.path.abspath(__file__)) + '/deploy-util.real'] + sys.argv[1:]))" > "$E/scr3/deploy-util"; chmod +x "$E/scr3/deploy-util"
-  beh '{}'; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"; sleep 0.5; sets quiescent_at "$(date +%s)"
+  beh '{}'; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA"; start_app "$E/apps/CPZed.app"; sets quiescent_at "$(date +%s)"
   OUT=$("$E/scr3/gate" check 2>&1); ck busy-failure-blocks-gate "$?" 1; ckm busy-failure-msg "$OUT" "cannot enumerate build/test"; kill_dummy
 }
 
@@ -737,7 +755,7 @@ sc_n4_processes() { # N4: identify the app by executable path, not by the port
   # a FOREIGN process owns the port: the quit is never sent
   newenv n4b; install_prev; mkpr 1
   printf 'import socket, time, sys\ns = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", %s)); s.listen(5)\nwhile True: time.sleep(0.2)\n' "$PORT" > "$E/foreign.py"
-  ( cd "$E" && nohup python3 -I "$E/foreign.py" >/dev/null 2>&1 & ); sleep 0.5
+  ( cd "$E" && nohup python3 -I "$E/foreign.py" >/dev/null 2>&1 & ); poll 20 test -n "$(port_up)"
   sre_on; dep run; sre_off
   ck foreign-port-aborts "$RC" 30; ck foreign-port-hold "$([[ -e $E/home/hold ]] && echo y)" y
   ck foreign-port-quit-never-sent "$([[ -e $E/quit.log ]] && echo sent || echo never)" never
@@ -763,6 +781,85 @@ EOF
   chmod +x "$E/bin/quit2"; export CPZED_QUIT_CMD="$E/bin/quit2"; start_app "$E/apps/CPZed.app"; sre_on; dep run; sre_off
   ck quit-race-aborts "$RC" 30; ck quit-race-hold "$([[ -e $E/home/hold ]] && echo y)" y; ckm quit-race-notified "$(notes)" "still running from"
   ck quit-race-installed-untouched "$(sha_of "$E/apps/CPZed.app")" "$PREV_SHA"; kill_dummy
+}
+
+
+sc_n12_n13() { # N12: Zed's --crash-handler helper is not a running instance; N13: mid-run state corruption stops the run
+  newenv n12; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"
+  ( cd "$E" && nohup python3 -I "$E/apps/CPZed.app/Contents/MacOS/zed" --crash-handler x >/dev/null 2>&1 & ); poll 20 pgrep -f "crash-handler x"
+  sre_on; dep run; sre_off; ck crash-handler-helper-ignored "$RC" 0; ck crash-handler-new-build-installed "$(sha_of "$E/apps/CPZed.app")" "$COMMIT"; kill_dummy
+  newenv n13; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"; sre_on
+  ( poll 60 grep -q '\[restarting\]' "$E/notify.log"; printf 'garbage' > "$E/home/state.json" ) &
+  dep run; sre_off; ck midrun-state-corruption-stops "$RC" 30; ck midrun-state-corruption-hold "$([[ -e $E/home/hold ]] && echo y)" y
+  ck midrun-state-corruption-not-rewritten "$(cat "$E/home/state.json")" garbage; ck midrun-state-corruption-app-not-quit "$([[ -e $E/quit.log ]] && echo quit || echo none)" none
+  ck midrun-state-corruption-installed-untouched "$(sha_of "$E/apps/CPZed.app")" "$PREV_SHA"; kill_dummy
+}
+
+
+# ---- review round 3 scenarios ----
+sc_first_strict() { # the first deploy ships every fork-only commit up to the target: all must be approved
+  newenv fstrict; local out base1; mkpr 1
+  ( cd "$E/repo" && echo z >> a && git commit -qam "sneaky direct push" && git push -q fork main ) >/dev/null 2>&1; mkpr 3
+  out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0); ckm first-deploy-blocked-by-unapproved-middle "$out" "blocked by"; ck first-deploy-not-shipped "$([[ "$out" == "$COMMIT" ]] && echo shipped || echo no)" no
+  out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0 --upstream refs/nope/missing); ckm first-deploy-needs-upstream-ref "$out" "cannot list the fork-only commits"
+  newenv fok; mkpr 1; mkpr 2; out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --quiet-s 0); ck first-deploy-all-approved-ok "$out" "$COMMIT"
+  ck included-lists-fork-only-commits "$(python3 -I "$D/deploy-util" included "$E/repo" origin/main "$COMMIT" | wc -l | tr -d ' ')" 2
+}
+
+sc_n14_spaces() { # a bundle path with a SPACE is matched from the kernel's argv, not from ps text
+  newenv n14; mkapp "$E/sp ace/CPZed.app" 1 "$PREV_SHA"
+  ( cd "$E" && DUMMY_NO_LISTEN=1 DUMMY_PID_FILE="$E/sp.pid" nohup python3 -I "$E/sp ace/CPZed.app/Contents/MacOS/zed" >/dev/null 2>&1 & ); poll 20 test -s "$E/sp.pid"
+  ck space-path-procs-of "$(python3 -I "$D/deploy-util" procs-of "$E/sp ace/CPZed.app/Contents/MacOS/zed" | grep -c .)" 1
+  python3 -I "$D/deploy-util" same-exe "$(cat "$E/sp.pid")" "$E/sp ace/CPZed.app/Contents/MacOS/zed"; ck space-path-same-exe "$?" 0
+  ck space-path-other-exe-not-matched "$(python3 -I "$D/deploy-util" procs-of "$E/other.app/Contents/MacOS/zed" | grep -c .)" 0
+  kill -9 "$(cat "$E/sp.pid")" 2>/dev/null
+}
+
+sc_x1_slow_exit() { # an app that closes its port and exits ~2 s later is WAITED for (by process), not held
+  newenv x1; install_prev; mkpr 1; echo '{"slow_exit":2}' > "$E/slow.json"; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA" "$E/slow.json"
+  start_app "$E/apps/CPZed.app"; sre_on; dep run; sre_off
+  ck slow-exit-app-waited-for "$RC" 0; ck slow-exit-new-build-installed "$(sha_of "$E/apps/CPZed.app")" "$COMMIT"; kill_dummy
+}
+
+sc_x4_snapshot_failclosed() { # a session-snapshot failure (claudes fails when called by deploy, not by the gate) stops the run before the quit
+  newenv x4; install_prev; mkpr 1; cp -R "$D" "$E/scr4"; mv "$E/scr4/deploy-util" "$E/scr4/deploy-util.real"
+  printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys, os' "cmd = subprocess.run(['ps', '-o', 'command=', '-p', str(os.getppid())], capture_output=True, text=True).stdout" \
+    "if sys.argv[1] == 'claudes' and '/deploy' in cmd and '/gate' not in cmd: sys.exit(1)" \
+    "sys.exit(subprocess.call([sys.executable, '-I', os.path.dirname(os.path.abspath(__file__)) + '/deploy-util.real'] + sys.argv[1:]))" > "$E/scr4/deploy-util"; chmod +x "$E/scr4/deploy-util"
+  start_app "$E/apps/CPZed.app"; sre_on; local save=$D; D=$E/scr4; DEP_T=60 dep run; D=$save; sre_off
+  ck snapshot-failure-aborts "$RC" 30; ck snapshot-failure-hold "$([[ -e $E/home/hold ]] && echo y)" y
+  ckm snapshot-failure-says-why "$(notes)" "cannot enumerate the sessions"; ck snapshot-failure-quit-never-sent "$([[ -e $E/quit.log ]] && echo sent || echo never)" never; kill_dummy
+}
+
+sc_signal_after_quit() { # TERM after the quit must never leave the editor down silently
+  local dp
+  # A: during the post-quit window (a Glider archiver is running)
+  newenv sigA; install_prev; mkpr 1; local d; d=$(fake_tool ditto "sleep 12")
+  cat > "$E/bin/quit3" <<EOF
+#!/bin/sh
+echo "\$(date +%s)" >> "\$CPZED_TEST_PREFIX/quit.log"
+pid=\$(cat "\$DUMMY_PID_FILE" 2>/dev/null); [ -n "\$pid" ] && kill -TERM "\$pid"
+( "$d" -c -k --keepParent "\$CPZED_TEST_PREFIX/apps/CPZed.app" x.zip >/dev/null 2>&1 & )
+exit 0
+EOF
+  chmod +x "$E/bin/quit3"; export CPZED_QUIT_CMD="$E/bin/quit3"; start_app "$E/apps/CPZed.app"; sre_on
+  "$D/deploy" run >"$E/sig.out" 2>&1 & dp=$!
+  poll 90 test -e "$E/quit.log"; sleep 1.5; kill -TERM "$dp"; wait "$dp"; local rc=$?; sre_off
+  ck signal-after-quit-exit "$rc" 143; poll 20 test -n "$(port_up)"; ck signal-after-quit-old-app-relaunched "$(port_up | wc -l | tr -d ' ')" 1
+  ck signal-after-quit-hold "$([[ -e $E/home/hold ]] && echo y)" y; ckm signal-after-quit-urgent "$(notes)" "interrupted in phase"
+  ck signal-after-quit-installed-untouched "$(sha_of "$E/apps/CPZed.app")" "$PREV_SHA"; kill_dummy
+  # B: during the first-swap wait for the user (stock quit): stock is relaunched
+  newenv sigB; mkstock; mkpr 1; mkapp "$E/apps/Zed.app" 0 "$(printf '%040d' 77)" "$E/stock-build.json"; start_app "$E/apps/Zed.app"; sre_on
+  "$D/deploy" run --first-swap >"$E/sig.out" 2>&1 & dp=$!
+  poll 90 grep -q '\[first-swap\]' "$E/notify.log"; sleep 0.5; kill -TERM "$dp"; wait "$dp"; rc=$?; sre_off
+  ck signal-first-swap-exit "$rc" 143; poll 20 test -n "$(port_up)"; ck signal-first-swap-stock-relaunched "$(port_up | wc -l | tr -d ' ')" 1
+  ck signal-first-swap-hold "$([[ -e $E/home/hold ]] && echo y)" y; kill_dummy
+  # C: during the health check of the new build: hold + urgent notice (new build stays installed)
+  newenv sigC; install_prev; mkpr 1; beh '{"no_listen":true}'; start_app "$E/apps/CPZed.app"; sre_on
+  "$D/deploy" run >"$E/sig.out" 2>&1 & dp=$!
+  poll 90 eval '[[ "$(statej phase)" == health ]]'; sleep 0.3; kill -TERM "$dp"; wait "$dp"; rc=$?; sre_off
+  ck signal-in-health-exit "$rc" 143; ck signal-in-health-hold "$([[ -e $E/home/hold ]] && echo y)" y; ckm signal-in-health-urgent "$(notes)" "interrupted after the swap"
+  ck signal-in-health-new-build-installed "$(sha_of "$E/apps/CPZed.app")" "$COMMIT"; kill_dummy
 }
 
 # ----------------------------------------------------------- mutations ----
@@ -842,6 +939,12 @@ run sc_prefix_s5
 run sc_busy_failclosed
 run sc_verify_app
 run sc_n4_processes
+run sc_n12_n13
+run sc_first_strict
+run sc_n14_spaces
+run sc_x1_slow_exit
+run sc_x4_snapshot_failclosed
+run sc_signal_after_quit
 # the watcher must detect the naive two-rename swap, otherwise sc_atomic_no_gap proves nothing
 if want atomic || want naive; then
   QUIET=1; LAST_FAIL=0; sc_naive_swap_has_gap >/dev/null 2>&1; lf=$LAST_FAIL; QUIET=0; LAST_FAIL=0
@@ -952,6 +1055,28 @@ mut n4-path-normalised deploy-util '    return os.path.realpath(p).lower()' '   
 mut n4-assert-stopped-before-swap deploy 'assert_stopped "$old_app" "$APP"   # and once more, right before the rename' ':' sc_n4_processes
 mut n4-assert-stopped-both deploy 'assert_stopped "$old_app" "$APP"   # and once more, right before the rename' ':' sc_n4_processes deploy '  assert_stopped "$old_app" "$APP"
   # Data backup' '  # Data backup'
+
+mut n12-crash-handler deploy-util '"--crash-handler" not in r["cmd"].split()]' 'True]' sc_n12_n13
+mut n13-midrun-state deploy-lib.sh 'st_set()  { python3 -I "${UTIL[0]}" state "$STATE" set "$1" "$2" || state_fail; }' 'st_set()  { python3 -I "${UTIL[0]}" state "$STATE" set "$1" "$2"; }' sc_n12_n13
+
+mut first-strict-fork-only deploy-util '            ok, why = commit_eligible(c, sj, ledger, ghcmd)
+            if not ok:
+                print("blocked by %s: %s (the first deploy needs every fork-only commit approved)" % (c, why)); return 1' '            ok = True' sc_first_strict
+mut first-needs-upstream deploy-util 'print("blocked: cannot list the fork-only commits: %s is missing (fetch the upstream remote)" % upstream); return 1' 'pass' sc_first_strict
+mut n14-kernel-argv deploy-util '        for t in argv[1:]:
+            if not t.startswith("-"):
+                return norm_path(t), argv
+        return "", argv
+    return norm_path(path), argv' '        for t in " ".join(argv[1:]).split():
+            if not t.startswith("-"):
+                return norm_path(t), argv
+        return "", argv
+    return norm_path(path), argv' sc_n14_spaces
+mut x1-wait-for-process deploy 'if [[ -z "$(port_pid)" && -z "$(util procs-of "$bin")" ]]; then return 0; fi' 'if [[ -z "$(port_pid)" ]]; then return 0; fi' sc_x1_slow_exit
+mut x4-snapshot-guard deploy 'cl=$(util claudes "$main") || abort_deploy "cannot enumerate the sessions under the app; not quitting" hold' 'cl=$(util claudes "$main")' sc_x4_snapshot_failclosed
+mut signal-after-quit deploy '  elif (( APP_QUIT == 1 )); then' '  elif false; then' sc_signal_after_quit
+mut signal-relaunch deploy '    [[ -d "$OLD_APP" ]] && open_app "$OLD_APP"' '    :' sc_signal_after_quit
+mut signal-after-swap deploy '  elif (( SWAPPED == 1 )); then' '  elif false; then' sc_signal_after_quit
 
 REAL_AFTER=$(real_snapshot)
 ck "real /Applications and ~/Library/Application Support untouched" "$REAL_AFTER" "$REAL_BEFORE"
