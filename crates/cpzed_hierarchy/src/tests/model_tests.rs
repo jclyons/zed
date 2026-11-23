@@ -403,7 +403,7 @@ fn load_classifies_blobs() {
     // A future version is recognised even if its shape is unknown to this build.
     assert_eq!(
         Hierarchy::load(Some(r#"{"version":3,"sections":{"new":"shape"}}"#)),
-        LoadOutcome::FutureVersion(3)
+        LoadOutcome::FutureVersion("3".into())
     );
     // Same version but a RowKey variant this build does not know: unreadable (backed up by the store).
     assert!(matches!(
@@ -470,4 +470,58 @@ fn move_row_scales_linearly_in_the_container_size() {
     assert_eq!(h.unsectioned_order[&a][0], visible[n - 1]);
     // Was ~9 s in debug when quadratic; generous bound so a loaded machine cannot flake it.
     assert!(elapsed.as_secs() < 2, "took {elapsed:?}");
+}
+
+#[test]
+fn any_unclassifiable_object_version_is_treated_as_future_not_garbage() {
+    use crate::LoadOutcome;
+    for blob in [
+        r#"{"version":3}"#,
+        r#"{"version":"3"}"#,
+        r#"{"version":1e20}"#,
+        r#"{"version":18446744073709551616}"#,
+        r#"{"version":-1}"#,
+        r#"{"version":2.5}"#,
+        r#"{"version":null,"sections":[]}"#,
+        r#"{"sections":[]}"#,
+        r#"{"version":0}"#,
+    ] {
+        assert!(
+            matches!(Hierarchy::load(Some(blob)), LoadOutcome::FutureVersion(_)),
+            "{blob}"
+        );
+    }
+    // Genuine garbage, non-objects, v1 and an empty object are plain unreadable.
+    for blob in [
+        "",
+        "nope",
+        "[1,2]",
+        "3",
+        "\"x\"",
+        "{}",
+        r#"{"version":1,"roots":[]}"#,
+    ] {
+        assert!(
+            matches!(Hierarchy::load(Some(blob)), LoadOutcome::Unreadable { .. }),
+            "{blob}"
+        );
+    }
+}
+
+#[test]
+fn deleted_section_id_is_not_reused_across_save_and_reload() {
+    let a = g("a");
+    let mut h = Hierarchy::default();
+    let (s1, _) = h.create_section(&a, "One").unwrap();
+    assert_eq!(s1.0, "s1");
+    h.delete_section(&a, &s1).unwrap();
+    let mut reloaded = Hierarchy::from_json(&h.to_json().unwrap());
+    let (next, _) = reloaded.create_section(&a, "Two").unwrap();
+    assert_eq!(next.0, "s2");
+    // An old blob without the counter still never collides with a live id.
+    let mut old = Hierarchy::from_json(
+        r#"{"version":2,"sections":[[{"host":null,"paths":[]},[{"id":"s1","name":"X","collapsed":false,"items":[]}]]]}"#,
+    );
+    let (fresh, _) = old.create_section(&GroupKey::default(), "Y").unwrap();
+    assert_ne!(fresh.0, "s1");
 }

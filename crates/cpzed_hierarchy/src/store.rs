@@ -21,6 +21,7 @@ pub const WRITE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// `touch_seen` only rewrites an entry that is older than this, so a sidebar rebuild that sees
 /// the same rows again is free (no write, no notify).
 const TOUCH_GRANULARITY_SECS: i64 = 60 * 60;
+const ONE_DAY_SECS: i64 = 24 * 60 * 60;
 
 struct GlobalHierarchyStore(Entity<HierarchyStore>);
 
@@ -37,6 +38,8 @@ pub struct HierarchyStore {
     read_only: bool,
     /// True once `touch_seen` ran: `prune` is a no-op before that (see [`Hierarchy::prune`]).
     touched: bool,
+    /// Logical-clock skew (see [`Self::logical_now`]); fixed on first use in a session.
+    clock_skew: Option<i64>,
     _quit_subscription: Option<Subscription>,
 }
 
@@ -75,10 +78,34 @@ impl HierarchyStore {
     /// - Written by a NEWER version: empty and READ-ONLY. Nothing is ever written, so rolling back
     ///   a deploy does not destroy the newer build's data.
     pub fn new(db: KeyValueStore, cx: &mut Context<Self>) -> Self {
-        let stored = db.scoped(KVP_SCOPE).read(KVP_KEY).log_err().flatten();
+        let stored = db.scoped(KVP_SCOPE).read(KVP_KEY);
+        Self::from_stored(db, stored, cx)
+    }
+
+    /// [`Self::new`] with the stored blob already read. A read ERROR (busy, I/O) is not "missing":
+    /// the blob may be intact, so the store goes read-only rather than overwrite it.
+    pub fn from_stored(
+        db: KeyValueStore,
+        stored: anyhow::Result<Option<String>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut read_only = false;
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(error) => {
+                log::error!(
+                    "cpzed_hierarchy: could not read the stored hierarchy ({error:#}); staying read-only"
+                );
+                read_only = true;
+                None
+            }
+        };
         let mut backup: Option<String> = None;
-        let mut hierarchy = match Hierarchy::load(stored.as_deref()) {
+        let mut hierarchy = match if read_only {
+            LoadOutcome::Missing
+        } else {
+            Hierarchy::load(stored.as_deref())
+        } {
             LoadOutcome::Missing => Hierarchy::default(),
             LoadOutcome::Loaded(hierarchy) => hierarchy,
             LoadOutcome::Unreadable { reason } => {
@@ -97,12 +124,16 @@ impl HierarchyStore {
             }
         };
         if let Some(blob) = backup {
-            let db = db.clone();
+            // Synchronous (rare path): the backup is durable before any v2 write can be queued.
+            // If it cannot be written, the original must not be replaced: go read-only.
             let key = Self::backup_key(&blob);
-            cx.background_spawn(async move {
-                db.scoped(KVP_SCOPE).write(key, blob).await.log_err();
-            })
-            .detach();
+            let written = gpui::block_on(db.scoped(KVP_SCOPE).write(key, blob));
+            if let Err(error) = written {
+                log::error!(
+                    "cpzed_hierarchy: could not back up the unreadable blob ({error:#}); staying read-only"
+                );
+                read_only = true;
+            }
         }
         let repairs = hierarchy.validate(&|_| None);
         let quit = cx.on_app_quit(|this, cx| this.flush_if_dirty(cx));
@@ -114,6 +145,7 @@ impl HierarchyStore {
             dirty: false,
             read_only,
             touched: false,
+            clock_skew: None,
             _quit_subscription: Some(quit),
         };
         if !repairs.is_empty() {
@@ -123,7 +155,9 @@ impl HierarchyStore {
         this
     }
 
-    /// True when the stored data came from a newer build; edits then apply in memory only.
+    /// True when the stored data came from a newer build, or could not be read or backed up. Every
+    /// mutating op then returns [`Refusal::ReadOnly`] and nothing is ever written; the sidebar
+    /// should say so.
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
@@ -143,6 +177,9 @@ impl HierarchyStore {
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut Hierarchy) -> Result<T, Refusal>,
     ) -> Result<T, Refusal> {
+        if self.read_only {
+            return Err(Refusal::ReadOnly);
+        }
         let result = edit(&mut self.hierarchy)?;
         self.schedule_write(cx);
         cx.notify();
@@ -211,6 +248,9 @@ impl HierarchyStore {
         name: &str,
         cx: &mut Context<Self>,
     ) -> Result<(SectionId, bool), Refusal> {
+        if self.read_only {
+            return Err(Refusal::ReadOnly);
+        }
         // Idempotent: creating an existing name changes nothing, so it must not notify.
         match self.hierarchy.clone_section_id(group, name) {
             Some(existing) => Ok((existing, false)),
@@ -301,23 +341,49 @@ impl HierarchyStore {
         from: &GroupKey,
         to: &GroupKey,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), Refusal> {
         self.edit(cx, |h| {
             h.cross_project_move(row, from, to);
             Ok(())
         })
-        .ok();
     }
 
-    pub fn set_row_collapsed(&mut self, row: &RowKey, collapsed: bool, cx: &mut Context<Self>) {
+    pub fn set_row_collapsed(
+        &mut self,
+        row: &RowKey,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), Refusal> {
+        if self.read_only {
+            return Err(Refusal::ReadOnly);
+        }
         if self.hierarchy.collapsed_rows.contains(row) == collapsed {
-            return;
+            return Ok(());
         }
         self.edit(cx, |h| {
             h.set_row_collapsed(row, collapsed);
             Ok(())
         })
-        .ok();
+    }
+
+    /// Activity-relative time. Retention counts days of use, not wall-clock days: after a long
+    /// absence (or a forward clock jump) the first call fixes a skew so that logical time is at
+    /// most one day past the newest recorded sighting. Rows and projects the user simply has not
+    /// opened yet this session therefore are not "30 days stale" because of the gap. The skew then
+    /// stays constant, so logical time advances at wall-clock speed while the app is used.
+    fn logical_now(&mut self, now: i64) -> i64 {
+        let skew = *self.clock_skew.get_or_insert_with(|| {
+            let newest = self
+                .hierarchy
+                .last_seen
+                .values()
+                .chain(self.hierarchy.group_last_seen.values())
+                .copied()
+                .filter(|seen| *seen <= now)
+                .max();
+            newest.map_or(0, |newest| (now - newest - ONE_DAY_SECS).max(0))
+        });
+        now - skew
     }
 
     /// Record that rows and groups were seen. Quiet: never notifies (the sidebar calls this while
@@ -330,6 +396,10 @@ impl HierarchyStore {
         cx: &mut Context<Self>,
     ) {
         self.touched = true;
+        if self.read_only {
+            return;
+        }
+        let now = self.logical_now(now);
         let stale =
             |seen: Option<&i64>| seen.is_none_or(|seen| now - *seen >= TOUCH_GRANULARITY_SECS);
         let rows: Vec<RowKey> = rows
@@ -352,9 +422,10 @@ impl HierarchyStore {
     /// Lazy 30-day prune. Notifies only if something was removed. A no-op until `touch_seen` has
     /// run in this session (callers must record the visible rows first; see [`Hierarchy::prune`]).
     pub fn prune(&mut self, now: i64, cx: &mut Context<Self>) -> usize {
-        if !self.touched {
+        if !self.touched || self.read_only {
             return 0;
         }
+        let now = self.logical_now(now);
         let pruned = self.hierarchy.prune(now);
         if pruned > 0 {
             self.schedule_write(cx);
@@ -369,6 +440,9 @@ impl HierarchyStore {
         group_of: &dyn Fn(&RowKey) -> Option<GroupKey>,
         cx: &mut Context<Self>,
     ) -> Vec<Repair> {
+        if self.read_only {
+            return Vec::new();
+        }
         let repairs = self.hierarchy.validate(group_of);
         if !repairs.is_empty() {
             log::warn!("cpzed_hierarchy: repaired hierarchy: {repairs:?}");

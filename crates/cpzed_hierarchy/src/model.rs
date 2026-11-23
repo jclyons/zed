@@ -84,6 +84,9 @@ pub enum Refusal {
     DuplicateName,
     /// This drag/target pairing has no meaning.
     InvalidTarget,
+    /// The stored hierarchy could not be read safely (newer version, read error, failed backup):
+    /// nothing is changed or saved until it is resolved.
+    ReadOnly,
 }
 
 impl std::fmt::Display for Refusal {
@@ -100,6 +103,9 @@ impl std::fmt::Display for Refusal {
             Refusal::EmptyName => "section names cannot be empty",
             Refusal::DuplicateName => "a section with that name already exists in this project",
             Refusal::InvalidTarget => "cannot drop here",
+            Refusal::ReadOnly => {
+                "the saved sidebar hierarchy could not be loaded safely, so it is read-only"
+            }
         };
         f.write_str(text)
     }
@@ -171,9 +177,11 @@ pub enum LoadOutcome {
     Unreadable {
         reason: String,
     },
-    /// Written by a NEWER build (version above ours). Load empty and never write (read-only), so a
-    /// rollback cannot wipe the newer build's data.
-    FutureVersion(u64),
+    /// Written by a NEWER build, or by anything that is not a v1/v2 blob we can classify: any
+    /// JSON object whose `version` is not exactly 1 or 2 (a larger, huge, negative, fractional or
+    /// string version, or missing next to other keys). Holds the version as written. Load empty
+    /// and never write (read-only), so a rollback cannot wipe the newer build's data.
+    FutureVersion(String),
 }
 
 impl Default for Hierarchy {
@@ -224,13 +232,17 @@ impl Hierarchy {
         let Some(text) = text else {
             return LoadOutcome::Missing;
         };
-        let version = serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|value| value.get("version").and_then(|v| v.as_u64()));
-        if let Some(version) = version
-            && version > u64::from(VERSION)
-        {
-            return LoadOutcome::FutureVersion(version);
+        if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(text) {
+            let known = matches!(object.get("version").and_then(|v| v.as_u64()), Some(1 | 2));
+            // Version 2 is parsed below; version 1 is a known old shape (unreadable, backed up);
+            // `{}` is plain garbage. Any other object is something this build cannot classify.
+            if !known && !object.is_empty() {
+                return LoadOutcome::FutureVersion(
+                    object
+                        .get("version")
+                        .map_or_else(|| "(missing)".to_string(), |v| v.to_string()),
+                );
+            }
         }
         match serde_json::from_str::<Hierarchy>(text) {
             Ok(h) if h.version == VERSION => LoadOutcome::Loaded(h),
