@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# script/cpzed/health: post-relaunch health check (CPZED-23, design section 5 step 8).
+#
+#   health --app APP --n N --sha SHA [--min-threads K] [--log-offset BYTES] [--budget S]
+#
+# Healthy (exit 0) means ALL of: the single-instance port is listening; `cli --version` contains
+# -cpzed.<N>; cpzed-build.json sha == SHA; `cli --agent-list` exits 0 and lists >= K terminal threads;
+# Zed.log has no `panic` and no "Migration changed" line after BYTES; the same process is still alive
+# CPZED_HEALTH_ALIVE_S (60) later. Retries until --budget (CPZED_HEALTH_BUDGET_S, 90) for the first four.
+#
+# Explicitly NOT health signals (never a reason to fail): keychain / privacy prompts on screen
+# (SecurityAgent, UserNotificationCenter), keychain errors in the log (errSecAuthFailed, -25293,
+# -128 / user canceled, "failed to read credentials"), a signed-out account, missing API keys. When
+# any is seen the output has the line `prompts_pending=1` and the exit is still 0.
+# Exit 1 = unhealthy; the reason is the last line on stdout, prefixed `FAIL:`.
+set -uo pipefail
+DL_NAME=health
+. "$(cd "$(dirname "$0")" && pwd)/deploy-lib.sh"
+dl_init
+app=""; n=""; sha=""; minth=0; off=0; budget=${CPZED_HEALTH_BUDGET_S:-90}; alive=${CPZED_HEALTH_ALIVE_S:-60}
+while [[ $# -gt 0 ]]; do case $1 in
+  --app) app=$2; shift 2;; --n) n=$2; shift 2;; --sha) sha=$2; shift 2;;
+  --min-threads) minth=$2; shift 2;; --log-offset) off=$2; shift 2;; --budget) budget=$2; shift 2;;
+  *) dl_die "unknown argument $1" 64;; esac; done
+[[ -n "$app" && -n "$n" && -n "$sha" ]] || dl_die "usage: health --app APP --n N --sha SHA [...]" 64
+ZLOG=${CPZED_ZED_LOG:-$HOME/Library/Logs/Zed/Zed.log}
+if [[ -n "${CPZED_TEST_PREFIX:-}" ]]; then
+  case "$(_dl_rp "$ZLOG")/" in "$(_dl_rp "$CPZED_TEST_PREFIX")"/*) ;; *) dl_die "TEST CONFINEMENT: log $ZLOG outside prefix" 99;; esac
+fi
+cli="$app/Contents/MacOS/cli"
+fail() { echo "FAIL: $1"; exit 1; }
+
+first_checks() { # echoes the failing reason, returns 1; 0 when all pass
+  local pid ver bsha out cnt
+  pid=$(port_pid); [[ -n "$pid" ]] || { echo "single-instance port $PORT is not listening"; return 1; }
+  ver=$("$cli" --version 2>&1) || { echo "cli --version failed: $ver"; return 1; }
+  [[ "$ver" == *"-cpzed.$n"* ]] || { echo "version '$ver' does not contain -cpzed.$n"; return 1; }
+  bsha=$(app_sha "$app"); [[ "$bsha" == "$sha" ]] || { echo "cpzed-build.json sha '$bsha' != deployed '$sha'"; return 1; }
+  out=$(mktemp "${TMPDIR:-/tmp}/cpzed-health.XXXXXX")
+  if ! perl -e 'alarm 30; exec @ARGV' "$cli" --agent-list >"$out" 2>&1; then
+    echo "zed --agent-list failed: $(head -c 200 "$out")"; rm -f "$out"; return 1; fi
+  cnt=$(util json-count "$out" || true); rm -f "$out"
+  [[ "$cnt" =~ ^[0-9]+$ ]] || { echo "zed --agent-list did not return a JSON list"; return 1; }
+  (( cnt >= minth )) || { echo "agent-list shows $cnt terminal threads, expected >= $minth"; return 1; }
+  return 0
+}
+
+end=$(( $(ts) + budget )); why=""
+while :; do
+  why=$(first_checks) && break
+  (( $(ts) >= end )) && fail "$why"
+  sleep 1
+done
+pid=$(port_pid)
+
+# Log scan after the launch offset: panics and migration errors fail; keychain noise never does.
+pending=0
+if [[ -f "$ZLOG" ]]; then
+  new=$(tail -c +"$((off + 1))" "$ZLOG" 2>/dev/null || true)
+  bad=$(grep -E 'panicked at|Migration changed' <<<"$new" | head -1 || true)
+  [[ -z "$bad" ]] || fail "log: $bad"
+  grep -qE 'errSecAuthFailed|-25293|user canceled|-128|failed to read credentials' <<<"$new" && pending=1
+fi
+for p in ${CPZED_PROMPT_PROCS:-SecurityAgent UserNotificationCenter}; do
+  pgrep -f "$p" >/dev/null 2>&1 && pending=1
+done
+
+sleep "$alive"
+pid_alive "$pid" && [[ "$(port_pid)" == "$pid" ]] || fail "the app did not stay up for ${alive}s"
+(( pending )) && echo "prompts_pending=1"
+echo "healthy pid=$pid"
+exit 0

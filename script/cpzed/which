@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# script/cpzed/which: report what is installed and running, key=value lines (CPZED-23). Read-only.
+#   which [--json]
+set -uo pipefail
+DL_NAME=which
+. "$(cd "$(dirname "$0")" && pwd)/deploy-lib.sh"
+dl_confine
+ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || true)
+pid=$(port_pid)
+ring=$(ls -1 "$HOME_DIR/ring" 2>/dev/null | paste -sd, -)
+stock=$(ls -1 "$HOME_DIR/stock" 2>/dev/null | paste -sd, -)
+sha=$(app_sha "$APP"); n=$(app_n "$APP")
+if [[ "${1:-}" == --json ]]; then
+  python3 -I - "$APP" "$ver" "$sha" "$n" "$pid" "$ring" "$stock" "$([[ -e $HOLD ]] && head -1 "$HOLD")" "$(st_get phase)" "$(st_get n)" <<'PY'
+import json, sys
+k = "app installed_version sha n running_pid ring stock hold phase next_n".split()
+print(json.dumps(dict(zip(k, sys.argv[1:]))))
+PY
+  exit 0
+fi
+echo "app=$APP"; echo "installed=$([[ -d $APP ]] && echo yes || echo no)"
+echo "installed_version=$ver"; echo "sha=$sha"; echo "n=$n"
+echo "running_pid=$pid"; echo "port=$PORT"
+echo "hold=$([[ -e $HOLD ]] && head -1 "$HOLD")"
+echo "phase=$(st_get phase)"; echo "next_n=$(st_get n)"
+echo "stock_app_present=$([[ -d $STOCK_APP ]] && echo yes || echo no)"
+echo "ring=$ring"; echo "stock_archives=$stock"

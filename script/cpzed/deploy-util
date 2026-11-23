@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""script/cpzed/deploy-util: small, testable helpers for the CPZed deploy pipeline (CPZED-23).
+
+Subcommands (all argv-only; nothing is ever passed through a shell):
+  state <file> check | get K | set K V | setj K JSON | del K | addhist JSON | dump   (a corrupt file is an error, exit 3)
+  swap exchange A B      one atomic renamex_np(RENAME_SWAP) of two .app directories
+  swap rename SRC DST    renamex_np(RENAME_EXCL): DST must not exist
+  swap rm PATH ROOT ANCHOR...   remove PATH only if strictly inside ROOT, ROOT is an allowlisted dir name and a direct child of an ANCHOR
+  swap probe DIR         self-test: exchange two temp dirs under DIR, report atomicity
+  walk PID               JSON lines for every descendant of PID
+  busy PID               descendants that are builds/tests (one "pid cmd" per line)
+  claudes PID            JSON list of claude descendants {pid, cwd, argv, session}
+  cpu PID...             cumulative CPU seconds per pid ("pid seconds")
+  resume FILE            print the resume list from state.sessions
+  restamp APP N SHA      re-stamp a bundle's version for a rollback build (plist + cpzed-build.json)
+  interval FILE MIN_S MAX_PER_DAY [NOW]   exit 0 when the min interval and daily cap allow a deploy
+  eligible REPO LEDGER GH [--base REF] [--deployed SHA] [--quiet-s S] [--now T]
+  procs-of [--verbose] PATH   pids (and argv) of processes running PATH, read from the kernel (resolved, case-insensitive)
+  included REPO UPSTREAM TARGET   the fork-only first-parent commits a deploy of TARGET carries
+  same-exe PID PATH      exit 0 when PID's executable is PATH
+  json-count FILE        number of entries in a JSON array (or the only list value) read from FILE
+Never forces anything, never kills anything.
+"""
+import fcntl, json, os, plistlib, re, shlex, subprocess, sys, tempfile, time
+
+# ---------------------------------------------------------------- state ----
+
+class StateError(Exception):
+    pass
+
+HEX = re.compile(r"^[0-9a-f]{7,64}$")
+
+def validate_state(d):
+    def isint(v): return isinstance(v, int) and not isinstance(v, bool)
+    def num(v): return isint(v) or (isinstance(v, str) and v.isdigit())
+    if "n" in d and not (num(d["n"]) and int(d["n"]) >= 1): raise StateError("n must be an integer >= 1")
+    for k in ("phase", "last_blocked", "stock_zip", "first_swap"):
+        if k in d and not isinstance(d[k], (str, int)): raise StateError(k + " must be a string")
+    for k in ("deployed_sha", "failed_sha", "target_sha"):
+        if k in d and not (isinstance(d[k], str) and (d[k] == "" or HEX.match(d[k]))): raise StateError(k + " must be a hex sha or empty")
+    if "history" in d:
+        if not isinstance(d["history"], list) or not all(isinstance(h, dict) and isint(h.get("at", 0)) for h in d["history"]):
+            raise StateError("history must be a list of objects with an integer 'at'")
+    if "sessions" in d and not isinstance(d["sessions"], list): raise StateError("sessions must be a list")
+    if "quiescent_at" in d and not num(d["quiescent_at"]):
+        raise StateError("quiescent_at must be an integer")
+
+def state_load(path):
+    """A MISSING file is an empty state. Anything else that is not a valid state object is an error:
+    never treat a corrupt state as empty (it would be written back and reset n, deployed_sha, phase)."""
+    try:
+        f = open(path)
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise StateError("cannot read %s: %s" % (path, e))
+    with f:
+        try:
+            d = json.load(f)
+        except ValueError as e:
+            raise StateError("%s is not valid JSON: %s" % (path, e))
+    if not isinstance(d, dict):
+        raise StateError("%s does not hold a JSON object" % path)
+    validate_state(d)
+    return d
+
+def state_op(path, argv):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lk = open(path + ".flock", "a")
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        try:
+            d = state_load(path)
+        except StateError as e:
+            print("state: " + str(e), file=sys.stderr)
+            return 3
+        op = argv[0]
+        if op == "check":
+            return 0
+        if op == "get":
+            v = d.get(argv[1])
+            print("" if v is None else v if isinstance(v, str) else json.dumps(v))
+            return 0
+        if op == "dump":
+            print(json.dumps(d, indent=1, sort_keys=True))
+            return 0
+        if op == "set":
+            d[argv[1]] = argv[2]
+        elif op == "setj":
+            d[argv[1]] = json.loads(argv[2])
+        elif op == "del":
+            d.pop(argv[1], None)
+        elif op == "addhist":
+            d.setdefault("history", []).append(json.loads(argv[1]))
+            d["history"] = d["history"][-200:]
+        else:
+            print("state: unknown op " + op, file=sys.stderr)
+            return 2
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".state.")
+        with os.fdopen(fd, "w") as f:
+            json.dump(d, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return 0
+    finally:
+        lk.close()
+
+# ------------------------------------------------------------------ swap ---
+
+RENAME_SWAP, RENAME_EXCL = 0x2, 0x4
+ALLOWED_RM_ROOTS = {".cpzed-stage", "ring", "backup", "tmp", "stock"}
+
+def _renamex(a, b, flags):
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.renamex_np(os.fsencode(a), os.fsencode(b), flags) != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e), "%s -> %s" % (a, b))
+
+def _plain_dir(p):
+    return os.path.isdir(p) and not os.path.islink(p)
+
+def swap_op(argv):
+    op = argv[0]
+    if op == "exchange":
+        a, b = argv[1], argv[2]
+        for p in (a, b):
+            if not p.endswith(".app") or not _plain_dir(p):
+                print("swap: not a plain .app directory: " + p, file=sys.stderr)
+                return 1
+        if os.stat(a).st_dev != os.stat(b).st_dev:
+            print("swap: different volumes, refusing", file=sys.stderr)
+            return 1
+        _renamex(a, b, RENAME_SWAP)
+        return 0
+    if op == "rename":
+        a, b = argv[1], argv[2]
+        if not a.endswith(".app") or not _plain_dir(a):
+            print("swap: source is not a plain .app directory: " + a, file=sys.stderr)
+            return 1
+        if os.path.lexists(b):
+            print("swap: destination exists: " + b, file=sys.stderr)
+            return 1
+        _renamex(a, b, RENAME_EXCL)
+        return 0
+    if op == "rm":
+        path, root, anchors = argv[1], argv[2], argv[3:]
+        rr = os.path.realpath(root)
+        if os.path.basename(rr).lower() not in ALLOWED_RM_ROOTS:
+            print("swap rm: root %s is not an allowlisted directory" % root, file=sys.stderr)
+            return 1
+        if not any(os.path.dirname(rr).lower() == os.path.realpath(a).lower() for a in anchors):
+            print("swap rm: root %s is not directly inside an allowed anchor %s" % (root, anchors), file=sys.stderr)
+            return 1
+        if os.path.islink(path):
+            print("swap rm: refusing a symlink: " + path, file=sys.stderr)
+            return 1
+        rp = os.path.realpath(path)
+        if not (rp.lower() + "/").startswith(rr.lower().rstrip("/") + "/") or rp.lower() == rr.lower().rstrip("/"):
+            print("swap rm: %s is not strictly inside %s" % (path, root), file=sys.stderr)
+            return 1
+        if os.path.basename(rp) == "CPZed.app" and os.path.basename(rr) != ".cpzed-stage":
+            print("swap rm: refusing an installed-looking CPZed.app outside the stage dir", file=sys.stderr)
+            return 1
+        if not os.path.lexists(rp):
+            return 0
+        import shutil
+        if os.path.isdir(rp):
+            shutil.rmtree(rp)
+        else:
+            os.unlink(rp)
+        return 0
+    if op == "probe":
+        d = tempfile.mkdtemp(dir=argv[1])
+        a, b = os.path.join(d, "A.app"), os.path.join(d, "B.app")
+        os.mkdir(a); os.mkdir(b)
+        open(os.path.join(a, "id"), "w").write("A")
+        open(os.path.join(b, "id"), "w").write("B")
+        _renamex(a, b, RENAME_SWAP)
+        ok = open(os.path.join(a, "id")).read() == "B" and open(os.path.join(b, "id")).read() == "A"
+        import shutil
+        shutil.rmtree(d)
+        print("atomic-swap-ok" if ok else "atomic-swap-FAILED")
+        return 0 if ok else 1
+    return 2
+
+# --------------------------------------------------------- process walk ----
+
+def ps_table():
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,etime=,time=,command="],
+                         capture_output=True, text=True).stdout
+    rows = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$", line)
+        if m:
+            rows[int(m[1])] = dict(pid=int(m[1]), ppid=int(m[2]), etime=m[3], time=m[4], cmd=m[5])
+    return rows
+
+def cpu_seconds(t):  # [dd-][hh:]mm:ss[.ss]
+    days = 0
+    if "-" in t:
+        d, t = t.split("-", 1); days = int(d)
+    parts = [float(x) for x in t.split(":")]
+    s = 0.0
+    for p in parts:
+        s = s * 60 + p
+    return days * 86400 + s
+
+def descendants(root, rows=None):
+    rows = rows or ps_table()
+    kids = {}
+    for r in rows.values():
+        kids.setdefault(r["ppid"], []).append(r)
+    out, stack = [], [root]
+    while stack:
+        for r in kids.get(stack.pop(), []):
+            out.append(r); stack.append(r["pid"])
+    return out
+
+INTERPRETERS = {"sh", "bash", "zsh", "dash", "python", "python3", "perl", "node", "env", "ruby"}
+BUSY_NAMES = {"cargo", "rustc", "cc", "clang", "clang++", "ld", "xcodebuild", "swift", "swiftc", "npm", "pnpm",
+              "pytest", "nextest", "cargo-nextest"}
+
+def is_interp(name):
+    n = name.lower()
+    return n in INTERPRETERS or n.startswith("python")
+
+def tool_name(cmd):
+    toks = cmd.split()
+    if not toks:
+        return ""
+    n = os.path.basename(toks[0])
+    if is_interp(n):
+        for t in toks[1:]:
+            if t.startswith("-"):
+                continue
+            return os.path.basename(t)
+    return n
+
+def is_busy(row):
+    n = tool_name(row["cmd"])
+    if n in BUSY_NAMES:
+        return True
+    if n == "git" and "fsmonitor" not in row["cmd"]:
+        return True
+    return False
+
+def cwd_of(pid):
+    r = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+def session_of(argv):
+    """Resume handle from a claude argv: --resume/-r value, --session-id, --name/-n, else None."""
+    for flags in (("--resume", "-r"), ("--session-id",), ("--name", "-n")):
+        for i, a in enumerate(argv):
+            for f in flags:
+                if a == f and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    return argv[i + 1]
+                if a.startswith(f + "="):
+                    return a.split("=", 1)[1]
+    return None
+
+def norm_path(p):
+    """APFS is case-insensitive and paths may be symlinked: compare resolved, lower-cased paths."""
+    return os.path.realpath(p).lower()
+
+def procargs(pid):
+    """(exec_path, argv) straight from the kernel (sysctl KERN_PROCARGS2): exact strings, spaces preserved."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, int(pid))        # CTL_KERN, KERN_PROCARGS2
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 8:
+        return None
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = buf.raw[:size.value]
+    argc = int.from_bytes(raw[:4], "little")
+    path, _, rest = raw[4:].partition(b"\0")
+    rest = rest.lstrip(b"\0")
+    argv = [x.decode(errors="replace") for x in rest.split(b"\0")[:argc]]
+    return path.decode(errors="replace"), argv
+
+def exe_and_argv(pid):
+    """(normalised executable, argv). For interpreted scripts the executable is the script path."""
+    pa = procargs(pid)
+    if pa is None:
+        return None
+    path, argv = pa
+    if is_interp(os.path.basename(path)):
+        for t in argv[1:]:
+            if not t.startswith("-"):
+                return norm_path(t), argv
+        return "", argv
+    return norm_path(path), argv
+
+def procs_of(path):
+    """[(pid, argv)] of processes running PATH. Zed's own `--crash-handler` helper runs the same executable and may
+    outlive the app for a moment: it is not an instance."""
+    want = norm_path(path)
+    out = []
+    for pid in ps_table():
+        r = exe_and_argv(pid)
+        if r and r[0] == want and "--crash-handler" not in r[1]:
+            out.append((pid, r[1]))
+    return out
+
+def same_exe(pid, path):
+    r = exe_and_argv(pid)
+    return bool(r) and r[0] == norm_path(path)
+
+# ----------------------------------------------------------- restamp -------
+
+def restamp(app, n, sha):
+    plist = os.path.join(app, "Contents", "Info.plist")
+    with open(plist, "rb") as f:
+        pl = plistlib.load(f)
+    ver = pl.get("CFBundleShortVersionString", "0.0.0")
+    base = re.sub(r"-cpzed\.\d+$", "", ver)
+    pl["CFBundleShortVersionString"] = "%s-cpzed.%d" % (base, int(n))
+    with open(plist, "wb") as f:
+        plistlib.dump(pl, f)
+    bj = os.path.join(app, "Contents", "Resources", "cpzed-build.json")
+    try:
+        d = json.load(open(bj))
+    except (OSError, ValueError):
+        d = {}
+    d.update({"n": int(n), "restamped_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "restamped_from_n": d.get("n")})
+    if sha:
+        d["sha"] = sha
+    with open(bj, "w") as f:
+        json.dump(d, f, indent=2)
+    return 0
+
+# ----------------------------------------------------- interval / daily ----
+
+def interval_ok(statefile, min_s, per_day, now=None):
+    now = int(now or time.time())
+    try:
+        st = state_load(statefile)
+    except StateError as e:
+        print("state unreadable: %s" % e); return 1
+    hist = [h for h in st.get("history", []) if h.get("kind") == "deploy"]
+    if hist:
+        last = max(h["at"] for h in hist)
+        if now - last < min_s:
+            print("minimum interval: last deploy %ds ago, need %ds" % (now - last, min_s))
+            return 1
+    n24 = sum(1 for h in hist if now - h["at"] < 86400)
+    if n24 >= per_day:
+        print("daily cap: %d deploys in the last 24h (max %d)" % (n24, per_day))
+        return 1
+    return 0
+
+# ----------------------------------------------------------- eligible -----
+
+PR_RE = [re.compile(r"\(#(\d+)\)\s*$"), re.compile(r"^Merge pull request #(\d+)\b")]
+
+def git(repo, *a):
+    r = subprocess.run(["git", "-C", repo] + list(a), capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("git %s: %s" % (" ".join(a), r.stderr.strip()))
+    return r.stdout
+
+def gh_pr(ghcmd, n):
+    r = subprocess.run(shlex.split(ghcmd) + ["pr", "view", str(n), "--repo", "jclyons/zed", "--json", "state,headRefOid,mergeCommit"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return json.loads(r.stdout)
+
+def commit_eligible(c, subject, ledger, ghcmd):
+    n = None
+    for rx in PR_RE:
+        m = rx.search(subject)
+        if m:
+            n = int(m[1]); break
+    if n is None:
+        return False, "no PR number in subject"
+    ent = next((p for p in ledger.get("prs", []) if p.get("pr") == n), None)
+    if not ent:
+        return False, "PR #%d not in merge-ledger" % n
+    if ent.get("reviewer") != "clean" or ent.get("tester") != "clean":
+        return False, "PR #%d reviewer/tester not clean" % n
+    if ent.get("hold"):
+        return False, "PR #%d on hold" % n
+    if ent.get("user_approved") is not True:
+        return False, "PR #%d not user_approved" % n
+    pr = gh_pr(ghcmd, n)
+    if not pr:
+        return False, "PR #%d: gh lookup failed" % n
+    if pr.get("state") != "MERGED":
+        return False, "PR #%d not merged" % n
+    if (pr.get("mergeCommit") or {}).get("oid") != c:
+        return False, "PR #%d merge commit is not this commit" % n
+    if pr.get("headRefOid") != ent.get("sha"):
+        return False, "PR #%d head %s != ledger sha" % (n, pr.get("headRefOid"))
+    return True, "PR #%d" % n
+
+def eligible(repo, ledger_path, ghcmd, base="fork/main", deployed=None, quiet_s=1800, now=None, window=50, upstream="origin/main"):
+    now = int(now or time.time())
+    try:
+        ledger = json.load(open(ledger_path))
+    except (OSError, ValueError) as e:
+        print("blocked: cannot read ledger: %s" % e); return 1
+    tip = git(repo, "log", "-1", "--format=%H%x09%ct%x09%s", base).strip().split("\t", 2)
+    tip_time = int(tip[1])
+    if deployed:
+        # Strict chain: EVERY first-parent commit after the deployed one must be merged with its approvals.
+        r = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", deployed, base], capture_output=True)
+        if r.returncode != 0:
+            print("blocked: deployed commit %s is not an ancestor of %s (history rewritten or unknown); refusing, needs a human" % (deployed, base)); return 1
+        chain = [l.split("\t", 2) for l in git(repo, "rev-list", "--first-parent", "--reverse", "--format=%H%x09%ct%x09%s", "%s..%s" % (deployed, base)).splitlines() if "\t" in l]
+        if not chain:
+            print("nothing new since " + deployed); return 3
+        target = None
+        for c, _t, s in chain:
+            ok, why = commit_eligible(c, s, ledger, ghcmd)
+            if not ok:
+                if target is None:
+                    print("blocked by %s: %s" % (c, why)); return 1
+                break
+            target = c
+    else:
+        # First ever deploy (no deployed_sha): all earlier history predates the ledger, so the newest eligible
+        # commit in the window is accepted (documented in docs/fork/DEPLOY.md).
+        commits = [l.split("\t", 2) for l in git(repo, "log", "--first-parent", "-n", str(window), "--format=%H%x09%ct%x09%s", base).splitlines()]
+        target = None
+        for c, _t, s in commits:
+            ok, _ = commit_eligible(c, s, ledger, ghcmd)
+            if ok:
+                target = c; break
+        if target is None:
+            print("blocked: no eligible commit in the last %d on %s" % (window, base)); return 1
+        # The first deploy ships every fork-only commit up to the target: ALL of them must be approved, not just the target.
+        if subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", upstream], capture_output=True).returncode != 0:
+            print("blocked: cannot list the fork-only commits: %s is missing (fetch the upstream remote)" % upstream); return 1
+        for l in git(repo, "rev-list", "--first-parent", "--reverse", "--format=%H%x09%ct%x09%s", "%s..%s" % (upstream, target)).splitlines():
+            if "\t" not in l:
+                continue
+            c, _t, sj = l.split("\t", 2)
+            ok, why = commit_eligible(c, sj, ledger, ghcmd)
+            if not ok:
+                print("blocked by %s: %s (the first deploy needs every fork-only commit approved)" % (c, why)); return 1
+    if now - tip_time < quiet_s:
+        print("coalescing: %s tip is %ds old, need %ds quiet" % (base, now - tip_time, quiet_s)); return 4
+    print(target)
+    return 0
+
+# ---------------------------------------------------------------- main ----
+
+def main(a):
+    if len(a) < 2:
+        print(__doc__); return 2
+    c = a[0]
+    if c == "state":
+        return state_op(a[1], a[2:])
+    if c == "swap":
+        return swap_op(a[1:])
+    if c == "walk":
+        for r in descendants(int(a[1])):
+            print(json.dumps(r))
+        return 0
+    if c == "procs-of":
+        verbose = "--verbose" in a
+        for p, argv in procs_of([x for x in a[1:] if x != "--verbose"][0]):
+            print("%d %s" % (p, (os.path.basename(argv[0]) + " " + " ".join(argv[1:]))[:300]) if verbose else p)
+        return 0
+    if c == "included":      # included REPO UPSTREAM TARGET: the fork-only first-parent commits a deploy of TARGET carries
+        try:
+            print(git(a[1], "log", "--first-parent", "--reverse", "--format=%h %s", "%s..%s" % (a[2], a[3])).strip())
+        except RuntimeError as e:
+            print("(cannot list: %s)" % e)
+        return 0
+    if c == "same-exe":
+        return 0 if same_exe(a[1], a[2]) else 1
+    if c == "busy":
+        for r in descendants(int(a[1])):
+            if is_busy(r):
+                print("%d %s" % (r["pid"], r["cmd"][:120]))
+        return 0
+    if c == "claudes":
+        out = []
+        for r in descendants(int(a[1])):
+            if tool_name(r["cmd"]) == "claude":
+                try:
+                    argv = shlex.split(r["cmd"])
+                except ValueError:          # ps output is not shell-quoted: fall back to whitespace
+                    argv = r["cmd"].split()
+                out.append(dict(pid=r["pid"], cwd=cwd_of(r["pid"]), argv=argv, session=session_of(argv)))
+        print(json.dumps(out))
+        return 0
+    if c == "cpu":
+        rows = ps_table()
+        for p in a[1:]:
+            r = rows.get(int(p))
+            if r:
+                print("%s %.2f" % (p, cpu_seconds(r["time"])))
+        return 0
+    if c == "resume":
+        try:
+            sess = state_load(a[1]).get("sessions", [])
+        except StateError as e:
+            print("state: %s" % e, file=sys.stderr); return 3
+        for s in sess:
+            cwd = shlex.quote(s.get("cwd") or "~")
+            h = s.get("session")
+            print("cd %s && claude %s" % (cwd, "--resume " + shlex.quote(h) if h else "--continue"))
+        return 0
+    if c == "restamp":
+        return restamp(a[1], a[2], a[3])
+    if c == "interval":
+        return interval_ok(a[1], int(a[2]), int(a[3]), a[4] if len(a) > 4 else None)
+    if c == "eligible":
+        kw, i = {}, 4
+        while i < len(a):
+            k = a[i]
+            kw[{"--base": "base", "--deployed": "deployed", "--quiet-s": "quiet_s", "--now": "now", "--window": "window", "--upstream": "upstream"}[k]] = a[i + 1]
+            i += 2
+        for k in ("quiet_s", "now", "window"):
+            if k in kw: kw[k] = int(kw[k])
+        return eligible(a[1], a[2], a[3], **kw)
+    if c == "json-count":
+        try:
+            d = json.load(open(a[1]))
+        except (OSError, ValueError):
+            return 1
+        if isinstance(d, dict):
+            ls = [v for v in d.values() if isinstance(v, list)]
+            d = ls[0] if len(ls) == 1 else []
+        print(len(d)); return 0
+    print("unknown subcommand " + c, file=sys.stderr)
+    return 2
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

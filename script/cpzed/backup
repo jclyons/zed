@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# script/cpzed/backup: backups and the rollback ring (CPZED-23). Every delete goes through
+# `deploy-util swap rm`, which only removes things strictly inside an allowlisted directory.
+#
+#   backup data                 ditto db/ threads/ (Zed data) and ~/.config/zed into backup/<stamp>/ (keeps newest 5)
+#   backup ring-add APP         zip a bundle into ring/<n>-<sha7>.zip (ditto --keepParent) and trim the ring to 3
+#   backup stock-add APP        archive the stock app into stock/Zed-<ver>.zip and verify it by unzip + codesign
+#   backup stock-verify ZIP     recorded sha256 matches and a temp extract passes codesign --verify --deep --strict
+#   backup latest-stock         print the newest stock archive path
+# Prints the created path on stdout.
+set -euo pipefail
+DL_NAME=backup
+. "$(cd "$(dirname "$0")" && pwd)/deploy-lib.sh"
+dl_init
+mkdir -p "$HOME_DIR"/{ring,stock,backup}
+trim() { # dir keep
+  local f i=0
+  while IFS= read -r f; do
+    i=$((i + 1)); (( i > $2 )) || continue
+    rm_in "$1/$f" "$1" || true
+  done < <(ls -1t "$1" | grep -v "\.part$")
+}
+case "${1:-}" in
+  data)
+    d="$HOME_DIR/backup/$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+    mkdir -p "$d"
+    for src in "$DATA_DIR/db" "$DATA_DIR/threads" "$CONF_DIR"; do
+      [[ -e "$src" ]] || { log "backup: $src absent, skipped"; continue; }
+      name=$(basename "$src"); [[ "$src" == "$CONF_DIR" ]] && name=config-zed
+      ditto "$src" "$d/$name" || dl_die "backup of $src failed" 3
+      [[ -e "$d/$name" ]] || dl_die "backup of $src missing after copy" 3
+    done
+    trim "$HOME_DIR/backup" 5
+    echo "$d" ;;
+  ring-add)
+    app=${2:?}; n=$(app_n "$app"); sha=$(app_sha "$app")
+    [[ "$n" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{7,40}$ ]] || dl_die "bad or missing cpzed-build.json in $app (n='$n' sha='$sha')" 2
+    z="$HOME_DIR/ring/$n-${sha:0:7}.zip"
+    ditto -c -k --keepParent "$app" "$z.part" && mv "$z.part" "$z"
+    trim "$HOME_DIR/ring" 3
+    echo "$z" ;;
+  stock-add)
+    app=${2:?}; ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
+    z="$HOME_DIR/stock/Zed-$ver.zip"
+    ditto -c -k --keepParent "$app" "$z.part"
+    mkdir -p "$HOME_DIR/tmp"; chk=$(mktemp -d "$HOME_DIR/tmp/stockchk.XXXXXX")
+    ditto -x -k "$z.part" "$chk"
+    if [[ -n "${CPZED_VERIFY_CMD:-}" ]]; then v=(dl_run CPZED_VERIFY_CMD); else v=(/usr/bin/codesign --verify --deep --strict); fi
+    if ! "${v[@]}" "$chk/$(basename "$app")"; then
+      rm -f "$z.part"; rm_in "$chk" "$HOME_DIR/tmp" || true; dl_die "stock archive failed verification" 4
+    fi
+    rm_in "$chk" "$HOME_DIR/tmp"; mv "$z.part" "$z"
+    shasum -a 256 "$z" | cut -d' ' -f1 > "$z.sha256"; echo "$z" ;;
+  stock-verify)  # zip: recorded sha256 matches AND an extract passes the codesign verification
+    z=${2:?}; [[ -f "$z" && -f "$z.sha256" ]] || dl_die "stock archive or its recorded sha256 is missing: $z" 4
+    [[ "$(shasum -a 256 "$z" | cut -d' ' -f1)" == "$(cat "$z.sha256")" ]] || dl_die "stock archive sha256 does not match the recorded one" 4
+    mkdir -p "$HOME_DIR/tmp"; chk=$(mktemp -d "$HOME_DIR/tmp/stockchk.XXXXXX")
+    ditto -x -k "$z" "$chk"
+    if [[ -n "${CPZED_VERIFY_CMD:-}" ]]; then v=(dl_run CPZED_VERIFY_CMD); else v=(/usr/bin/codesign --verify --deep --strict); fi
+    if "${v[@]}" "$chk/Zed.app"; then rc=0; else rc=1; fi
+    rm_in "$chk" "$HOME_DIR/tmp" || true
+    (( rc == 0 )) || dl_die "stock archive failed verification" 4
+    echo verified ;;
+  latest-stock) ls -1t "$HOME_DIR/stock"/Zed-*.zip 2>/dev/null | head -1 ;;
+  *) echo "usage: backup data | ring-add APP | stock-add APP | stock-verify ZIP | latest-stock" >&2; exit 64 ;;
+esac
