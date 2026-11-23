@@ -20,9 +20,9 @@ fn init(cx: &mut TestAppContext) {
     static NEXT_DB: AtomicUsize = AtomicUsize::new(0);
     let id = NEXT_DB.fetch_add(1, Ordering::SeqCst);
     cx.update(|cx| {
-        cx.set_global(agent_ui::thread_metadata_store::TestMetadataDbName(format!(
-            "HIERARCHY_THREAD_METADATA_{id}"
-        )));
+        cx.set_global(agent_ui::thread_metadata_store::TestMetadataDbName(
+            format!("HIERARCHY_THREAD_METADATA_{id}"),
+        ));
         cx.set_global(TestTerminalMetadataDbName(format!(
             "HIERARCHY_TERMINAL_METADATA_{id}"
         )));
@@ -59,9 +59,8 @@ async fn open_window(
     multi_workspace.update_in(&mut vcx, |mw, window, cx| {
         mw.test_add_workspace(project_b, window, cx);
     });
-    let sidebar = vcx.update(|window, cx| {
-        cx.new(|cx| Sidebar::new(multi_workspace.clone(), window, cx))
-    });
+    let sidebar =
+        vcx.update(|window, cx| cx.new(|cx| Sidebar::new(multi_workspace.clone(), window, cx)));
     multi_workspace.update(&mut vcx, |mw, cx| mw.register_sidebar(sidebar.clone(), cx));
     vcx.run_until_parked();
     multi_workspace.update_in(&mut vcx, |mw, window, cx| mw.toggle_sidebar(window, cx));
@@ -153,7 +152,9 @@ fn rows(sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext) -> Vec<String> {
                     }
                     text
                 }
-                ListEntry::Thread(thread) => format!("  thread {}", thread.metadata.display_title()),
+                ListEntry::Thread(thread) => {
+                    format!("  thread {}", thread.metadata.display_title())
+                }
             })
             .collect()
     })
@@ -165,9 +166,9 @@ fn entry_index(sidebar: &Entity<Sidebar>, id: TerminalId, cx: &mut VisualTestCon
             .contents
             .entries
             .iter()
-            .position(|entry| {
-                matches!(entry, ListEntry::Terminal(t) if t.metadata.terminal_id == id)
-            })
+            .position(
+                |entry| matches!(entry, ListEntry::Terminal(t) if t.metadata.terminal_id == id),
+            )
             .expect("terminal row")
     })
 }
@@ -278,7 +279,9 @@ async fn test_nesting_collapse_depth_and_keys(cx: &mut TestAppContext) {
     );
 
     // Collapsed: "+2" and the children are gone.
-    edit(&mut cx, |store, cx| store.set_row_collapsed(&key(parent), true, cx));
+    edit(&mut cx, |store, cx| {
+        store.set_row_collapsed(&key(parent), true, cx)
+    });
     assert_eq!(
         rows(&sidebar, &mut cx),
         ["[project-b]", "[project-a]", "  parent +2"]
@@ -315,11 +318,18 @@ async fn test_deep_chain_clamps_indent_and_shows_depth_badges(cx: &mut TestAppCo
     let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
     let mut chain = Vec::new();
     for ix in 0..10 {
-        chain.push(add_terminal(&mut cx, &format!("t{ix}"), "/project-a", 10 + ix));
+        chain.push(add_terminal(
+            &mut cx,
+            &format!("t{ix}"),
+            "/project-a",
+            10 + ix,
+        ));
     }
     edit(&mut cx, |store, cx| {
         for pair in chain.windows(2) {
-            store.set_parent(&key(pair[1]), Some(&key(pair[0])), cx).unwrap();
+            store
+                .set_parent(&key(pair[1]), Some(&key(pair[0])), cx)
+                .unwrap();
         }
     });
     let rendered = rows(&sidebar, &mut cx);
@@ -341,7 +351,9 @@ async fn test_cross_project_child_and_parent_close_lifts_children(cx: &mut TestA
     let child = add_terminal(&mut cx, "child", "/project-b", 20);
     let other = add_terminal(&mut cx, "other", "/project-b", 30);
     edit(&mut cx, |store, cx| {
-        store.set_parent(&key(child), Some(&key(parent)), cx).unwrap();
+        store
+            .set_parent(&key(child), Some(&key(parent)), cx)
+            .unwrap();
     });
     assert_eq!(
         rows(&sidebar, &mut cx),
@@ -375,7 +387,9 @@ async fn test_search_is_flat(cx: &mut TestAppContext) {
     let child = add_terminal(&mut cx, "build child", "/project-a", 20);
     let g = group("/project-a");
     edit(&mut cx, |store, cx| {
-        store.set_parent(&key(child), Some(&key(parent)), cx).unwrap();
+        store
+            .set_parent(&key(child), Some(&key(parent)), cx)
+            .unwrap();
         let (id, _) = store.create_section(&g, "Alpha", cx).unwrap();
         store.set_section(&key(parent), &g, Some(&id), cx).unwrap();
     });
@@ -387,10 +401,7 @@ async fn test_search_is_flat(cx: &mut TestAppContext) {
             .update(cx, |editor, cx| editor.set_text("build", window, cx));
     });
     let searched = rows(&sidebar, &mut cx);
-    assert_eq!(
-        searched,
-        ["[project-a]", "  build parent", "  build child"]
-    );
+    assert_eq!(searched, ["[project-a]", "  build parent", "  build child"]);
 }
 
 // 6. The real sequence: a manager with builders in a "Personas" section, a second project with
@@ -413,11 +424,17 @@ async fn test_real_sequence_survives_restart_and_shows_in_two_windows(cx: &mut T
     let gb = group("/project-b");
     edit(&mut cx1, |store, cx| {
         let (personas, _) = store.create_section(&ga, "Personas", cx).unwrap();
-        store.set_section(&key(manager), &ga, Some(&personas), cx).unwrap();
+        store
+            .set_section(&key(manager), &ga, Some(&personas), cx)
+            .unwrap();
         for builder in &builders {
-            store.set_parent(&key(*builder), Some(&key(manager)), cx).unwrap();
+            store
+                .set_parent(&key(*builder), Some(&key(manager)), cx)
+                .unwrap();
         }
-        store.set_parent(&key(sub), Some(&key(builders[0])), cx).unwrap();
+        store
+            .set_parent(&key(sub), Some(&key(builders[0])), cx)
+            .unwrap();
         let (one, _) = store.create_section(&gb, "One", cx).unwrap();
         let (two, _) = store.create_section(&gb, "Two", cx).unwrap();
         store.set_section(&key(p1), &gb, Some(&one), cx).unwrap();
@@ -443,9 +460,8 @@ async fn test_real_sequence_survives_restart_and_shows_in_two_windows(cx: &mut T
     assert_eq!(rows(&sidebar2, &mut cx2), expected);
 
     // Simulate a restart: flush to the in-memory KVP, throw the state away, reload it.
-    let flush = cx1.update(|_, cx| {
-        HierarchyStore::global(cx).update(cx, |store, cx| store.flush(cx))
-    });
+    let flush =
+        cx1.update(|_, cx| HierarchyStore::global(cx).update(cx, |store, cx| store.flush(cx)));
     flush.await;
     cx1.update(|_, cx| {
         let db = db::kvp::KeyValueStore::global(cx);
@@ -454,7 +470,9 @@ async fn test_real_sequence_survives_restart_and_shows_in_two_windows(cx: &mut T
     assert_eq!(rows(&sidebar, &mut cx1), expected);
 
     // Expanding the manager after the reload shows the whole tree, sub-builder at depth 2.
-    edit(&mut cx1, |store, cx| store.set_row_collapsed(&key(manager), false, cx));
+    edit(&mut cx1, |store, cx| {
+        store.set_row_collapsed(&key(manager), false, cx)
+    });
     let tree = rows(&sidebar2, &mut cx2);
     assert_eq!(tree[6], "    manager");
     assert_eq!(tree[7].trim(), "builder1");
@@ -486,11 +504,17 @@ async fn test_collapsed_parent_rolls_up_notifications(cx: &mut TestAppContext) {
     }
     cx.run_until_parked();
     edit(&mut cx, |store, cx| {
-        store.set_parent(&key(ids[1]), Some(&key(ids[0])), cx).unwrap();
-        store.set_parent(&key(ids[2]), Some(&key(ids[1])), cx).unwrap();
+        store
+            .set_parent(&key(ids[1]), Some(&key(ids[0])), cx)
+            .unwrap();
+        store
+            .set_parent(&key(ids[2]), Some(&key(ids[1])), cx)
+            .unwrap();
         store.set_row_collapsed(&key(ids[0]), true, cx);
     });
-    panel.update(&mut cx, |panel, cx| panel.emit_test_terminal_bell(ids[2], cx));
+    panel.update(&mut cx, |panel, cx| {
+        panel.emit_test_terminal_bell(ids[2], cx)
+    });
     refresh(&sidebar, &mut cx);
     sidebar.read_with(&cx, |sidebar, _| {
         let layout = &sidebar.hierarchy.row_layout[&key(ids[0])];

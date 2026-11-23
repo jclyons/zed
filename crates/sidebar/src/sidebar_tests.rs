@@ -7035,7 +7035,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) | ListEntry::Section(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_)
+                | ListEntry::Section(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -7121,7 +7123,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) | ListEntry::Section(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_)
+                | ListEntry::Section(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -7160,7 +7164,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) | ListEntry::Section(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Terminal(_)
+                | ListEntry::Section(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });

@@ -19,6 +19,9 @@ use super::*;
 /// Indent step in px per depth level, and the depth at which the indent stops growing.
 const INDENT_STEP: f32 = 12.;
 pub(crate) const MAX_INDENT_DEPTH: usize = 6;
+/// Shown when the stored hierarchy was written by a newer CPZed: edits are not saved.
+const READ_ONLY_NOTICE: &str =
+    "Sections and nesting were saved by a newer CPZed: edits are disabled and not saved.";
 
 /// What `render_*` needs to know about a nested row. Filled in `rebuild_contents`.
 #[derive(Clone, Debug)]
@@ -45,7 +48,9 @@ pub(crate) struct SectionEntry {
 
 pub(crate) enum SectionEditKind {
     /// Create a section; when `then_move` is set, put that row into it afterwards.
-    New { then_move: Option<(RowKey, GroupKey)> },
+    New {
+        then_move: Option<(RowKey, GroupKey)>,
+    },
     Rename(SectionId),
 }
 
@@ -257,8 +262,7 @@ pub(crate) fn arrange_deferred(
                             has_children,
                             collapsed,
                             rollup,
-                            foreign_project: foreign_project
-                                .then(|| project_name(&own_group)),
+                            foreign_project: foreign_project.then(|| project_name(&own_group)),
                             group: own_group,
                         },
                     );
@@ -310,10 +314,7 @@ fn rollup_label(rollup: &Rollup, include_count: bool) -> String {
     parts.join(" · ")
 }
 
-fn store_update(
-    cx: &mut App,
-    f: impl FnOnce(&mut HierarchyStore, &mut Context<HierarchyStore>),
-) {
+fn store_update(cx: &mut App, f: impl FnOnce(&mut HierarchyStore, &mut Context<HierarchyStore>)) {
     if let Some(store) = HierarchyStore::try_global(cx) {
         store.update(cx, f);
     }
@@ -549,17 +550,21 @@ impl Sidebar {
                             });
                         }
                     })
-                    .entry(if collapsed { "Expand" } else { "Collapse" }, None, {
-                        let group = group.clone();
-                        let id = id.clone();
-                        move |_window, cx| {
-                            store_update(cx, |store, cx| {
-                                store
-                                    .set_section_collapsed(&group, &id, !collapsed, cx)
-                                    .ok();
-                            });
-                        }
-                    })
+                    .entry(
+                        if collapsed { "Expand" } else { "Collapse" },
+                        None,
+                        {
+                            let group = group.clone();
+                            let id = id.clone();
+                            move |_window, cx| {
+                                store_update(cx, |store, cx| {
+                                    store
+                                        .set_section_collapsed(&group, &id, !collapsed, cx)
+                                        .ok();
+                                });
+                            }
+                        },
+                    )
                 })
             })
             .into_any_element()
@@ -686,18 +691,20 @@ impl Sidebar {
         let name = edit.editor.read(cx).text(cx).trim().to_string();
         if !name.is_empty() {
             let group = edit.group.clone();
-            self.hierarchy.store.update(cx, |store, cx| match edit.kind {
-                SectionEditKind::New { then_move } => {
-                    if let Ok((id, _)) = store.create_section(&group, &name, cx)
-                        && let Some((row, row_group)) = then_move
-                    {
-                        store.set_section(&row, &row_group, Some(&id), cx).ok();
+            self.hierarchy
+                .store
+                .update(cx, |store, cx| match edit.kind {
+                    SectionEditKind::New { then_move } => {
+                        if let Ok((id, _)) = store.create_section(&group, &name, cx)
+                            && let Some((row, row_group)) = then_move
+                        {
+                            store.set_section(&row, &row_group, Some(&id), cx).ok();
+                        }
                     }
-                }
-                SectionEditKind::Rename(id) => {
-                    store.rename_section(&group, &id, &name, cx).ok();
-                }
-            });
+                    SectionEditKind::Rename(id) => {
+                        store.rename_section(&group, &id, &name, cx).ok();
+                    }
+                });
         }
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -710,6 +717,20 @@ impl Sidebar {
     }
 
     pub(crate) fn render_section_edit_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.hierarchy.store.read(cx).is_read_only() {
+            return Some(
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .child(
+                        Label::new(READ_ONLY_NOTICE)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .into_any_element(),
+            );
+        }
         let edit = self.hierarchy.section_edit.as_ref()?;
         let colors = cx.theme().colors();
         Some(
@@ -729,11 +750,11 @@ impl Sidebar {
                     .color(Color::Muted),
                 )
                 .child(div().flex_1().min_w_0().child(edit.editor.clone()))
-                .capture_action(cx.listener(
-                    |this, _: &editor::actions::Newline, window, cx| {
+                .capture_action(
+                    cx.listener(|this, _: &editor::actions::Newline, window, cx| {
                         this.confirm_section_edit(window, cx);
-                    },
-                ))
+                    }),
+                )
                 .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
                     this.cancel_section_edit(window, cx);
                 }))
@@ -770,6 +791,9 @@ impl Sidebar {
         let Some(store) = HierarchyStore::try_global(cx) else {
             return menu;
         };
+        if store.read(cx).is_read_only() {
+            return menu.separator().label(READ_ONLY_NOTICE);
+        }
         let snapshot = sidebar
             .read_with(cx, |sidebar, _| {
                 let layout = sidebar.hierarchy.row_layout.get(key)?.clone();
@@ -782,9 +806,7 @@ impl Sidebar {
         };
         let hierarchy = store.read(cx).hierarchy().clone();
         let has_parent = hierarchy.parents.contains_key(key);
-        let current_section = hierarchy
-            .section_of(key)
-            .map(|(_, id)| id.clone());
+        let current_section = hierarchy.section_of(key).map(|(_, id)| id.clone());
         let sections: Vec<(SectionId, String)> = hierarchy
             .sections
             .get(&layout.group)
@@ -893,9 +915,13 @@ impl Sidebar {
         menu: ContextMenu,
         sidebar: &WeakEntity<Sidebar>,
         project: &ProjectGroupKey,
+        cx: &App,
     ) -> ContextMenu {
         let sidebar = sidebar.clone();
         let group = group_key(project);
+        if HierarchyStore::try_global(cx).is_some_and(|store| store.read(cx).is_read_only()) {
+            return menu.separator().label(READ_ONLY_NOTICE);
+        }
         menu.separator()
             .entry("New Section…", None, move |window, cx| {
                 sidebar

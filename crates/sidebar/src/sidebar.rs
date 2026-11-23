@@ -455,7 +455,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } | ListEntry::Section(_) => None,
+            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } | ListEntry::Section(_) => {
+                None
+            }
         }
     }
 
@@ -3390,7 +3392,12 @@ impl Sidebar {
                                 )
                         });
 
-                        let menu = Self::append_project_menu(menu, &this_for_menu, &project_group_key);
+                        let menu = Self::append_project_menu(
+                            menu,
+                            &this_for_menu,
+                            &project_group_key,
+                            menu_cx,
+                        );
 
                         let project_group_key = project_group_key.clone();
                         let remove_multi_workspace = multi_workspace.clone();
@@ -4598,12 +4605,14 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Section(_)) => (0..ix).rev().find(|&i| {
-                matches!(
-                    self.contents.entries.get(i),
-                    Some(ListEntry::ProjectHeader { .. })
-                )
-            }),
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Section(_)) => {
+                (0..ix).rev().find(|&i| {
+                    matches!(
+                        self.contents.entries.get(i),
+                        Some(ListEntry::ProjectHeader { .. })
+                    )
+                })
+            }
             None => None,
         };
 
