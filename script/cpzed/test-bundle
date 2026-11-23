@@ -153,7 +153,12 @@ cat > "$S/codesign" <<'X'
 echo "codesign $*" >> "$STUB_LOG"
 [[ -n "${STUB_PLANT_OUT:-}" && "$*" == *probe* ]] && { mkdir -p "$STUB_PLANT_OUT"; echo x > "$STUB_PLANT_OUT/plant"; }
 [[ "${STUB_CS_FAIL:-0}" == 1 ]] && exit 1
-if [[ "$1" == -dv ]]; then echo "Authority=CPZed Local Signing" >&2; [[ "${STUB_RUNTIME:-1}" == 1 ]] && echo "flags=0x10000(runtime)" >&2 || echo "flags=0x2(adhoc)" >&2; fi
+# Mimic the REAL codesign: flags are on the CodeDirectory line at -dv; Authority= only at -dvv or higher.
+if [[ "$1" == -dv* ]]; then
+  if [[ "${STUB_RUNTIME:-1}" == 1 ]]; then echo "CodeDirectory v=20500 size=723532 flags=0x10000(runtime) hashes=22600+7 location=embedded" >&2
+  else echo "CodeDirectory v=20500 size=723532 flags=0x2(adhoc) hashes=22600+7 location=embedded" >&2; fi
+  [[ "$1" == -dvv* ]] && echo "Authority=CPZed Local Signing" >&2
+fi
 exit 0
 X
 cat > "$S/curl" <<'X'

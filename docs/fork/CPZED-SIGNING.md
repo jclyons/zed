@@ -15,3 +15,7 @@
 
 - `bundle` exits 7 when another `cargo`/`rustc` is running (the check is global on the shared Studio). `deploy` must retry, not fail.
 - `--skip-build` is for tests only (`CPZED_TEST_SKIP_BUILD=1`). The release `zed` binary must embed the full commit SHA being stamped, or `bundle` exits 11.
+
+## Versions
+
+`CFBundleShortVersionString` is `<cargo version>-cpzed.<n>`. `CFBundleVersion` is the 7-character commit SHA; the full SHA is in `Contents/Resources/cpzed-build.json`.
