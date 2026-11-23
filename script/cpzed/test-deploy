@@ -858,8 +858,29 @@ EOF
   newenv sigC; install_prev; mkpr 1; beh '{"no_listen":true}'; start_app "$E/apps/CPZed.app"; sre_on
   "$D/deploy" run >"$E/sig.out" 2>&1 & dp=$!
   poll 90 eval '[[ "$(statej phase)" == health ]]'; sleep 0.3; kill -TERM "$dp"; wait "$dp"; rc=$?; sre_off
-  ck signal-in-health-exit "$rc" 143; ck signal-in-health-hold "$([[ -e $E/home/hold ]] && echo y)" y; ckm signal-in-health-urgent "$(notes)" "interrupted after the swap"
+  ck signal-in-health-exit "$rc" 143; ck signal-in-health-hold "$([[ -e $E/home/hold ]] && echo y)" y; ckm signal-in-health-urgent "$(notes)" "The NEW build"
   ck signal-in-health-new-build-installed "$(sha_of "$E/apps/CPZed.app")" "$COMMIT"; kill_dummy
+}
+
+
+sc_signal_s1_s2() { # round 4: TERM during the quit wait; TERM during a slow swap exchange
+  local dp rc
+  # S1: the quit was sent, the app is exiting slowly, TERM lands in the wait: the old app is relaunched, hold + notice
+  newenv sigS1; install_prev; mkpr 1; echo '{"slow_exit":4}' > "$E/slow.json"; mkapp "$E/apps/CPZed.app" 1 "$PREV_SHA" "$E/slow.json"; start_app "$E/apps/CPZed.app"; sre_on
+  "$D/deploy" run >"$E/sig.out" 2>&1 & dp=$!
+  poll 90 test -e "$E/quit.log"; sleep 1; kill -TERM "$dp"; wait "$dp"; rc=$?; sre_off
+  ck signal-in-quit-wait-exit "$rc" 143; ck signal-in-quit-wait-hold "$([[ -e $E/home/hold ]] && echo y)" y; ckm signal-in-quit-wait-urgent "$(notes)" "after the quit was sent"
+  poll 30 test -n "$(port_up)"; ck signal-in-quit-wait-editor-up "$(port_up | wc -l | tr -d ' ')" 1; ck signal-in-quit-wait-installed-untouched "$(sha_of "$E/apps/CPZed.app")" "$PREV_SHA"; kill_dummy
+  # S2: TERM during a slow `swap exchange` (the swap completes, then the trap runs): the NEW build is named correctly
+  newenv sigS2; install_prev; mkpr 1; cp -R "$D" "$E/scr5"; mv "$E/scr5/deploy-util" "$E/scr5/deploy-util.real"
+  printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys, os, time' \
+    "rc = subprocess.call([sys.executable, '-I', os.path.dirname(os.path.abspath(__file__)) + '/deploy-util.real'] + sys.argv[1:])" \
+    "if sys.argv[1:3] == ['swap', 'exchange']: time.sleep(3)" "sys.exit(rc)" > "$E/scr5/deploy-util"; chmod +x "$E/scr5/deploy-util"
+  start_app "$E/apps/CPZed.app"; sre_on; "$E/scr5/deploy" run >"$E/sig.out" 2>&1 & dp=$!
+  poll 90 eval '[[ "$(statej phase)" == swapping ]]'; sleep 1; kill -TERM "$dp"; wait "$dp"; rc=$?; sre_off
+  ck signal-in-swap-exit "$rc" 143; ck signal-in-swap-installed-is-new "$(sha_of "$E/apps/CPZed.app")" "$COMMIT"
+  ck signal-in-swap-hold "$([[ -e $E/home/hold ]] && echo y)" y; ckm signal-in-swap-names-the-new-build "$(notes)" "The NEW build"
+  poll 30 test -n "$(port_up)"; ck signal-in-swap-editor-up "$(port_up | wc -l | tr -d ' ')" 1; kill_dummy
 }
 
 # ----------------------------------------------------------- mutations ----
@@ -945,6 +966,7 @@ run sc_n14_spaces
 run sc_x1_slow_exit
 run sc_x4_snapshot_failclosed
 run sc_signal_after_quit
+run sc_signal_s1_s2
 # the watcher must detect the naive two-rename swap, otherwise sc_atomic_no_gap proves nothing
 if want atomic || want naive; then
   QUIET=1; LAST_FAIL=0; sc_naive_swap_has_gap >/dev/null 2>&1; lf=$LAST_FAIL; QUIET=0; LAST_FAIL=0
@@ -1074,9 +1096,13 @@ mut n14-kernel-argv deploy-util '        for t in argv[1:]:
     return norm_path(path), argv' sc_n14_spaces
 mut x1-wait-for-process deploy 'if [[ -z "$(port_pid)" && -z "$(util procs-of "$bin")" ]]; then return 0; fi' 'if [[ -z "$(port_pid)" ]]; then return 0; fi' sc_x1_slow_exit
 mut x4-snapshot-guard deploy 'cl=$(util claudes "$main") || abort_deploy "cannot enumerate the sessions under the app; not quitting" hold' 'cl=$(util claudes "$main")' sc_x4_snapshot_failclosed
-mut signal-after-quit deploy '  elif (( APP_QUIT == 1 )); then' '  elif false; then' sc_signal_after_quit
-mut signal-relaunch deploy '    [[ -d "$OLD_APP" ]] && open_app "$OLD_APP"' '    :' sc_signal_after_quit
-mut signal-after-swap deploy '  elif (( SWAPPED == 1 )); then' '  elif false; then' sc_signal_after_quit
+mut signal-handler-branch deploy '  elif (( SWAPPED == 1 || APP_QUIT == 1 )); then' '  elif false; then' sc_signal_after_quit
+mut signal-relaunch deploy '      [[ -d "$OLD_APP" ]] && open_app "$OLD_APP"' '      :' sc_signal_after_quit
+
+mut signal-quit-wait deploy '  OLD_APP=$old_app; APP_QUIT=1   # BEFORE the quit is sent: a signal during the wait must relaunch
+  quit_and_wait "$old_app"; rc=$?' '  OLD_APP=$old_app
+  quit_and_wait "$old_app"; rc=$?; APP_QUIT=1' sc_signal_s1_s2
+mut signal-reads-real-bundle deploy 'if [[ -n "$TARGET_SHA" && "$cur" == "$TARGET_SHA" ]]; then' 'if false; then' sc_signal_s1_s2
 
 REAL_AFTER=$(real_snapshot)
 ck "real /Applications and ~/Library/Application Support untouched" "$REAL_AFTER" "$REAL_BEFORE"

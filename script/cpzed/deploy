@@ -117,7 +117,7 @@ assert_stopped() { # app...
 }
 
 # ---------------------------------------------------------------- lock ----
-LOCK_HELD=0; CHILD=; APP_QUIT=0; SWAPPED=0; OLD_APP=""; IN_ROLLBACK=0
+LOCK_HELD=0; CHILD=; APP_QUIT=0; SWAPPED=0; OLD_APP=""; IN_ROLLBACK=0; TARGET_SHA=""; BUILD_N=""
 # One deploy at a time: a kernel flock on $LOCK.flock, held on fd 200 for the life of the run (S1). `run` re-execs
 # itself under perl, which takes the lock non-blocking and dup2s it to fd 200; there is no stale-lock takeover to
 # race, and a reused pid cannot hold it. $LOCK itself is only an informational pid file.
@@ -132,13 +132,18 @@ on_signal() {
   if (( IN_ROLLBACK == 1 )); then
     hold_set "deploy interrupted by a signal during a rollback (phase '$ph')"
     notify urgent "CPZed deploy was interrupted during a ROLLBACK (phase '$ph'): the editor may be down. Hold set. Check $APP, and use the stock archive in $HOME_DIR/stock if needed."
-  elif (( SWAPPED == 1 )); then
-    hold_set "deploy interrupted by a signal after the swap (phase '$ph')"
-    notify urgent "CPZed deploy was interrupted after the swap (phase '$ph'): the new build is installed at $APP but was not health-checked. Hold set."
-  elif (( APP_QUIT == 1 )); then
-    [[ -d "$OLD_APP" ]] && open_app "$OLD_APP"
-    hold_set "deploy interrupted by a signal in phase '$ph' after the app was quit; the old app was relaunched"
-    notify urgent "CPZed deploy was interrupted in phase '$ph' after the app was quit. $([[ -d "$OLD_APP" ]] && echo "The old app ($OLD_APP) was relaunched." || echo "The old app is not present ($OLD_APP): the editor is DOWN."). Hold set."
+  elif (( SWAPPED == 1 || APP_QUIT == 1 )); then
+    # Decide from the REAL bundle, not from a flag: the signal may have landed in the middle of the swap.
+    local cur; cur=$(app_sha "$APP" 2>/dev/null)
+    if [[ -n "$TARGET_SHA" && "$cur" == "$TARGET_SHA" ]]; then
+      open_app "$APP"
+      hold_set "deploy interrupted by a signal in phase '$ph'; the NEW build $BUILD_N (${TARGET_SHA:0:7}) is installed at $APP and was NOT health-checked"
+      notify urgent "CPZed deploy was interrupted in phase '$ph'. The NEW build $BUILD_N (${TARGET_SHA:0:7}) is installed at $APP and was relaunched, but NOT health-checked; the previous build is staged at $STAGE_DIR/CPZed.app (if the swap was exchange). Hold set."
+    else
+      [[ -d "$OLD_APP" ]] && open_app "$OLD_APP"
+      hold_set "deploy interrupted by a signal in phase '$ph'; the OLD build ($OLD_APP) is installed; the new build (${TARGET_SHA:0:7}) was not swapped in"
+      notify urgent "CPZed deploy was interrupted in phase '$ph' after the quit was sent. The OLD app ($OLD_APP) $([[ -d "$OLD_APP" ]] && echo "was relaunched" || echo "is NOT present: the editor is DOWN"); the new build (${TARGET_SHA:0:7}) is staged and not installed. Hold set."
+    fi
   fi
   lock_release; exit 143
 }
@@ -314,6 +319,7 @@ run_pipeline() { # args: [--first-swap]
   fi
 
   # ---- build, verify, stage (skipped when a valid staged bundle for this sha exists) ----
+  TARGET_SHA=$target
   local n staged=0
   if [[ "$ph" =~ ^(staged|gating|snapshot|quitting)$ && "$(st_get target_sha)" == "$target" && -d "$STAGE_DIR/CPZed.app" \
         && "$(app_sha "$STAGE_DIR/CPZed.app")" == "$target" ]]; then
@@ -386,13 +392,13 @@ run_pipeline() { # args: [--first-swap]
   # ---- quit (polite, never forced) ----
   st_set phase quitting
   local old_app=$APP; ((first)) && old_app=$STOCK_APP
-  OLD_APP=$old_app; quit_and_wait "$old_app"; rc=$?
+  OLD_APP=$old_app; APP_QUIT=1   # BEFORE the quit is sent: a signal during the wait must relaunch
+  quit_and_wait "$old_app"; rc=$?
   if (( rc == 2 )); then abort_deploy "the single-instance port $PORT belongs to a process that is not $old_app/Contents/MacOS/zed; the quit was NOT sent. Resolve it, then clear the hold." hold; fi
   if (( rc != 0 )); then
     abort_deploy "CPZed quit blocked: still running after ${QUIT_WAIT}s: ${QW_WHY:-unknown} (a save dialog?). Not forced. Resolve it, then clear the hold." hold
   fi
 
-  APP_QUIT=1
   assert_stopped "$old_app" "$APP"
   # Data backup AFTER the quit: Zed's SQLite (WAL) is quiescent now, so the copy is consistent (N2).
   "$here/backup" data >/dev/null || { relaunch_old "$old_app"; abort_deploy "post-quit data backup failed; the old app was relaunched, nothing swapped" hold; }
@@ -420,6 +426,7 @@ run_pipeline() { # args: [--first-swap]
     relaunch_old "$old_app"; abort_deploy "the staged bundle failed re-verification right before the swap (tampered or corrupt); old app relaunched, nothing swapped" hold
   fi
   assert_stopped "$old_app" "$APP"   # and once more, right before the rename
+  BUILD_N=$n
   st_set phase swapping
   if ((first)); then
     util swap rename "$STAGE_DIR/CPZed.app" "$APP" || { st_set phase aborted; hold_set "first swap rename failed"; notify urgent "CPZed first swap rename failed; hold set."; exit 30; }
