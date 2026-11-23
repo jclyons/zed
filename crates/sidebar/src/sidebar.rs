@@ -1,3 +1,4 @@
+mod hierarchy_ui;
 mod thread_switcher;
 
 use acp_thread::ThreadStatus;
@@ -83,6 +84,8 @@ use crate::thread_switcher::{
     ThreadSwitcherTerminalEntry, ThreadSwitcherThreadEntry,
 };
 
+#[cfg(test)]
+mod hierarchy_tests;
 #[cfg(test)]
 mod sidebar_tests;
 
@@ -395,6 +398,8 @@ enum ListEntry {
     },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
+    /// CPZed fork: a section header inside a project group.
+    Section(hierarchy_ui::SectionEntry),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,7 +419,7 @@ impl RenameTarget {
                 Self::Terminal(terminal.metadata.terminal_id),
                 terminal.metadata.editable_title(),
             )),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::Section(_) => None,
         }
     }
 }
@@ -440,7 +445,7 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::Section(_) => None,
         }
     }
 }
@@ -450,7 +455,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } | ListEntry::Section(_) => {
+                None
+            }
         }
     }
 
@@ -472,6 +479,7 @@ impl ListEntry {
                 .workspaces_for_project_group(key, cx)
                 .cloned()
                 .collect(),
+            ListEntry::Section(_) => Vec::new(),
         }
     }
 }
@@ -512,6 +520,11 @@ enum EntryShape {
     },
     Thread(ThreadId),
     Terminal(TerminalId),
+    Section {
+        group: cpzed_hierarchy::GroupKey,
+        id: cpzed_hierarchy::SectionId,
+        collapsed: bool,
+    },
 }
 
 impl SidebarContents {
@@ -921,6 +934,8 @@ pub struct Sidebar {
     /// Display names of other release channels that have threads available to
     /// import.
     cross_channel_import_channels: Vec<SharedString>,
+    /// CPZed fork: hierarchy store, row layout side table and section editor.
+    hierarchy: hierarchy_ui::HierarchyUi,
 }
 
 impl Sidebar {
@@ -1064,6 +1079,7 @@ impl Sidebar {
             update_task: None,
             import_banners_use_verbose_labels: None,
             cross_channel_import_channels: Vec::new(),
+            hierarchy: Self::new_hierarchy_ui(cx),
         }
     }
 
@@ -1538,6 +1554,10 @@ impl Sidebar {
         let mut project_header_indices: Vec<usize> = Vec::new();
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        // CPZed fork: with a non-empty hierarchy, group rows are held back and arranged together.
+        let hierarchy_snapshot = self.hierarchy.store.read(cx).hierarchy();
+        let use_hierarchy = query.is_empty() && hierarchy_ui::has_structure(hierarchy_snapshot);
+        let mut deferred_groups: Vec<hierarchy_ui::DeferredGroup> = Vec::new();
 
         let has_open_projects = workspaces
             .iter()
@@ -2113,6 +2133,16 @@ impl Sidebar {
                     continue;
                 }
 
+                if use_hierarchy {
+                    deferred_groups.push(hierarchy_ui::DeferredGroup {
+                        at: entries.len(),
+                        group: hierarchy_ui::group_key(group_key),
+                        terminals,
+                        threads,
+                    });
+                    continue;
+                }
+
                 Self::push_entries_by_display_time(
                     &mut entries,
                     terminals,
@@ -2122,6 +2152,37 @@ impl Sidebar {
                 );
             }
         }
+
+        if use_hierarchy {
+            entries = hierarchy_ui::arrange_deferred(
+                deferred_groups,
+                entries,
+                hierarchy_snapshot,
+                &notified_threads,
+                &notified_terminals,
+                &mut current_session_ids,
+                &mut current_thread_ids,
+                &mut self.hierarchy.row_layout,
+            );
+            project_header_indices = entries
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, entry)| {
+                    matches!(entry, ListEntry::ProjectHeader { .. }).then_some(ix)
+                })
+                .collect();
+        } else {
+            self.hierarchy.row_layout.clear();
+        }
+        self.hierarchy.seen_rows = current_terminal_ids
+            .iter()
+            .map(|id| hierarchy_ui::terminal_key(*id))
+            .chain(
+                current_thread_ids
+                    .iter()
+                    .map(|id| hierarchy_ui::thread_key(*id)),
+            )
+            .collect();
 
         notified_threads.retain(|id| current_thread_ids.contains(id));
 
@@ -2176,6 +2237,7 @@ impl Sidebar {
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
         self.rebuild_contents(cx);
+        self.touch_hierarchy_seen(cx);
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
@@ -2240,6 +2302,11 @@ impl Sidebar {
             },
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
+            ListEntry::Section(section) => EntryShape::Section {
+                group: section.group.clone(),
+                id: section.id.clone(),
+                collapsed: section.collapsed,
+            },
         })
     }
 
@@ -2387,10 +2454,17 @@ impl Sidebar {
                     cx,
                 )
             }
-            ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
-            ListEntry::Terminal(terminal) => {
-                self.render_terminal(ix, terminal, is_active, is_selected, cx)
+            ListEntry::Thread(thread) => {
+                let row = self.render_thread(ix, thread, is_active, is_selected, cx);
+                let key = hierarchy_ui::thread_key(thread.metadata.thread_id);
+                self.wrap_hierarchy_row(ix, key, row, cx)
             }
+            ListEntry::Terminal(terminal) => {
+                let row = self.render_terminal(ix, terminal, is_active, is_selected, cx);
+                let key = hierarchy_ui::terminal_key(terminal.metadata.terminal_id);
+                self.wrap_hierarchy_row(ix, key, row, cx)
+            }
+            ListEntry::Section(section) => self.render_section_header(ix, section, is_selected, cx),
         };
 
         if is_group_header_after_first {
@@ -3327,6 +3401,13 @@ impl Sidebar {
                                 )
                         });
 
+                        let menu = Self::append_project_menu(
+                            menu,
+                            &this_for_menu,
+                            &project_group_key,
+                            menu_cx,
+                        );
+
                         let project_group_key = project_group_key.clone();
                         let remove_multi_workspace = multi_workspace.clone();
                         menu.separator().entry("Remove", None, move |window, cx| {
@@ -3786,6 +3867,10 @@ impl Sidebar {
             ListEntry::ProjectHeader { key, .. } => {
                 let key = key.clone();
                 self.toggle_collapse(&key, window, cx);
+            }
+            ListEntry::Section(section) => {
+                let section = section.clone();
+                self.confirm_section(&section, cx);
             }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
@@ -4463,6 +4548,9 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.selection else { return };
+        if self.handle_hierarchy_key(true, cx) {
+            return;
+        }
 
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => {
@@ -4487,6 +4575,9 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.selection else { return };
+        if self.handle_hierarchy_key(false, cx) {
+            return;
+        }
 
         match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { key, .. }) => {
@@ -4496,7 +4587,7 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Section(_)) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
                     {
@@ -4523,12 +4614,14 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
-                matches!(
-                    self.contents.entries.get(i),
-                    Some(ListEntry::ProjectHeader { .. })
-                )
-            }),
+            Some(ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::Section(_)) => {
+                (0..ix).rev().find(|&i| {
+                    matches!(
+                        self.contents.entries.get(i),
+                        Some(ListEntry::ProjectHeader { .. })
+                    )
+                })
+            }
             None => None,
         };
 
@@ -5963,7 +6056,7 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. } | ListEntry::Section(_) => unreachable!(),
             }
         }
 
@@ -6021,6 +6114,7 @@ impl Sidebar {
                     current_header_key = Some(key.clone());
                     None
                 }
+                ListEntry::Section(_) => None,
                 ListEntry::Thread(thread) => {
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
@@ -6721,6 +6815,13 @@ impl Sidebar {
                             });
                         }
 
+                        menu = Self::append_row_menu(
+                            menu,
+                            &sidebar,
+                            &hierarchy_ui::thread_key(thread_id),
+                            _cx,
+                        );
+
                         menu.separator().entry("Archive Thread", None, {
                             let session_id = session_id.clone();
                             move |window, cx| {
@@ -6840,8 +6941,9 @@ impl Sidebar {
             .menu(move |window, cx| {
                 let sidebar = sidebar.clone();
                 let rename_title = rename_title.clone();
-                ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu.entry("Rename Title", None, move |window, cx| {
+                ContextMenu::build(window, cx, move |menu, _window, cx| {
+                    let menu_sidebar = sidebar.clone();
+                    let menu = menu.entry("Rename Title", None, move |window, cx| {
                         sidebar
                             .update(cx, |sidebar, cx| {
                                 sidebar.start_renaming_entry(
@@ -6853,7 +6955,13 @@ impl Sidebar {
                                 );
                             })
                             .ok();
-                    })
+                    });
+                    Self::append_row_menu(
+                        menu,
+                        &menu_sidebar,
+                        &hierarchy_ui::terminal_key(terminal_id),
+                        cx,
+                    )
                 })
             })
             .into_any_element()
@@ -7443,7 +7551,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::ProjectHeader { .. } | ListEntry::Section(_) => {}
         }
     }
 
@@ -8288,6 +8396,7 @@ impl Render for Sidebar {
                     this.child(self.render_cross_channel_import_onboarding(verbose, cx))
                 })
             })
+            .children(self.render_section_edit_bar(cx))
             .child(self.render_sidebar_bottom_bar(cx))
     }
 }

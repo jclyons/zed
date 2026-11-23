@@ -16686,6 +16686,7 @@ dependencies = [
  "chrono",
  "client",
  "clock",
+ "cpzed_hierarchy",
  "db",
  "editor",
  "extension",
