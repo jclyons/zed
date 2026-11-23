@@ -3911,6 +3911,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpzed_hierarchy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "gpui",
+ "log",
+ "serde",
+ "serde_json",
+ "util",
+]
+
+[[package]]
 name = "cranelift-assembler-x64"
 version = "0.135.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

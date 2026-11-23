@@ -45,6 +45,7 @@ members = [
     "crates/context_server",
     "crates/copilot",
     "crates/copilot_chat",
+    "crates/cpzed_hierarchy",
     "crates/crashes",
     "crates/credentials_provider",
     "crates/dap",
@@ -330,6 +331,7 @@ context_server = { path = "crates/context_server" }
 copilot = { path = "crates/copilot" }
 copilot_chat = { path = "crates/copilot_chat" }
 copilot_ui = { path = "crates/copilot_ui" }
+cpzed_hierarchy = { path = "crates/cpzed_hierarchy" }
 crashes = { path = "crates/crashes" }
 crates_io_client = { path = "tooling/crates_io_client" }
 credentials_provider = { path = "crates/credentials_provider" }
