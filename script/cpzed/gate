@@ -51,8 +51,10 @@ check_once() {
   elif (( idle < HID_MIN )); then reasons+=("user active: HID idle ${idle}s < ${HID_MIN}s"); fi
   if [[ -n "$main" ]]; then
     local cl pids before after
-    cl=$(util claudes "$main")
-    pids=$(python3 -I -c 'import json,sys;print(" ".join(str(c["pid"]) for c in json.loads(sys.argv[1])))' "$cl")
+    if ! cl=$(util claudes "$main") || ! pids=$(python3 -I -c 'import json,sys;print(" ".join(str(c["pid"]) for c in json.loads(sys.argv[1])))' "$cl"); then
+      reasons+=("cannot enumerate the claude sessions under the app")   # fail CLOSED
+      pids=""
+    fi
     if [[ -n "$pids" ]]; then
       before=$(util cpu $pids); sleep "$CPU_WIN"; after=$(util cpu $pids)
       while read -r pid cpu; do

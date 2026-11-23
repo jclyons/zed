@@ -13,6 +13,23 @@
 #                      notify effects must be overridden, else the script exits 99 before doing anything.
 # Timings are seconds and overridable (CPZED_*_S) so tests run in a blink.
 
+# FAIL CLOSED (B1): outside a confined test run, NO CPZED_* variable is honored: any one present (even empty)
+# makes every script refuse to start, before reading it. The only exception is CPZED_IDENTITY (the signing
+# identity name, also read by `bundle`). A test run sets CPZED_TEST_PREFIX to a real, non-protected directory
+# and then every path and effect override must resolve inside it (dl_confine, called from dl_init/which).
+_dl_bad=""
+if [[ -z "${CPZED_TEST_PREFIX+x}" ]]; then
+  for _dl_v in $(compgen -v CPZED_); do
+    [[ "$_dl_v" == CPZED_IDENTITY ]] || _dl_bad="$_dl_bad $_dl_v"
+  done
+  if [[ -n "$_dl_bad" ]]; then
+    echo "${DL_NAME:-cpzed}: refusing to start: test/override variables are set but this is not a test run (CPZED_TEST_PREFIX unset):$_dl_bad" >&2
+    exit 2
+  fi
+elif [[ -z "${CPZED_TEST_PREFIX}" ]]; then
+  echo "${DL_NAME:-cpzed}: refusing to start: CPZED_TEST_PREFIX is set but empty" >&2; exit 2
+fi
+unset _dl_bad _dl_v
 _dl_here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 UTIL=("$_dl_here/deploy-util")
 HOME_DIR=${CPZED_HOME_DIR:-$HOME/Library/Application Support/CPZed}
@@ -37,10 +54,14 @@ dl_confine() {
   [[ -n "${CPZED_TEST_PREFIX:-}" ]] || return 0
   local pre p
   pre=$(_dl_rp "$CPZED_TEST_PREFIX")
-  [[ "$pre" != / && "$pre" != /Applications && "$pre" != "$(_dl_rp "$HOME")" || -n "${CPZED_TEST_ALLOW_HOME:-}" ]] \
+  [[ -d "$pre" ]] || dl_die "test prefix is not a directory: $pre" 99
+  local lp; lp=$(printf %s "$pre" | tr A-Z a-z)
+  [[ "$lp" != / && "$lp" != /applications && "$lp" != "$(_dl_rp "$HOME" | tr A-Z a-z)" && "$lp" != /users && "$lp" != /library && "$lp" != /private ]] \
     || dl_die "test prefix is a protected path: $pre" 99
-  for p in "$HOME_DIR" "$APP_DIR" "$DATA_DIR" "$CONF_DIR"; do
-    case "$(_dl_rp "$p")/" in "$pre"/*) ;; *) dl_die "TEST CONFINEMENT: $p is outside $pre" 99 ;; esac
+  case "$lp/" in /applications/*|/system/*|/library/*|/usr/*|/bin/*|/sbin/*) dl_die "test prefix is a protected path: $pre" 99;; esac
+  for p in "$HOME_DIR" "$APP_DIR" "$DATA_DIR" "$CONF_DIR" "${CPZED_REPO:-$pre}" "${CPZED_LEDGER:-$pre}" "${CPZED_ZED_LOG:-$pre}"; do
+    local lq; lq=$(_dl_rp "$p" | tr A-Z a-z)
+    case "$lq/" in "$lp"/*) ;; *) dl_die "TEST CONFINEMENT: $p is outside $pre" 99 ;; esac
   done
   [[ -n "${CPZED_QUIT_CMD:-}" && -n "${CPZED_OPEN_CMD:-}" && -n "${CPZED_NOTIFY_CMD:-}" ]] \
     || dl_die "TEST CONFINEMENT: CPZED_QUIT_CMD, CPZED_OPEN_CMD and CPZED_NOTIFY_CMD must be set under a test prefix (no real osascript/open)" 99
@@ -57,6 +78,8 @@ st_setj() { python3 -I "${UTIL[0]}" state "$STATE" setj "$1" "$2"; }
 st_del()  { python3 -I "${UTIL[0]}" state "$STATE" del "$1"; }
 st_hist() { python3 -I "${UTIL[0]}" state "$STATE" addhist "$1"; }
 util()    { python3 -I "${UTIL[0]}" "$@"; }
+# the only delete primitive: path strictly inside root; root allowlisted AND a direct child of HOME_DIR or APP_DIR
+rm_in()   { util swap rm "$1" "$2" "$HOME_DIR" "$APP_DIR"; }
 
 # split an override command string into an argv without a shell
 dl_run() { # varname args...   runs ${!varname} (split) then the args

@@ -57,7 +57,7 @@ pid=$(port_pid)
 pending=0
 if [[ -f "$ZLOG" ]]; then
   new=$(tail -c +"$((off + 1))" "$ZLOG" 2>/dev/null || true)
-  bad=$(grep -E 'panic|Migration changed' <<<"$new" | head -1 || true)
+  bad=$(grep -E 'panicked at|Migration changed' <<<"$new" | head -1 || true)
   [[ -z "$bad" ]] || fail "log: $bad"
   grep -qE 'errSecAuthFailed|-25293|user canceled|-128|failed to read credentials' <<<"$new" && pending=1
 fi

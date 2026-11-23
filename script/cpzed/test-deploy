@@ -39,6 +39,7 @@ REAL_BEFORE=$(real_snapshot)
 newenv() { # name
   E=$T/$1; rm -rf "$E"; mkdir -p "$E"/{home,apps,data/db,data/threads,conf,bin,gh,fake}
   portn=$((portn + 1)); PORT=$((47100 + portn * 3 + $$ % 97 * 40))
+  while lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; do PORT=$((PORT + 1)); done
   export CPZED_TEST_PREFIX=$E CPZED_HOME_DIR=$E/home CPZED_APP_DIR=$E/apps CPZED_DATA_DIR=$E/data CPZED_CONF_DIR=$E/conf
   export CPZED_PORT=$PORT CPZED_ZED_LOG=$E/Zed.log CPZED_REPO=$E/repo CPZED_LEDGER=$E/ledger.json
   export CPZED_QUIT_CMD="$E/bin/quit" CPZED_OPEN_CMD="$E/bin/open" CPZED_NOTIFY_CMD="$E/bin/notify"
@@ -52,7 +53,8 @@ newenv() { # name
   echo '[]' > "$E/threads.json"; echo '{}' > "$E/next-build.json"
   cat > "$E/bin/quit" <<'EOF'
 #!/bin/sh
-pid=$(lsof -nP -iTCP:"$CPZED_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1); [ -n "$pid" ] && kill -TERM "$pid"; exit 0
+echo "$(date +%s)" >> "$CPZED_TEST_PREFIX/quit.log"
+pid=$(cat "$DUMMY_PID_FILE" 2>/dev/null); [ -n "$pid" ] && kill -TERM "$pid"; exit 0
 EOF
   cat > "$E/bin/open" <<'EOF'
 #!/bin/sh
@@ -86,8 +88,9 @@ b = json.load(open(os.path.join(here, "..", "Resources", "dummy.json")))
 port = int(os.environ["CPZED_PORT"]); log = os.environ.get("CPZED_ZED_LOG")
 if b.get("refuse_quit"): signal.signal(signal.SIGTERM, signal.SIG_IGN)
 else: signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
-if log and b.get("panic"): open(log, "a").write("thread 'main' panic: boom\n")
+if log and b.get("panic"): open(log, "a").write("thread 'main' panicked at src/x.rs:1:1: boom\n")
 if log and b.get("keychain"): open(log, "a").write("ERROR errSecAuthFailed -25293 failed to read credentials\n")
+if log and b.get("lsp_noise"): open(log, "a").write("LSP: handled a panic message gracefully\n")
 if log and b.get("migration"): open(log, "a").write("Migration changed at index 3\n")
 for c in b.get("children", []):
     subprocess.Popen(c["argv"], cwd=c.get("cwd") or None, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -105,7 +108,7 @@ shutil.rmtree(app, ignore_errors=True)
 for d in ("Contents/MacOS", "Contents/Resources"): os.makedirs(os.path.join(app, d))
 kind = "Zed" if app.endswith("Zed.app") and not app.endswith("CPZed.app") else "CPZed"
 ver = "1.0.0-cpzed.%s" % n if kind == "CPZed" else "1.12.0"
-plistlib.dump({"CFBundleIdentifier": "dev.zed.Zed", "CFBundleShortVersionString": ver, "CFBundleVersion": sha[:7]},
+plistlib.dump({"CFBundleIdentifier": "test.cpzed.dummy", "CFBundleShortVersionString": ver, "CFBundleVersion": sha[:7]},
               open(os.path.join(app, "Contents/Info.plist"), "wb"))
 json.dump({"sha": sha, "n": int(n)}, open(os.path.join(app, "Contents/Resources/cpzed-build.json"), "w"))
 try: b = json.load(open(beh))
@@ -169,7 +172,7 @@ install_prev() {
 }
 mkstock() {
   mkapp "$E/stockbuild/Zed.app" 0 "$(printf '%040d' 77)" "$E/stock-build.json"
-  mkdir -p "$E/home/stock"; ditto -c -k --keepParent "$E/stockbuild/Zed.app" "$E/home/stock/Zed-1.12.0.zip"
+  "$D/backup" stock-add "$E/stockbuild/Zed.app" >/dev/null
 }
 fake_tool() { # name body -> $E/fake/<name>/<name>
   mkdir -p "$E/fake/$1"; printf '#!/bin/sh\n%s\n' "$2" > "$E/fake/$1/$1"; chmod +x "$E/fake/$1/$1"; echo "$E/fake/$1/$1"
@@ -205,14 +208,16 @@ EOF
 }
 sc_naive_swap_has_gap() { sc_atomic_no_gap naive; }   # validates the watcher itself
 
+rmu() { python3 -I "$D/deploy-util" swap rm "$1" "$2" "$E/home" "$E/apps"; }
 sc_rm_guards() {
   newenv rm; mkdir -p "$E/home/ring/x" "$E/outside/y" "$E/home/tmp"; ln -s "$E/home/ring/x" "$E/home/ring/link"
-  python3 -I "$D/deploy-util" swap rm "$E/outside/y" "$E/home/ring" 2>/dev/null; ck rm-outside-refused $? 1; ck rm-outside-kept "$([[ -d $E/outside/y ]] && echo y)" y
-  python3 -I "$D/deploy-util" swap rm "$E/home/ring/link" "$E/home/ring" 2>/dev/null; ck rm-symlink-refused $? 1; ck rm-symlink-kept "$([[ -L $E/home/ring/link ]] && echo y)" y
-  python3 -I "$D/deploy-util" swap rm "$E/home/ring" "$E/home/ring" 2>/dev/null; ck rm-root-itself-refused $? 1
-  python3 -I "$D/deploy-util" swap rm "$E/home/ring/../../outside/y" "$E/home/ring" 2>/dev/null; ck rm-dotdot-refused $? 1
-  mkdir -p "$E/apps/sub"; python3 -I "$D/deploy-util" swap rm "$E/apps/sub" "$E/apps" 2>/dev/null; ck rm-nonallowlisted-root-refused $? 1; ck rm-nonallowlisted-kept "$([[ -d $E/apps/sub ]] && echo y)" y
-  python3 -I "$D/deploy-util" swap rm "$E/home/ring/x" "$E/home/ring" 2>/dev/null; ck rm-inside-ok "$([[ -d $E/home/ring/x ]] && echo present || echo gone)" gone
+  rmu "$E/outside/y" "$E/home/ring" 2>/dev/null; ck rm-outside-refused $? 1; ck rm-outside-kept "$([[ -d $E/outside/y ]] && echo y)" y
+  rmu "$E/home/ring/link" "$E/home/ring" 2>/dev/null; ck rm-symlink-refused $? 1; ck rm-symlink-kept "$([[ -L $E/home/ring/link ]] && echo y)" y
+  rmu "$E/home/ring" "$E/home/ring" 2>/dev/null; ck rm-root-itself-refused $? 1
+  rmu "$E/home/ring/../../outside/y" "$E/home/ring" 2>/dev/null; ck rm-dotdot-refused $? 1
+  mkdir -p "$E/home/misc/q"; rmu "$E/home/misc/q" "$E/home/misc" 2>/dev/null; ck rm-nonallowlisted-root-refused $? 1; ck rm-nonallowlisted-kept "$([[ -d $E/home/misc/q ]] && echo y)" y
+  mkdir -p "$E/outside/ring/z"; rmu "$E/outside/ring/z" "$E/outside/ring" 2>/dev/null; ck rm-unanchored-root-refused $? 1; ck rm-unanchored-kept "$([[ -d $E/outside/ring/z ]] && echo y)" y
+  rmu "$E/home/ring/x" "$E/home/ring" 2>/dev/null; ck rm-inside-ok "$([[ -d $E/home/ring/x ]] && echo present || echo gone)" gone
 }
 
 sc_detach() {
@@ -377,11 +382,11 @@ sc_refuse_quit() {
 }
 
 sc_rollback_prev() { # new build fails health -> previous build back, re-stamped n+1
-  newenv rbprev; install_prev; mkstock; mkpr 1; beh '{"fail_agent_list":true}'
+  newenv rbprev; install_prev; local BASE; BASE=$(git -C "$E/repo" rev-parse HEAD); mkapp "$E/apps/CPZed.app" 1 "$BASE"; mkstock; mkpr 1; beh '{"fail_agent_list":true}'
   echo '[{"id":1}]' > "$E/threads.json"; start_app "$E/apps/CPZed.app"; sre_on
   dep run; sre_off
   ck rollback-rc "$RC" 20
-  ck rollback-prev-sha-back "$(sha_of "$E/apps/CPZed.app")" "$(printf '%040d' 99)"
+  ck rollback-prev-sha-back "$(sha_of "$E/apps/CPZed.app")" "$BASE"
   ck rollback-restamped-n-plus-1 "$(n_of "$E/apps/CPZed.app")" 3         # failed build was n=2
   ck rollback-version-string "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$E/apps/CPZed.app/Contents/Info.plist")" "1.0.0-cpzed.3"
   ck rollback-resigned "$([[ -f $E/apps/CPZed.app/Contents/Resources/signed-n ]] && echo y)" y
@@ -512,7 +517,7 @@ sc_first_swap() {
   ( for _ in $(seq 1 150); do grep -q '\[first-swap\]' "$E/notify.log" 2>/dev/null && break; sleep 0.2; done; rm -rf "$E/apps/Zed.app" ) & dep run --first-swap; sre_off
   ck firstswap-no-marker-aborts "$RC" 30; ck firstswap-no-marker-nothing-installed "$([[ -e $E/apps/CPZed.app ]] && echo y || echo n)" n; kill_dummy
   # --first-swap refuses when CPZed.app already exists; plain deploy refuses when it is missing
-  newenv fsex; install_prev; mkpr 1; dep run --first-swap; ck firstswap-refuses-existing "$RC" 30
+  newenv fsex; install_prev; mkpr 1; dep run --first-swap; ck firstswap-refuses-existing "$RC" 30; ckm firstswap-refuses-existing-msg "$OUT" "already exists"; ck firstswap-refuses-existing-built-nothing "$(cat "$E/bundle.log" 2>/dev/null | wc -l | tr -d ' ')" 0
   newenv fsmiss; mkpr 1; dep run; ck deploy-refuses-missing-app "$RC" 30
 }
 
@@ -536,6 +541,120 @@ sc_backup_which() {
   ck which-json "$("$D/which" --json | python3 -I -c 'import json,sys;print(json.load(sys.stdin)["n"])')" 1
 }
 
+
+# ---- review round 1 scenarios ----
+sc_override_refusal() { # B1: outside a confined test run, NO test/override variable is honored; refuse to start
+  newenv ovr; mkdir -p "$E/fakehome"
+  local v scripts="deploy gate health which backup" sc out rc
+  local vars="CPZED_GH_CMD CPZED_HID_IDLE_CMD CPZED_SELFCHECK_CMD CPZED_VERIFY_CMD CPZED_SIGN_CMD CPZED_BUNDLE_CMD CPZED_QUIT_CMD CPZED_OPEN_CMD CPZED_LSREGISTER_CMD CPZED_NOTIFY_CMD CPZED_LEDGER CPZED_REPO CPZED_BUILD_WT CPZED_COALESCE_S CPZED_MIN_INTERVAL_S CPZED_MAX_PER_DAY CPZED_HOME_DIR CPZED_APP_DIR CPZED_DATA_DIR CPZED_PORT CPZED_ZED_LOG CPZED_GATE_INTERVAL_S CPZED_HID_MIN_S CPZED_QUIESCENT_MAX_S CPZED_TEST_THREADS CPZED_TEST_SHA"
+  for v in $vars; do
+    out=$(env -i PATH="$PATH" HOME="$E/fakehome" "$v=/bin/true" "$D/deploy" status 2>&1); rc=$?
+    ck "override-refused-alone:$v" "$rc" 2
+  done
+  ckm override-refused-msg "$out" "not a test run"
+  for sc in $scripts; do
+    out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_GH_CMD=/bin/true "$D/$sc" status 2>&1); ck "override-refused-by:$sc" "$?" 2
+  done
+  local args=(); for v in $vars; do args+=("$v=/bin/true"); done
+  out=$(env -i PATH="$PATH" HOME="$E/fakehome" "${args[@]}" "$D/deploy" run 2>&1); ck override-refused-combined "$?" 2
+  out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_GH_CMD= "$D/deploy" status 2>&1); ck override-refused-even-empty "$?" 2
+  out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX= "$D/deploy" status 2>&1); ck empty-test-prefix-refused "$?" 2
+  out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX=/Applications "$D/deploy" status 2>&1); ck prefix-applications-refused "$?" 99
+  out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX=/applications "$D/deploy" status 2>&1); ck prefix-applications-lowercase-refused "$?" 99
+  out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_TEST_PREFIX="$E/nope" CPZED_HOME_DIR="$E/nope/h" CPZED_APP_DIR="$E/nope/a" CPZED_DATA_DIR="$E/nope/d" CPZED_CONF_DIR="$E/nope/c" CPZED_QUIT_CMD=/bin/true CPZED_OPEN_CMD=/bin/true CPZED_NOTIFY_CMD=/bin/true "$D/deploy" status 2>&1); ck prefix-nonexistent-refused "$?" 99
+  out=$(env -i PATH="$PATH" HOME="$E/fakehome" CPZED_IDENTITY=Someone "$D/deploy" status 2>&1); ck identity-var-allowed "$?" 0
+}
+
+sc_gate_crash() { # B2a: a crashing gate is NOT a pass
+  newenv gcrash; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"; cp -R "$D" "$E/scr"; printf '#!/bin/bash\nexit 127\n' > "$E/scr/gate"; chmod +x "$E/scr/gate"
+  sre_on; local save=$D; D=$E/scr; DEP_T=10 dep run; D=$save; sre_off
+  ck gate-crash-aborts "$RC" 30; ck gate-crash-hold "$([[ -e $E/home/hold ]] && echo y)" y
+  ck gate-crash-app-not-quit "$(port_up | wc -l | tr -d ' ')" 1; ck gate-crash-no-quit-call "$([[ -e $E/quit.log ]] && echo quit || echo none)" none
+  ckm gate-crash-notified "$(notes)" "gate failed unexpectedly"; kill_dummy
+}
+sc_gate_recheck_after_ditto() { # B2b: the user comes back during the archiver wait: re-check before the quit
+  newenv recheck; install_prev; mkpr 1
+  printf '#!/bin/sh\n[ -e "$CPZED_TEST_PREFIX/user-back" ] && echo 30 || echo 99999\n' > "$E/bin/hid"; chmod +x "$E/bin/hid"; export CPZED_HID_IDLE_CMD="$E/bin/hid"
+  local d; d=$(fake_tool ditto "sleep 9"); ( "$d" -c -k --keepParent "$E/apps/CPZed.app" "$E/out.zip" >/dev/null 2>&1 & )
+  ( for _ in $(seq 1 300); do grep -q '\[restarting\]' "$E/notify.log" 2>/dev/null && break; sleep 0.1; done
+    sleep 1; touch "$E/user-back"; sleep 8; rm -f "$E/user-back"; date +%s > "$E/user-gone" ) & local bg=$!
+  start_app "$E/apps/CPZed.app"; sre_on; DEP_T=60 dep run; sre_off; wait "$bg" 2>/dev/null
+  ck recheck-deploy-ok "$RC" 0
+  local q g; q=$(head -1 "$E/quit.log" 2>/dev/null); g=$(cat "$E/user-gone" 2>/dev/null)
+  ck recheck-quit-only-after-user-left "$([[ -n "$q" && -n "$g" && "$q" -ge "$g" ]] && echo y)" y; kill_dummy
+}
+
+sc_first_swap_stock() { # B3: --first-swap needs a verified stock archive BEFORE anything is quit
+  newenv fsz; mkpr 1; mkapp "$E/apps/Zed.app" 0 "$(printf '%040d' 77)" "$E/stock-build.json"; start_app "$E/apps/Zed.app"; sre_on
+  dep run --first-swap; sre_off          # no zip, no confirm: the zip is created and verified first; then it times out
+  ck stockzip-autocreated "$([[ -f $E/home/stock/Zed-1.12.0.zip && -f $E/home/stock/Zed-1.12.0.zip.sha256 ]] && echo y)" y
+  ck stockzip-then-timeout "$RC" 30; kill_dummy
+  newenv fsbad; mkpr 1; mkapp "$E/apps/Zed.app" 0 "$(printf '%040d' 77)" "$E/stock-build.json"; touch "$E/apps/Zed.app/Contents/BADSIG"; start_app "$E/apps/Zed.app"; sre_on
+  dep run --first-swap; sre_off
+  ck unverifiable-stock-refused "$RC" 30; ckm unverifiable-stock-msg "$OUT$(notes)" "first swap refused"
+  ck unverifiable-stock-nothing-quit "$(port_up | wc -l | tr -d ' ')" 1; ck unverifiable-stock-no-sudo-lines "$([[ "$OUT" == *"sudo rm"* ]] && echo printed || echo none)" none
+  ck unverifiable-stock-quit-never-called "$([[ -e $E/quit.log ]] && echo quit || echo none)" none; kill_dummy
+  newenv fsv; mkapp "$E/apps/Zed.app" 0 "$(printf '%040d' 77)" "$E/stock-build.json"; local z; z=$("$D/backup" stock-add "$E/apps/Zed.app")
+  "$D/backup" stock-verify "$z" >/dev/null 2>&1; ck stock-verify-good "$?" 0
+  rm "$z.sha256"; "$D/backup" stock-verify "$z" >/dev/null 2>&1; ck stock-verify-no-sidecar "$?" 4
+  shasum -a 256 "$z" | cut -d' ' -f1 > "$z.sha256"; echo tamper >> "$z"; "$D/backup" stock-verify "$z" >/dev/null 2>&1; ck stock-verify-tampered "$?" 4
+}
+
+sc_eligible_strict() { # B4
+  newenv eligs; local out base1 side; mkpr 1; base1=$COMMIT
+  ( cd "$E/repo" && echo z >> a && git commit -qam "sneaky direct push" && git push -q fork main ) >/dev/null 2>&1; mkpr 2; mkpr 3
+  out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --deployed "$base1" --window 1 --quiet-s 0); ckm elig-outside-window-still-strict "$out" "blocked by"
+  ck elig-outside-window-not-shipped "$([[ "$out" == "$COMMIT" ]] && echo shipped || echo no)" no
+  ( cd "$E/repo" && git checkout -q -b side HEAD~2 && echo s >> a && git commit -qam "side" && git checkout -q main ) >/dev/null 2>&1; side=$(git -C "$E/repo" rev-parse side)
+  out=$(python3 -I "$D/deploy-util" eligible "$E/repo" "$E/ledger.json" "$E/bin/gh" --deployed "$side" --quiet-s 0); ckm elig-deployed-not-ancestor-refused "$out" "not an ancestor"
+}
+
+sc_lock_concurrent() { # S1: a kernel flock; exactly one of N concurrent runs gets the lock
+  newenv lockc; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"; local i
+  echo 999999 > "$E/home/deploy.lock"   # a stale pid file must not matter
+  for i in 1 2 3 4 5; do ( DEP_T=6 dep run; echo "$RC" > "$E/rc.$i" ) & done; wait
+  ck exactly-four-refused "$(cat "$E"/rc.* | grep -c '^75$')" 4; kill_dummy
+}
+
+sc_claude_quote() { # S2: an unbalanced quote in a claude argv must not blind the gate or kill the snapshot
+  gate_env gquote; kill_dummy
+  local busy idle; busy=$(fake_tool claude 'while :; do :; done'); mkdir -p "$E/fake/c"; printf '#!/bin/sh\nsleep 60\n' > "$E/fake/c/claude"; chmod +x "$E/fake/c/claude"
+  beh "{\"children\":[{\"argv\":[\"$busy\",\"-p\",\"don't stop\"]}]}"; mkapp "$E/apps/CPZed.app" 1 "$(printf '%040d' 99)"; start_app "$E/apps/CPZed.app"
+  sleep 0.5; sets quiescent_at "$(date +%s)"; OUT=$("$D/gate" check 2>&1); ck quote-busy-claude-blocks "$?" 1; ckm quote-busy-cpu-msg "$OUT" "CPU"; kill_dummy; pkill -9 -f "$E/fake" 2>/dev/null
+  beh "{\"children\":[{\"argv\":[\"$E/fake/c/claude\",\"-p\",\"don't stop\"],\"cwd\":\"$E/data\"}]}"; mkapp "$E/apps/CPZed.app" 1 "$(printf '%040d' 99)"; start_app "$E/apps/CPZed.app"
+  sleep 0.5; sets quiescent_at "$(date +%s)"; OUT=$("$D/gate" check 2>&1); ck quote-idle-claude-passes "$?" 0
+  ck quote-session-listed "$(python3 -I "$D/deploy-util" claudes "$(cat "$E/dummy.pid")" | python3 -I -c 'import json,sys;print(len(json.load(sys.stdin)))')" 1; kill_dummy; pkill -9 -f "$E/fake" 2>/dev/null
+  # util failure => blocked (fail CLOSED)
+  cp -R "$D" "$E/scr2"; mv "$E/scr2/deploy-util" "$E/scr2/deploy-util.real"
+  printf '%s\n' '#!/usr/bin/env python3' 'import subprocess, sys, os' "if sys.argv[1] == 'claudes': sys.exit(1)" "sys.exit(subprocess.call([sys.executable, '-I', os.path.dirname(os.path.abspath(__file__)) + '/deploy-util.real'] + sys.argv[1:]))" > "$E/scr2/deploy-util"; chmod +x "$E/scr2/deploy-util"
+  beh '{}'; mkapp "$E/apps/CPZed.app" 1 "$(printf '%040d' 99)"; start_app "$E/apps/CPZed.app"; sleep 0.5; sets quiescent_at "$(date +%s)"
+  OUT=$("$E/scr2/gate" check 2>&1); ck util-failure-blocks-gate "$?" 1; ckm util-failure-msg "$OUT" "cannot enumerate"; kill_dummy
+}
+
+sc_staged_tamper() { # S3
+  newenv tamp1; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"; sre_on
+  ( for _ in $(seq 1 200); do grep -q '\[restarting\]' "$E/notify.log" 2>/dev/null && break; sleep 0.1; done; touch "$E/apps/.cpzed-stage/CPZed.app/Contents/BADSIG" ) &
+  dep run; sre_off; ck tamper-before-quit-aborts "$RC" 30; ck tamper-before-quit-hold "$([[ -e $E/home/hold ]] && echo y)" y
+  ck tamper-before-quit-app-not-quit "$([[ -e $E/quit.log ]] && echo quit || echo none)" none; ck tamper-before-quit-untouched "$(sha_of "$E/apps/CPZed.app")" "$(printf '%040d' 99)"; kill_dummy
+  for how in sig sha; do
+    newenv "tamp2$how"; install_prev; mkpr 1; start_app "$E/apps/CPZed.app"; sre_on
+    ( for _ in $(seq 1 300); do [[ -e "$E/quit.log" ]] && break; sleep 0.05; done
+      if [[ $how == sig ]]; then touch "$E/apps/.cpzed-stage/CPZed.app/Contents/BADSIG"
+      else echo '{"sha":"evil","n":2}' > "$E/apps/.cpzed-stage/CPZed.app/Contents/Resources/cpzed-build.json"; fi ) &
+    dep run; sre_off
+    ck "tamper-before-swap-$how-aborts" "$RC" 30; ck "tamper-before-swap-$how-hold" "$([[ -e $E/home/hold ]] && echo y)" y
+    ck "tamper-before-swap-$how-old-build-kept" "$(sha_of "$E/apps/CPZed.app")" "$(printf '%040d' 99)"
+    ck "tamper-before-swap-$how-old-relaunched" "$(port_up | wc -l | tr -d ' ')" 1; kill_dummy
+  done
+}
+
+sc_log_noise_and_ring_validation() { # N1, N8
+  newenv lspn; install_prev; mkpr 1; beh '{"lsp_noise":true}'; start_app "$E/apps/CPZed.app"; sre_on; dep run; sre_off
+  ck lsp-noise-mentioning-panic-is-not-a-panic "$RC" 0; kill_dummy
+  newenv ringv; mkapp "$E/bad/CPZed.app" 1 "$(printf '%040d' 5)"; echo '{"sha":"abc1234","n":"../../x"}' > "$E/bad/CPZed.app/Contents/Resources/cpzed-build.json"
+  "$D/backup" ring-add "$E/bad/CPZed.app" >/dev/null 2>&1; ck ring-add-rejects-bad-n "$?" 2
+}
+
 # ----------------------------------------------------------- mutations ----
 MUTN=0
 mutant() { # file old new  -> makes a mutant copy dir in M
@@ -548,21 +667,24 @@ if s.count(old) < 1: sys.exit("mutation anchor not found in %s: %s" % (p, old))
 open(p, "w").write(s.replace(old, new, 1))
 EOF
 }
-mut() { # name file old new scenario [file2 old2 new2]
-  want "mut:$1" || return 0
-  if ! mutant "$2" "$3" "$4"; then fail=$((fail+1)); echo "FAIL mut:$1: anchor missing"; return; fi
-  if [[ -n "${6:-}" ]]; then
-    python3 -I - "$M/$6" "$7" "$8" <<'PYEOF' || { fail=$((fail+1)); echo "FAIL mut:$1: second anchor missing"; return; }
+mut() { # name file old new scenario [file old new]...
+  local name=$1
+  want "mut:$name" || return 0
+  if ! mutant "$2" "$3" "$4"; then fail=$((fail+1)); echo "FAIL mut:$name: anchor missing"; return; fi
+  local sc=$5; shift 5
+  while [[ $# -ge 3 ]]; do
+    python3 -I - "$M/$1" "$2" "$3" <<'PYEOF2' || { fail=$((fail+1)); echo "FAIL mut:$name: extra anchor missing"; return; }
 import sys
 p, old, new = sys.argv[1:]
 s = open(p).read()
 if old not in s: sys.exit(1)
 open(p, "w").write(s.replace(old, new, 1))
-PYEOF
-  fi
-  local save=$D; D=$M; QUIET=1; LAST_FAIL=0; "$5" >/dev/null 2>&1; local lf=$LAST_FAIL; QUIET=0; D=$save
+PYEOF2
+    shift 3
+  done
+  local save=$D; D=$M; QUIET=1; LAST_FAIL=0; "$sc" >/dev/null 2>&1; local lf=$LAST_FAIL; QUIET=0; D=$save
   pkill -9 -f "$T/" 2>/dev/null; pkill -f "$E/fake" 2>/dev/null; sre_off 2>/dev/null; kill_dummy 2>/dev/null
-  LAST_FAIL=0; ck "mut: $1 -> $5 fails without guard" "$lf" 1
+  LAST_FAIL=0; ck "mut: $name -> $sc fails without guard" "$lf" 1
 }
 
 run() { want "$1" || return 0; LAST_FAIL=0; "$1"; kill_dummy 2>/dev/null; pkill -f "$E/fake" 2>/dev/null; true; }
@@ -596,6 +718,15 @@ run sc_ditto_wait
 run sc_first_swap
 run sc_confinement
 run sc_backup_which
+run sc_override_refusal
+run sc_gate_crash
+run sc_gate_recheck_after_ditto
+run sc_first_swap_stock
+run sc_eligible_strict
+run sc_lock_concurrent
+run sc_claude_quote
+run sc_staged_tamper
+run sc_log_noise_and_ring_validation
 # the watcher must detect the naive two-rename swap, otherwise sc_atomic_no_gap proves nothing
 if want atomic || want naive; then
   QUIET=1; LAST_FAIL=0; sc_naive_swap_has_gap >/dev/null 2>&1; lf=$LAST_FAIL; QUIET=0; LAST_FAIL=0
@@ -603,9 +734,10 @@ if want atomic || want naive; then
 fi
 
 # one mutation per guard: remove it, the scenario must fail
-mut lock-guard deploy 'if pid_alive "$op"; then return 1; fi' 'if false; then return 1; fi' sc_lock
+mut lock-guard deploy 'flock($f, LOCK_EX | LOCK_NB) or do {' '1 or do {' sc_lock
+mut lock-guard-concurrent deploy 'flock($f, LOCK_EX | LOCK_NB) or do {' '1 or do {' sc_lock_concurrent
 mut hold-guard deploy 'hold_active && { echo "deploy: hold file present: $(head -1 "$HOLD")" >&2; exit 78; }
-  lock_acquire' 'lock_acquire' sc_hold
+  if [[ -z' 'if [[ -z' sc_hold
 mut never-kill deploy '    sleep 1
   done
   return 1' '    sleep 1
@@ -626,16 +758,16 @@ mut rollback-n-plus-1 deploy 'n2=$(st_get n); st_set n $((n2 + 1))' 'n2=$failed_
 mut rollback-to-stock deploy 'hold_set "all rollbacks failed"' ':' sc_rollback_impossible
 mut rollback-prev-first deploy 'if [[ -d "$STAGE_DIR/CPZed.app" && "$(st_get first_swap)" != 1 ]]; then prev=$STAGE_DIR/CPZed.app' 'if false; then :' sc_rollback_prev
 mut health-sha health 'bsha=$(app_sha "$app"); [[ "$bsha" == "$sha" ]] ||' 'bsha=$(app_sha "$app"); true ||' sc_health_wrongsha
-mut health-keychain-ignored health "grep -E 'panic|Migration changed'" "grep -E 'panic|Migration changed|errSecAuthFailed'" sc_health_variants
+mut health-keychain-ignored health "grep -E 'panicked at|Migration changed'" "grep -E 'panicked at|Migration changed|errSecAuthFailed'" sc_health_variants
 mut health-prompts-ignored health 'pgrep -f "$p" >/dev/null 2>&1 && pending=1' 'pgrep -f "$p" >/dev/null 2>&1 && fail "prompt on screen"' sc_health_variants
-mut health-panic health "grep -E 'panic|Migration changed'" "grep -E 'NEVERMATCH'" sc_health_variants
+mut health-panic health "grep -E 'panicked at|Migration changed'" "grep -E 'NEVERMATCH'" sc_health_variants
 mut health-threads health '(( cnt >= minth )) ||' 'true ||' sc_health_variants
 mut health-port health 'pid=$(port_pid); [[ -n "$pid" ]] ||' 'pid=1; true ||' sc_health_variants health 'pid_alive "$pid" && [[ "$(port_pid)" == "$pid" ]] ||' 'true ||'
 mut selfcheck-guard deploy 'abort_deploy "selfcheck failed (updater locks missing)"; }
     else' 'true; }
     else' sc_selfcheck_fail
-mut codesign-guard deploy 'verify_app "$app" || {' 'true || {' sc_verify_fail
-mut stamp-guard deploy '[[ "$(app_sha "$app")" == "$target" && "$(app_n "$app")" == "$n" ]] ||' 'true ||' sc_health_variants deploy '[[ "$(app_sha "$STAGE_DIR/CPZed.app")" == "$target" ]] ||' 'true ||'
+mut codesign-guard deploy 'verify_app "$app" || {' 'true || {' sc_verify_fail deploy '"$(app_n "$STAGE_DIR/CPZed.app")" == "$2" ]] && verify_app "$STAGE_DIR/CPZed.app"' '"$(app_n "$STAGE_DIR/CPZed.app")" == "$2" ]]'
+mut stamp-guard deploy '[[ "$(app_sha "$app")" == "$target" && "$(app_n "$app")" == "$n" ]] ||' 'true ||' sc_health_variants deploy '[[ "$(app_sha "$STAGE_DIR/CPZed.app")" == "$target" ]] ||' 'true ||' deploy '[[ -d "$STAGE_DIR/CPZed.app" && "$(app_sha "$STAGE_DIR/CPZed.app")" == "$1" && "$(app_n "$STAGE_DIR/CPZed.app")" == "$2" ]] && verify_app' 'verify_app'
 mut signing-hold deploy 'if (( rc == 10 )); then abort_deploy' 'if false; then abort_deploy' sc_signing_hold
 mut dead-deploy-guard deploy '    swapping|launching|health|rollback) hold_set' '    NEVER) hold_set' sc_dead_deploy
 mut ditto-wait deploy 'glider_archiving() { pgrep -f "ditto -c.*CPZed\.app" >/dev/null 2>&1; }' 'glider_archiving() { false; }' sc_ditto_wait
@@ -661,6 +793,27 @@ mut elig-chain deploy-util 'if target is None:
 mut elig-coalesce deploy-util 'if now - tip_time < quiet_s:' 'if False:' sc_eligible
 mut atomic-exchange-flag deploy-util 'RENAME_SWAP, RENAME_EXCL = 0x2, 0x4' 'RENAME_SWAP, RENAME_EXCL = 0x4, 0x4' sc_util_swap_probe
 mut known-bad-sha deploy '[[ "$target" == "$(st_get failed_sha)" ]] &&' 'false &&' sc_rollback_prev
+
+mut override-guard deploy-lib.sh 'if [[ -n "$_dl_bad" ]]; then' 'if false; then' sc_override_refusal
+mut override-guard-empty-prefix deploy-lib.sh 'elif [[ -z "${CPZED_TEST_PREFIX}" ]]; then' 'elif false; then' sc_override_refusal
+mut gate-rc-zero deploy '(( rc == 0 )) || abort_deploy "the quiescence gate failed unexpectedly (exit $rc); not quitting" hold' 'true' sc_gate_crash
+mut gate-recheck-after-wait deploy 'if ! "$here/gate" check >/dev/null 2>&1; then log "gate failed after the archiver wait; back to waiting"; continue; fi' ':' sc_gate_recheck_after_ditto
+mut firstswap-stock-archive deploy 'if [[ -z "$sz" ]] || ! "$here/backup" stock-verify "$sz" >/dev/null 2>&1; then' 'if false; then' sc_first_swap_stock
+mut stock-verify-sha backup '[[ "$(shasum -a 256 "$z" | cut -d'"'"' '"'"' -f1)" == "$(cat "$z.sha256")" ]] ||' 'true ||' sc_first_swap_stock
+mut elig-ancestor deploy-util 'if r.returncode != 0:
+            print("blocked: deployed commit' 'if False:
+            print("blocked: deployed commit' sc_eligible_strict
+mut elig-strict-chain-beyond-window deploy-util '    if deployed:
+        # Strict chain' '    if deployed and False:
+        # Strict chain' sc_eligible_strict
+mut claude-quote-fallback deploy-util 'argv = r["cmd"].split()' 'raise' sc_claude_quote
+mut gate-fail-closed gate 'reasons+=("cannot enumerate the claude sessions under the app")   # fail CLOSED' ':' sc_claude_quote
+mut staged-verify-pre-quit deploy 'verify_staged "$target" "$n" || abort_deploy "the staged bundle failed re-verification (tampered or corrupt); nothing was quit" hold' 'true' sc_staged_tamper
+mut staged-verify-pre-swap deploy 'if ! verify_staged "$target" "$n"; then' 'if false; then' sc_staged_tamper
+mut panic-regex health "grep -E 'panicked at|Migration changed'" "grep -E 'panic|Migration changed'" sc_log_noise_and_ring_validation
+mut ring-n-validation backup '[[ "$n" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{7,40}$ ]] ||' 'true ||' sc_log_noise_and_ring_validation
+mut rm-anchor deploy-util 'if not any(os.path.dirname(rr).lower() == os.path.realpath(a).lower() for a in anchors):' 'if False:' sc_rm_guards
+mut confine-prefix-dir deploy-lib.sh '[[ -d "$pre" ]] || dl_die "test prefix is not a directory: $pre" 99' ':' sc_override_refusal
 
 REAL_AFTER=$(real_snapshot)
 ck "real /Applications and ~/Library/Application Support untouched" "$REAL_AFTER" "$REAL_BEFORE"

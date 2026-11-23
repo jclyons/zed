@@ -42,8 +42,11 @@ quit_app() { # polite quit only
   if [[ -n "${CPZED_QUIT_CMD:-}" ]]; then dl_run CPZED_QUIT_CMD
   else /usr/bin/osascript -e 'tell application id "dev.zed.Zed" to quit'; fi
 }
-open_app() { # path
-  if [[ -n "${CPZED_OPEN_CMD:-}" ]]; then dl_run CPZED_OPEN_CMD "$1"; else /usr/bin/open -a "$1"; fi
+open_app() { # path ; fd 200 is the run lock: never leak it into the launched app
+  ( exec 200>&-; if [[ -n "${CPZED_OPEN_CMD:-}" ]]; then dl_run CPZED_OPEN_CMD "$1"; else /usr/bin/open -a "$1"; fi )
+}
+verify_staged() { # the staged bundle must still be the verified build (sha, n, signature) right before it is used
+  [[ -d "$STAGE_DIR/CPZed.app" && "$(app_sha "$STAGE_DIR/CPZed.app")" == "$1" && "$(app_n "$STAGE_DIR/CPZed.app")" == "$2" ]] && verify_app "$STAGE_DIR/CPZed.app"
 }
 sign_app() { # app: re-seal after a re-stamp, keeping the existing entitlements
   if [[ -n "${CPZED_SIGN_CMD:-}" ]]; then dl_run CPZED_SIGN_CMD "$1"; return; fi
@@ -70,7 +73,6 @@ thread_count() { # app -> count (0 when the app is not answering)
   if [[ -n "$(port_pid)" ]] && perl -e 'alarm 30; exec @ARGV' "$1/Contents/MacOS/cli" --agent-list >"$o" 2>/dev/null; then c=$(util json-count "$o" || echo 0); else c=0; fi
   rm -f "$o"; echo "${c:-0}"
 }
-rm_in() { util swap rm "$1" "$2"; }   # the only way this script deletes anything
 
 # Politely quit and wait; 0 = exited, 1 = refused (nothing was killed).
 quit_and_wait() {
@@ -87,18 +89,9 @@ quit_and_wait() {
 
 # ---------------------------------------------------------------- lock ----
 LOCK_HELD=0; CHILD=
-lock_acquire() {
-  mkdir -p "$HOME_DIR"
-  local i op
-  for i in 1 2; do
-    if ( set -o noclobber; echo "$$" > "$LOCK" ) 2>/dev/null; then LOCK_HELD=1; return 0; fi
-    op=$(cat "$LOCK" 2>/dev/null || true)
-    if pid_alive "$op"; then return 1; fi
-    # stale: rename it away (atomic, one taker wins), then retry
-    mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null && rm -f "$LOCK.stale.$$"
-  done
-  return 1
-}
+# One deploy at a time: a kernel flock on $LOCK.flock, held on fd 200 for the life of the run (S1). `run` re-execs
+# itself under perl, which takes the lock non-blocking and dup2s it to fd 200; there is no stale-lock takeover to
+# race, and a reused pid cannot hold it. $LOCK itself is only an informational pid file.
 lock_release() { [[ $LOCK_HELD == 1 && "$(cat "$LOCK" 2>/dev/null)" == "$$" ]] && rm -f "$LOCK"; LOCK_HELD=0; }
 
 # --------------------------------------------------------------- stages ---
@@ -181,7 +174,7 @@ do_rollback() { # reason ; never returns
     if [[ -n "$(port_pid)" ]]; then
       hold_set "rolled back to stock Zed; investigate before clearing"
       st_hist "{\"kind\":\"rollback-stock\",\"at\":$(ts)}"; st_set phase rolled-back-stock
-      notify urgent "CPZed $failed_n and the previous build both failed ($reason). Stock Zed is running again. Hold set. The failed CPZed.app is still at $APP."
+      notify urgent "CPZed $failed_n and the previous build both failed ($reason). Stock Zed is running again. Hold set. The failed CPZed.app is still at $APP. After fixing CPZed, remove /Applications/Zed.app again (Glider presence-wins could push stock back to the MBP)."
       exit 21
     fi
   fi
@@ -196,7 +189,12 @@ run_pipeline() { # args: [--first-swap]
   [[ "${1:-}" == --first-swap ]] && first=1
   dl_init
   hold_active && { echo "deploy: hold file present: $(head -1 "$HOLD")" >&2; exit 78; }
-  lock_acquire || { echo "deploy: another deploy is running (pid $(cat "$LOCK" 2>/dev/null))" >&2; exit 75; }
+  if [[ -z "${_DEPLOY_LOCKED:-}" ]] || ! python3 -I -c 'import os,sys;a=os.fstat(200);b=os.stat(sys.argv[1]);sys.exit(0 if (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino) else 1)' "$LOCK.flock" 2>/dev/null; then
+    exec env _DEPLOY_LOCKED=1 perl -MPOSIX -MFcntl=:flock -e 'open(my $f, ">>", shift) or exit 76;
+      flock($f, LOCK_EX | LOCK_NB) or do { print STDERR "deploy: another deploy is running\n"; exit 75 };
+      POSIX::dup2(fileno($f), 200); close $f; exec @ARGV or exit 77' "$LOCK.flock" "$here/deploy" run "$@"
+  fi
+  echo "$$" > "$LOCK"; LOCK_HELD=1
   trap 'lock_release' EXIT
   trap '[[ -n "${CHILD:-}" ]] && kill "$CHILD" 2>/dev/null; lock_release; exit 143' TERM INT HUP
 
@@ -214,10 +212,25 @@ run_pipeline() { # args: [--first-swap]
   local deployed target rc
   deployed=$(st_get deployed_sha)
   target=$(util eligible "$REPO" "$LEDGER" "$GH" --base fork/main ${deployed:+--deployed "$deployed"} --quiet-s "$COALESCE"); rc=$?
-  if (( rc != 0 )); then log "no deploy: $target"; echo "$target"; exit 10; fi
+  if (( rc != 0 )); then
+    log "no deploy: $target"; echo "$target"
+    if (( rc == 1 )) && [[ "$(st_get last_blocked)" != "$target" ]]; then st_set last_blocked "$target"; notify blocked "CPZed deploy blocked: $target"; fi
+    exit 10
+  fi
   [[ "$target" == "$(st_get failed_sha)" ]] && { log "no deploy: $target failed before"; echo "known-bad sha $target"; exit 10; }
   if ! ((first)); then
     local why; why=$(util interval "$STATE" "${CPZED_MIN_INTERVAL_S:-14400}" "${CPZED_MAX_PER_DAY:-2}") || { log "deferred: $why"; echo "$why"; exit 10; }
+  fi
+
+  # ---- --first-swap needs a VERIFIED stock archive before anything is quit (B3) ----
+  if ((first)); then
+    local sz
+    sz=$("$here/backup" latest-stock 2>/dev/null || true)
+    if [[ -z "$sz" ]] || ! "$here/backup" stock-verify "$sz" >/dev/null 2>&1; then
+      sz=$("$here/backup" stock-add "$STOCK_APP" 2>/dev/null) || abort_deploy "first swap refused: cannot create a verified stock archive; nothing was quit"
+      "$here/backup" stock-verify "$sz" >/dev/null 2>&1 || abort_deploy "first swap refused: the stock archive failed verification; nothing was quit"
+    fi
+    st_set stock_zip "$sz"
   fi
 
   # ---- build, verify, stage (skipped when a valid staged bundle for this sha exists) ----
@@ -267,24 +280,28 @@ run_pipeline() { # args: [--first-swap]
     st_set phase gating
     "$here/gate" wait & CHILD=$!; wait "$CHILD"; rc=$?; CHILD=
     (( rc == 2 )) && exit 78
+    (( rc == 0 )) || abort_deploy "the quiescence gate failed unexpectedly (exit $rc); not quitting" hold
     st_set phase snapshot
-    local main; main=$(port_pid)
-    st_setj sessions "$( [[ -n "$main" ]] && util claudes "$main" || echo '[]')"
+    local main cl="[]"; main=$(port_pid)
+    if [[ -n "$main" ]]; then cl=$(util claudes "$main") || abort_deploy "cannot enumerate the sessions under the app; not quitting" hold; fi
+    st_setj sessions "$cl" || abort_deploy "cannot record the session snapshot; not quitting" hold
     local cur_app=$APP; ((first)) && cur_app=$STOCK_APP
     st_set pre_threads "$(thread_count "$cur_app")"
-    "$here/backup" data >/dev/null || abort_deploy "pre-quit data backup failed"
     sessions_msg=$(util resume "$STATE" | paste -sd';' -)
     notify restarting "CPZed restarting in $(awk -v p="$PREQUIT" 'BEGIN{printf "%d", p/60+0.5}') min (build $n). Sessions about to be interrupted: ${sessions_msg:-none}"
     sleep "$PREQUIT"
-    if "$here/gate" check >/dev/null 2>&1; then break; fi
-    log "gate failed right before the quit; back to waiting"
-    st_set quiescent_at 0
+    if ! "$here/gate" check >/dev/null 2>&1; then
+      log "gate failed right before the quit; back to waiting"; st_set quiescent_at 0; continue
+    fi
+    # Wait out any Glider archive of the current bundle, then re-check the WHOLE gate again (B2b): the user or a
+    # session may have come back during the wait.
+    local end=$(( $(ts) + DITTO_WAIT ))
+    while glider_archiving && (( $(ts) < end )); do sleep 2; done
+    glider_archiving && abort_deploy "Glider is still archiving CPZed.app; nothing was quit"
+    if ! "$here/gate" check >/dev/null 2>&1; then log "gate failed after the archiver wait; back to waiting"; continue; fi
+    verify_staged "$target" "$n" || abort_deploy "the staged bundle failed re-verification (tampered or corrupt); nothing was quit" hold
+    break
   done
-
-  # Wait out any Glider archive of the current bundle BEFORE quitting (and again before the swap).
-  local end=$(( $(ts) + DITTO_WAIT ))
-  while glider_archiving && (( $(ts) < end )); do sleep 2; done
-  glider_archiving && abort_deploy "Glider is still archiving CPZed.app; nothing was quit"
 
   # ---- quit (polite, never forced) ----
   st_set phase quitting
@@ -292,6 +309,9 @@ run_pipeline() { # args: [--first-swap]
   if ! quit_and_wait; then
     abort_deploy "CPZed quit blocked: the app is still running after ${QUIT_WAIT}s (a save dialog?). Not forced. Resolve it, then clear the hold." hold
   fi
+
+  # Data backup AFTER the quit: Zed's SQLite (WAL) is quiescent now, so the copy is consistent (N2).
+  "$here/backup" data >/dev/null || { relaunch_old "$old_app"; abort_deploy "post-quit data backup failed; the old app was relaunched, nothing swapped" hold; }
 
   # ---- first swap: the user removes stock with sudo; we never run sudo ----
   if ((first)); then
@@ -312,6 +332,9 @@ run_pipeline() { # args: [--first-swap]
   local send=$(( $(ts) + 600 ))
   while glider_archiving && (( $(ts) < send )); do sleep 2; done
   if glider_archiving; then relaunch_old "$old_app"; abort_deploy "Glider started archiving CPZed.app during the quit; old build relaunched, nothing swapped"; fi
+  if ! verify_staged "$target" "$n"; then
+    relaunch_old "$old_app"; abort_deploy "the staged bundle failed re-verification right before the swap (tampered or corrupt); old app relaunched, nothing swapped" hold
+  fi
   st_set phase swapping
   if ((first)); then
     util swap rename "$STAGE_DIR/CPZed.app" "$APP" || { st_set phase aborted; hold_set "first swap rename failed"; notify urgent "CPZed first swap rename failed; hold set."; exit 30; }

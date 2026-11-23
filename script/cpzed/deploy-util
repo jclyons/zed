@@ -5,7 +5,7 @@ Subcommands (all argv-only; nothing is ever passed through a shell):
   state <file> get K | set K V | setj K JSON | del K | addhist JSON | dump
   swap exchange A B      one atomic renamex_np(RENAME_SWAP) of two .app directories
   swap rename SRC DST    renamex_np(RENAME_EXCL): DST must not exist
-  swap rm PATH ROOT      remove PATH only if strictly inside ROOT and ROOT is an allowlisted dir name
+  swap rm PATH ROOT ANCHOR...   remove PATH only if strictly inside ROOT, ROOT is an allowlisted dir name and a direct child of an ANCHOR
   swap probe DIR         self-test: exchange two temp dirs under DIR, report atomicity
   walk PID               JSON lines for every descendant of PID
   busy PID               descendants that are builds/tests (one "pid cmd" per line)
@@ -105,10 +105,13 @@ def swap_op(argv):
         _renamex(a, b, RENAME_EXCL)
         return 0
     if op == "rm":
-        path, root = argv[1], argv[2]
+        path, root, anchors = argv[1], argv[2], argv[3:]
         rr = os.path.realpath(root)
         if os.path.basename(rr).lower() not in ALLOWED_RM_ROOTS:
             print("swap rm: root %s is not an allowlisted directory" % root, file=sys.stderr)
+            return 1
+        if not any(os.path.dirname(rr).lower() == os.path.realpath(a).lower() for a in anchors):
+            print("swap rm: root %s is not directly inside an allowed anchor %s" % (root, anchors), file=sys.stderr)
             return 1
         if os.path.islink(path):
             print("swap rm: refusing a symlink: " + path, file=sys.stderr)
@@ -308,18 +311,14 @@ def eligible(repo, ledger_path, ghcmd, base="fork/main", deployed=None, quiet_s=
         ledger = json.load(open(ledger_path))
     except (OSError, ValueError) as e:
         print("blocked: cannot read ledger: %s" % e); return 1
-    log = git(repo, "log", "--first-parent", "-n", str(window), "--format=%H%x09%ct%x09%s", base).splitlines()
-    commits = [l.split("\t", 2) for l in log]          # newest first
-    if not commits:
-        print("blocked: no commits on " + base); return 1
-    tip_time = int(commits[0][1])
-    if deployed and any(c[0] == deployed for c in commits):
-        chain = []
-        for c in commits:
-            if c[0] == deployed:
-                break
-            chain.append(c)
-        chain.reverse()                                  # oldest first, after the deployed one
+    tip = git(repo, "log", "-1", "--format=%H%x09%ct%x09%s", base).strip().split("\t", 2)
+    tip_time = int(tip[1])
+    if deployed:
+        # Strict chain: EVERY first-parent commit after the deployed one must be merged with its approvals.
+        r = subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", deployed, base], capture_output=True)
+        if r.returncode != 0:
+            print("blocked: deployed commit %s is not an ancestor of %s (history rewritten or unknown); refusing, needs a human" % (deployed, base)); return 1
+        chain = [l.split("\t", 2) for l in git(repo, "rev-list", "--first-parent", "--reverse", "--format=%H%x09%ct%x09%s", "%s..%s" % (deployed, base)).splitlines() if "\t" in l]
         if not chain:
             print("nothing new since " + deployed); return 3
         target = None
@@ -331,6 +330,9 @@ def eligible(repo, ledger_path, ghcmd, base="fork/main", deployed=None, quiet_s=
                 break
             target = c
     else:
+        # First ever deploy (no deployed_sha): all earlier history predates the ledger, so the newest eligible
+        # commit in the window is accepted (documented in docs/fork/DEPLOY.md).
+        commits = [l.split("\t", 2) for l in git(repo, "log", "--first-parent", "-n", str(window), "--format=%H%x09%ct%x09%s", base).splitlines()]
         target = None
         for c, _t, s in commits:
             ok, _ = commit_eligible(c, s, ledger, ghcmd)
@@ -366,7 +368,10 @@ def main(a):
         out = []
         for r in descendants(int(a[1])):
             if tool_name(r["cmd"]) == "claude":
-                argv = shlex.split(r["cmd"]) if True else []
+                try:
+                    argv = shlex.split(r["cmd"])
+                except ValueError:          # ps output is not shell-quoted: fall back to whitespace
+                    argv = r["cmd"].split()
                 out.append(dict(pid=r["pid"], cwd=cwd_of(r["pid"]), argv=argv, session=session_of(argv)))
         print(json.dumps(out))
         return 0
@@ -391,9 +396,9 @@ def main(a):
         kw, i = {}, 4
         while i < len(a):
             k = a[i]
-            kw[{"--base": "base", "--deployed": "deployed", "--quiet-s": "quiet_s", "--now": "now"}[k]] = a[i + 1]
+            kw[{"--base": "base", "--deployed": "deployed", "--quiet-s": "quiet_s", "--now": "now", "--window": "window"}[k]] = a[i + 1]
             i += 2
-        for k in ("quiet_s", "now"):
+        for k in ("quiet_s", "now", "window"):
             if k in kw: kw[k] = int(kw[k])
         return eligible(a[1], a[2], a[3], **kw)
     if c == "json-count":

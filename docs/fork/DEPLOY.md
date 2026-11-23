@@ -55,6 +55,24 @@ Since the last deployed commit, every first-parent commit must be eligible: the 
 deploy ("blocked by <sha>"). `fork/main` must be quiet for 30 min (coalesce), at least 4 h since the last deploy,
 at most 2 per day; rollbacks are exempt.
 
+## Safety properties added in review round 1
+
+- **Fail closed on overrides.** Outside a confined test run (`CPZED_TEST_PREFIX` unset) every script refuses to
+  start (exit 2) if ANY `CPZED_*` variable is present, even empty; only `CPZED_IDENTITY` is allowed. A test run must
+  point every path at a real directory inside the prefix and override quit/open/notify.
+- **The gate cannot be skipped.** `deploy` proceeds only when `gate wait` exits exactly 0 (a crash aborts and sets
+  `hold`). After the Glider archiver wait the whole `gate check` runs again, then the staged bundle is re-verified
+  (signature, sha, n) before the quit and again right before the swap.
+- **`--first-swap` needs a verified stock archive** (sha256 sidecar plus a temp-extract `codesign --verify
+  --deep --strict`) before anything is quit; it creates one with `backup stock-add` when missing.
+- **Eligibility is a strict chain** from the deployed commit (`git rev-list --first-parent deployed..base`, no
+  window); a deployed commit that is not an ancestor of `fork/main` blocks. Only the very first deploy (no
+  `deployed_sha`) accepts the newest eligible commit in the last 50, because all earlier history predates the ledger.
+- **One deploy at a time** by a kernel `flock` held on fd 200 for the whole run (no stale-lock takeover).
+- **Quit refusal = abort + hold + notify**, never a retry loop and never a kill (a deliberate deviation from design
+  section 5 step 5, confirmed by cpzed-manager).
+- The data backup is taken after the quit, when the SQLite files are quiescent.
+
 ## Not in this ticket
 
 R5 (Glider archive check) and the R6 poll are T9 and land after this merges. `bundle`/`selfcheck` are T1 (PR #6);
