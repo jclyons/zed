@@ -503,14 +503,16 @@ sc_interval_run() {
   start_app "$E/apps/CPZed.app"; dep run; ck interval-defers "$RC" 10; ckm interval-msg "$OUT" "minimum interval"; ck interval-no-build "$(cat "$E/bundle.log" 2>/dev/null | wc -l | tr -d ' ')" 0
   export CPZED_MIN_INTERVAL_S=0; kill_dummy
 }
-sc_ditto_wait() {
-  newenv ditto; install_prev; mkpr 1
-  local d; d=$(fake_tool ditto "sleep 8; date +%s > $E/ditto.end")
+sc_ditto_wait() { # the swap must happen AFTER Glider's archiver exited; with the wait disabled it would happen while it runs
+  newenv ditto; install_prev; mkpr 1; export CPZED_DITTO_WAIT_S=90
+  local d; d=$(fake_tool ditto "sleep 25; date +%s > $E/ditto.end")
+  start_app "$E/apps/CPZed.app"; sre_on
   ( "$d" -c -k --keepParent "$E/apps/CPZed.app" "$E/out.zip" >/dev/null 2>&1 & ); poll 20 pgrep -f "$E/fake/ditto/ditto"
-  start_app "$E/apps/CPZed.app"; sre_on; dep run; sre_off
+  dep run; sre_off
   ck ditto-deploy-ok "$RC" 0
-  local launched_new; launched_new=$(tail -1 "$E/open.log" | cut -d' ' -f1)
-  ck ditto-swap-after-archive-finished "$([[ -f $E/ditto.end && "$launched_new" -ge "$(cat "$E/ditto.end")" ]] && echo y)" y; kill_dummy
+  poll 60 test -f "$E/ditto.end"                       # the archiver's exit marker (it may still be running if the wait was skipped)
+  local launched_new end; launched_new=$(tail -1 "$E/open.log" | cut -d' ' -f1); end=$(cat "$E/ditto.end" 2>/dev/null)
+  ck ditto-new-app-launched-only-after-archiver-exit "$([[ -n "$end" && "$launched_new" -ge "$end" ]] && echo y)" y; kill_dummy
 }
 
 sc_first_swap() {
