@@ -1555,8 +1555,8 @@ impl Sidebar {
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
         // CPZed fork: with a non-empty hierarchy, group rows are held back and arranged together.
-        let hierarchy_snapshot = self.hierarchy.store.read(cx).hierarchy().clone();
-        let use_hierarchy = query.is_empty() && hierarchy_ui::has_structure(&hierarchy_snapshot);
+        let hierarchy_snapshot = self.hierarchy.store.read(cx).hierarchy();
+        let use_hierarchy = query.is_empty() && hierarchy_ui::has_structure(hierarchy_snapshot);
         let mut deferred_groups: Vec<hierarchy_ui::DeferredGroup> = Vec::new();
 
         let has_open_projects = workspaces
@@ -2157,7 +2157,7 @@ impl Sidebar {
             entries = hierarchy_ui::arrange_deferred(
                 deferred_groups,
                 entries,
-                &hierarchy_snapshot,
+                hierarchy_snapshot,
                 &notified_threads,
                 &notified_terminals,
                 &mut current_session_ids,

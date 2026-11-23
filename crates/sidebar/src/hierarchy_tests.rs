@@ -744,3 +744,61 @@ async fn test_hidden_rows_are_still_recorded_as_seen(cx: &mut TestAppContext) {
     });
     assert!(stored, "the hidden row has a last_seen entry");
 }
+
+// Review (S2 deferral): an empty hierarchy never writes; with structure only the rows the
+// hierarchy mentions are touched, collapsed subtrees included.
+#[gpui::test]
+async fn test_touch_seen_records_only_mentioned_rows_and_never_writes_when_empty(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let top = add_terminal(&mut cx, "top", "/project-a", 10);
+    let low = add_terminal(&mut cx, "low", "/project-a", 20);
+    let other = add_terminal(&mut cx, "other", "/project-a", 30);
+
+    let settle = |cx: &mut VisualTestContext| {
+        cx.executor()
+            .advance_clock(cpzed_hierarchy::WRITE_DEBOUNCE * 4);
+        cx.run_until_parked();
+    };
+    let writes = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| HierarchyStore::global(cx).read(cx).write_count())
+    };
+    let last_seen = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            HierarchyStore::global(cx)
+                .read(cx)
+                .hierarchy()
+                .last_seen
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    };
+
+    for _ in 0..5 {
+        refresh(&sidebar, &mut cx);
+    }
+    settle(&mut cx);
+    assert_eq!(writes(&mut cx), 0, "empty hierarchy causes no store write");
+    assert!(last_seen(&mut cx).is_empty());
+
+    edit(&mut cx, |store, cx| {
+        store.set_parent(&key(low), Some(&key(top)), cx).unwrap();
+        store.set_row_collapsed(&key(top), true, cx).ok();
+    });
+    refresh(&sidebar, &mut cx);
+    settle(&mut cx);
+    let seen = last_seen(&mut cx);
+    assert!(seen.contains(&key(top)));
+    assert!(
+        seen.contains(&key(low)),
+        "a row hidden in a collapsed subtree is still touched"
+    );
+    assert!(
+        !seen.contains(&key(other)),
+        "a row with no hierarchy data is never recorded"
+    );
+}

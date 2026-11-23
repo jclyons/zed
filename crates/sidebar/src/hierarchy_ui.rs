@@ -112,6 +112,29 @@ pub(crate) struct DeferredGroup {
     pub threads: Vec<Arc<ThreadEntry>>,
 }
 
+/// Every row the hierarchy has any data about.
+fn mentioned_rows(hierarchy: &Hierarchy) -> HashSet<RowKey> {
+    let mut mentioned: HashSet<RowKey> = HashSet::new();
+    for (child, parent) in &hierarchy.parents {
+        mentioned.insert(child.clone());
+        mentioned.insert(parent.clone());
+    }
+    for (parent, children) in &hierarchy.child_order {
+        mentioned.insert(parent.clone());
+        mentioned.extend(children.iter().cloned());
+    }
+    for rows in hierarchy.unsectioned_order.values() {
+        mentioned.extend(rows.iter().cloned());
+    }
+    mentioned.extend(hierarchy.collapsed_rows.iter().cloned());
+    for sections in hierarchy.sections.values() {
+        for section in sections {
+            mentioned.extend(section.items.iter().cloned());
+        }
+    }
+    mentioned
+}
+
 fn project_name(group: &GroupKey) -> SharedString {
     group
         .paths
@@ -390,18 +413,35 @@ impl Sidebar {
         }
     }
 
-    /// Quietly record every row the last rebuild saw (visible or hidden in a collapsed subtree or
-    /// section) and every project header, so a long-collapsed subtree is not pruned. Rows of
-    /// collapsed PROJECT groups are only known for terminals: do not wire `prune` before that
-    /// is solved.
+    /// Quietly record the rows and groups the hierarchy actually mentions (a parent link, a
+    /// section membership, an order or collapse entry) that the last rebuild saw, hidden ones
+    /// included, so a long-collapsed subtree is not pruned. Rows with no hierarchy data are never
+    /// recorded: a user with an empty hierarchy causes no store write at all. Rows of collapsed
+    /// PROJECT groups are only known for terminals: do not wire `prune` before that is solved.
     pub(crate) fn touch_hierarchy_seen(&mut self, cx: &mut Context<Self>) {
-        let mut rows: Vec<RowKey> = self.hierarchy.seen_rows.clone();
-        let mut groups: Vec<GroupKey> = Vec::new();
-        for entry in &self.contents.entries {
-            match entry {
-                ListEntry::ProjectHeader { key, .. } => groups.push(group_key(key)),
-                other => rows.extend(entry_row_key(other)),
+        let (rows, groups) = {
+            let hierarchy = self.hierarchy.store.read(cx).hierarchy();
+            if !has_structure(hierarchy) {
+                return;
             }
+            let mentioned = mentioned_rows(hierarchy);
+            let mut rows: Vec<RowKey> = self.hierarchy.seen_rows.clone();
+            let mut groups: Vec<GroupKey> = Vec::new();
+            for entry in &self.contents.entries {
+                match entry {
+                    ListEntry::ProjectHeader { key, .. } => groups.push(group_key(key)),
+                    other => rows.extend(entry_row_key(other)),
+                }
+            }
+            rows.retain(|row| mentioned.contains(row));
+            groups.retain(|group| {
+                hierarchy.sections.get(group).is_some_and(|s| !s.is_empty())
+                    || hierarchy.unsectioned_order.contains_key(group)
+            });
+            (rows, groups)
+        };
+        if rows.is_empty() && groups.is_empty() {
+            return;
         }
         let now = chrono::Utc::now().timestamp();
         self.hierarchy.store.update(cx, |store, cx| {
