@@ -287,7 +287,7 @@ cs --force --options runtime --entitlements "$ent" --sign "$IDENTITY" "$app" -v
 echo "bundle: verifying"
 "$CODESIGN" --verify --deep --strict "$app"
 dv=$("$CODESIGN" -dvv "$app" 2>&1)   # Authority= is printed only at -dvv or higher; flags at -dv
-grep -qF "Authority=$IDENTITY" <<<"$dv" || die "codesign -dvv does not show '$IDENTITY'" 8
+grep -qxF "Authority=$IDENTITY" <<<"$dv" || die "codesign -dvv does not show '$IDENTITY'" 8
 grep -Eq 'flags=0x[0-9a-f]+\(.*runtime' <<<"$dv" || die "codesign -dvv does not show the hardened runtime flag" 8
 "$here/selfcheck" app "$app"
 echo "bundle: built $app ($cargo_ver-cpzed.$n, ${sha:0:7})"
