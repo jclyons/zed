@@ -42,6 +42,10 @@ const EXIT_INTERNAL: i32 = 1;
 const EXIT_NOT_CONFIRMED: i32 = 2;
 const EXIT_NO_MATCH: i32 = 3;
 const EXIT_UNSUPPORTED: i32 = 4;
+/// `--agent-close --title` matched several threads; none was closed.
+const EXIT_AMBIGUOUS: i32 = 5;
+/// The id belongs to an agent-panel (non-terminal) thread; refused.
+const EXIT_NOT_TERMINAL: i32 = 6;
 
 /// Serializes `--agent-new` requests: `AgentPanel::pending_terminal_spawn`
 /// holds a single slot, so two overlapping spawns could let the panel create a
@@ -653,6 +657,353 @@ async fn reply_json(
         })
         .to_string()
     })
+}
+
+/// A terminal thread known either from an open agent panel (`live`), from the
+/// persisted metadata store, or both. Stale threads of closed workspaces exist
+/// only in the store.
+struct KnownTerminal {
+    id: TerminalId,
+    /// Custom title, if any, else the terminal's own title.
+    title: String,
+    live: Option<LiveTerminal>,
+}
+
+#[derive(Clone)]
+struct LiveTerminal {
+    target: Target,
+    panel: Entity<AgentPanel>,
+}
+
+fn info_title(info: &agent_ui::AgentPanelTerminalInfo) -> String {
+    reply_title(info).unwrap_or_else(|| info.title.to_string())
+}
+
+/// Every terminal thread in the open agent panels (any window, local or
+/// remote workspace) plus the persisted ones, keyed by id. Read-only.
+fn known_terminals(cx: &App) -> Vec<KnownTerminal> {
+    let mut known: Vec<KnownTerminal> = Vec::new();
+    for window in cx.windows() {
+        let Some(window) = window.downcast::<MultiWorkspace>() else {
+            continue;
+        };
+        let Ok(multi_workspace) = window.read(cx) else {
+            continue;
+        };
+        for workspace in multi_workspace.workspaces() {
+            let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+                continue;
+            };
+            for info in panel.read(cx).terminals(cx) {
+                known.push(KnownTerminal {
+                    id: info.id,
+                    title: info_title(&info),
+                    live: Some(LiveTerminal {
+                        target: Target {
+                            window,
+                            workspace: workspace.clone(),
+                        },
+                        panel: panel.clone(),
+                    }),
+                });
+            }
+        }
+    }
+    if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
+        for metadata in store.read(cx).entries() {
+            if known.iter().all(|entry| entry.id != metadata.terminal_id) {
+                known.push(KnownTerminal {
+                    id: metadata.terminal_id,
+                    title: metadata
+                        .custom_title
+                        .as_ref()
+                        .map(|title| title.to_string())
+                        .unwrap_or_else(|| metadata.title.to_string()),
+                    live: None,
+                });
+            }
+        }
+    }
+    known
+}
+
+/// Waits (bounded) for the terminal metadata store; stale threads live only
+/// there, so an unloaded store must never read as "no such thread".
+async fn wait_for_terminal_store(
+    timeouts: Timeouts,
+    cx: &mut AsyncApp,
+) -> Result<Entity<TerminalThreadMetadataStore>, Failure> {
+    let store = cx
+        .update(|cx| TerminalThreadMetadataStore::try_global(cx))
+        .ok_or_else(|| Failure::internal("agent thread store is not initialized"))?;
+    let reload = cx.update(|cx| store.read(cx).reload_task());
+    bounded(reload, timeouts.metadata, cx).await;
+    if !cx.update(|cx| store.read(cx).is_loaded()) {
+        return Err(Failure::new(
+            EXIT_NOT_CONFIRMED,
+            "timed out loading agent thread metadata",
+        ));
+    }
+    Ok(store)
+}
+
+/// An id that parses but belongs to no terminal: is it an agent-panel thread?
+fn is_agent_panel_thread(id: &str, cx: &App) -> bool {
+    agent_ui::thread_metadata_store::ThreadMetadataStore::try_global(cx).is_some_and(|store| {
+        store
+            .read(cx)
+            .entry_ids()
+            .any(|thread_id| thread_id.to_key_string() == id)
+    })
+}
+
+fn parse_terminal_id(id: &str) -> Result<TerminalId, Failure> {
+    TerminalId::from_key_string(id)
+        .map_err(|_| Failure::internal(format!("invalid thread id: {id:?}")))
+}
+
+fn refuse_non_terminal(id: &str) -> Failure {
+    Failure::new(
+        EXIT_NOT_TERMINAL,
+        format!("{id} is an agent-panel thread, not a terminal thread; refusing"),
+    )
+}
+
+async fn send_outcome(outcome: Result<String, Failure>, responses: &dyn CliResponseSink) {
+    let status = match outcome {
+        Ok(message) => {
+            responses.send(CliResponse::Stdout { message }).log_err();
+            0
+        }
+        Err(failure) => {
+            responses
+                .send(CliResponse::Stderr {
+                    message: failure.message,
+                })
+                .log_err();
+            failure.status
+        }
+    };
+    responses.send(CliResponse::Exit { status }).log_err();
+}
+
+/// `zed --agent-close <id>` / `--agent-close --title <title>`.
+pub async fn handle_close_agent_thread(
+    id: Option<String>,
+    title: Option<String>,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    handle_close_agent_thread_with_timeouts(id, title, Timeouts::default(), responses, cx).await
+}
+
+pub async fn handle_close_agent_thread_with_timeouts(
+    id: Option<String>,
+    title: Option<String>,
+    timeouts: Timeouts,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    let outcome = close_agent_thread(id, title, timeouts, cx).await;
+    send_outcome(outcome, responses).await;
+}
+
+async fn close_agent_thread(
+    id: Option<String>,
+    title: Option<String>,
+    timeouts: Timeouts,
+    cx: &mut AsyncApp,
+) -> Result<String, Failure> {
+    if id.is_some() == title.is_some() {
+        return Err(Failure::internal(
+            "close needs exactly one of a thread id or a title",
+        ));
+    }
+    if cx.update(|cx| DisableAiSettings::get_global(cx).disable_ai) {
+        return Err(Failure::new(
+            EXIT_UNSUPPORTED,
+            "AI features are disabled (disable_ai); there are no agent terminals",
+        ));
+    }
+    let wanted_id = id.as_deref().map(parse_terminal_id).transpose()?;
+    let store = wait_for_terminal_store(timeouts, cx).await?;
+
+    let _guard = SPAWN_LOCK.lock().await;
+    let mut matches: Vec<KnownTerminal> = cx
+        .update(|cx| known_terminals(cx))
+        .into_iter()
+        .filter(|entry| match (&wanted_id, &title) {
+            (Some(wanted), _) => entry.id == *wanted,
+            (None, Some(title)) => entry.title == *title,
+            (None, None) => false,
+        })
+        .collect();
+
+    let not_found = |what: String| {
+        serde_json::json!({ "closed": false, "message": format!("no such thread: {what}") })
+            .to_string()
+    };
+    let known = match matches.len() {
+        0 => {
+            if let Some(id) = &id
+                && cx.update(|cx| is_agent_panel_thread(id, cx))
+            {
+                return Err(refuse_non_terminal(id));
+            }
+            return Ok(not_found(id.or(title).unwrap_or_default()));
+        }
+        1 => matches.remove(0),
+        _ => {
+            matches.sort_by_key(|entry| entry.id.to_string());
+            let ids: Vec<String> = matches.iter().map(|entry| entry.id.to_string()).collect();
+            return Err(Failure::new(
+                EXIT_AMBIGUOUS,
+                format!(
+                    "{} threads are titled {:?}; none closed. Close one by id: {}",
+                    ids.len(),
+                    title.unwrap_or_default(),
+                    ids.join(", ")
+                ),
+            ));
+        }
+    };
+
+    let terminal_id = known.id;
+    if let Some(live) = &known.live {
+        // Same call the sidebar's close makes, through the owning window only
+        // (a background window is neither raised nor focused).
+        cx.update(|cx| {
+            live.target.window.update(cx, |_, window, cx| {
+                live.panel.update(cx, |panel, cx| {
+                    panel.close_terminal_without_activating_draft(terminal_id, window, cx);
+                });
+            })
+        })
+        .map_err(|_| Failure::internal("the window owning the thread was closed"))?;
+        if cx.update(|cx| live.panel.read(cx).has_terminal(terminal_id)) {
+            return Err(Failure::internal(format!(
+                "terminal {terminal_id} is still open after the close request"
+            )));
+        }
+    }
+    // The panel's close already deletes the metadata entry; this also covers a
+    // stale thread of a closed workspace, which has no panel (idempotent).
+    cx.update(|cx| store.update(cx, |store, cx| store.delete(terminal_id, cx)));
+
+    Ok(serde_json::json!({
+        "id": terminal_id.to_string(),
+        "kind": "terminal",
+        "title": known.title,
+        "closed": true,
+        "was_open": known.live.is_some(),
+    })
+    .to_string())
+}
+
+/// `zed --agent-rename <id> <title>`.
+pub async fn handle_rename_agent_thread(
+    id: String,
+    title: String,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    handle_rename_agent_thread_with_timeouts(id, title, Timeouts::default(), responses, cx).await
+}
+
+pub async fn handle_rename_agent_thread_with_timeouts(
+    id: String,
+    title: String,
+    timeouts: Timeouts,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    let outcome = rename_agent_thread(id, title, timeouts, cx).await;
+    send_outcome(outcome, responses).await;
+}
+
+async fn rename_agent_thread(
+    id: String,
+    title: String,
+    timeouts: Timeouts,
+    cx: &mut AsyncApp,
+) -> Result<String, Failure> {
+    if title.trim().is_empty() || title.contains(['\n', '\r']) {
+        return Err(Failure::internal(
+            "the title must be a non-empty single line",
+        ));
+    }
+    if cx.update(|cx| DisableAiSettings::get_global(cx).disable_ai) {
+        return Err(Failure::new(
+            EXIT_UNSUPPORTED,
+            "AI features are disabled (disable_ai); there are no agent terminals",
+        ));
+    }
+    let terminal_id = parse_terminal_id(&id)?;
+    let store = wait_for_terminal_store(timeouts, cx).await?;
+
+    let known = cx
+        .update(|cx| known_terminals(cx))
+        .into_iter()
+        .find(|entry| entry.id == terminal_id);
+    let Some(known) = known else {
+        if cx.update(|cx| is_agent_panel_thread(&id, cx)) {
+            return Err(refuse_non_terminal(&id));
+        }
+        return Err(Failure::new(EXIT_NO_MATCH, format!("no such thread: {id}")));
+    };
+
+    cx.update(|cx| {
+        if let Some(live) = &known.live {
+            live.panel.update(cx, |panel, cx| {
+                panel.rename_terminal(terminal_id, title.clone().into(), cx);
+            });
+        }
+        // Persist explicitly as well (also the only path for a stale thread).
+        store.update(cx, |store, cx| {
+            store.rename_terminal(terminal_id, title.clone().into(), cx);
+        });
+    });
+
+    match known.live {
+        Some(live) => Ok(reply_json(
+            &live.target,
+            &live.panel,
+            terminal_id,
+            Path::new(""),
+            timeouts,
+            cx,
+        )
+        .await),
+        None => Ok(cx.update(|cx| {
+            let metadata = store.read(cx).entry(terminal_id).cloned();
+            serde_json::json!({
+                "id": terminal_id.to_string(),
+                "kind": "terminal",
+                "title": metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.custom_title.as_ref())
+                    .map(|title| title.to_string()),
+                "working_directory": metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.working_directory.as_ref())
+                    .map(|path| path.to_string_lossy().into_owned()),
+                "folder_paths": metadata
+                    .as_ref()
+                    .map(|metadata| {
+                        metadata
+                            .folder_paths()
+                            .paths()
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "window_id": serde_json::Value::Null,
+                "workspace_id": serde_json::Value::Null,
+            })
+            .to_string()
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -1852,5 +2203,354 @@ mod tests {
             })
             .unwrap();
         assert_eq!(keys.len(), 1, "bare-repo worktrees share one group");
+    }
+    // ---- `--agent-close` / `--agent-rename` ----
+    // All of these run on the fake file system plus real shells in a
+    // temp-prefix directory (TestDirs); nothing touches the real home, Dock,
+    // keychain or Zed data dirs.
+
+    async fn new_terminal(
+        cx: &mut TestAppContext,
+        app_state: &Arc<AppState>,
+        cwd: &Path,
+        title: Option<&str>,
+    ) -> String {
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        handle_new_agent_terminal_with_timeouts(
+            cwd.to_path_buf(),
+            None,
+            title.map(str::to_string),
+            NoMatchBehavior::Error,
+            app_state.clone(),
+            Timeouts::default(),
+            &sink,
+            &mut async_cx,
+        )
+        .await;
+        let outcome = Outcome::from(&sink);
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        outcome.stdout.unwrap()["id"].as_str().unwrap().to_string()
+    }
+
+    async fn close(cx: &mut TestAppContext, id: Option<&str>, title: Option<&str>) -> Outcome {
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        handle_close_agent_thread_with_timeouts(
+            id.map(str::to_string),
+            title.map(str::to_string),
+            Timeouts::default(),
+            &sink,
+            &mut async_cx,
+        )
+        .await;
+        Outcome::from(&sink)
+    }
+
+    async fn rename(cx: &mut TestAppContext, id: &str, title: &str) -> Outcome {
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        handle_rename_agent_thread_with_timeouts(
+            id.to_string(),
+            title.to_string(),
+            Timeouts::default(),
+            &sink,
+            &mut async_cx,
+        )
+        .await;
+        Outcome::from(&sink)
+    }
+
+    fn stored_ids(cx: &mut TestAppContext) -> Vec<String> {
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .map(|metadata| metadata.terminal_id.to_string())
+                .collect()
+        })
+    }
+
+    async fn project_with_window(
+        cx: &mut TestAppContext,
+        name: &str,
+    ) -> (TestDirs, Arc<AppState>, PathBuf, Entity<Workspace>) {
+        let app_state = init_agent_test(cx);
+        let dirs = TestDirs::new(name);
+        let root = dirs.dir("project");
+        insert_dirs(&app_state, &root, json!({})).await;
+        let (_window, workspace) = open_window(cx, &app_state, &root).await;
+        (dirs, app_state, root, workspace)
+    }
+
+    #[gpui::test]
+    async fn test_close_by_id_removes_the_terminal_and_is_idempotent(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, workspace) = project_with_window(cx, "close-id").await;
+        let keep = new_terminal(cx, &app_state, &root, Some("keep")).await;
+        let gone = new_terminal(cx, &app_state, &root, Some("gone")).await;
+        cx.run_until_parked();
+        assert_eq!(terminal_count(cx, &workspace), 2);
+        assert!(stored_ids(cx).contains(&gone));
+
+        let outcome = close(cx, Some(&gone), None).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        let reply = outcome.stdout.unwrap();
+        assert_eq!(reply["closed"], json!(true));
+        assert_eq!(reply["id"], json!(gone));
+        assert_eq!(reply["was_open"], json!(true));
+        cx.run_until_parked();
+        assert_eq!(terminal_count(cx, &workspace), 1);
+        let ids = stored_ids(cx);
+        assert!(!ids.contains(&gone), "metadata entry must go too: {ids:?}");
+        assert!(ids.contains(&keep));
+
+        // Second close of the same id: exit 0, nothing closed.
+        let again = close(cx, Some(&gone), None).await;
+        assert_eq!(again.status, 0, "{again:?}");
+        let reply = again.stdout.unwrap();
+        assert_eq!(reply["closed"], json!(false));
+        assert!(
+            reply["message"]
+                .as_str()
+                .unwrap()
+                .contains("no such thread")
+        );
+        assert_eq!(terminal_count(cx, &workspace), 1);
+    }
+
+    #[gpui::test]
+    async fn test_close_unknown_id_exits_0_and_malformed_id_exits_1(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, workspace) = project_with_window(cx, "close-unknown").await;
+        let _id = new_terminal(cx, &app_state, &root, None).await;
+        cx.run_until_parked();
+
+        let unknown = close(cx, Some(&uuid::Uuid::new_v4().to_string()), None).await;
+        assert_eq!(unknown.status, 0, "{unknown:?}");
+        assert_eq!(unknown.stdout.unwrap()["closed"], json!(false));
+
+        let malformed = close(cx, Some("not-a-uuid"), None).await;
+        assert_eq!(malformed.status, 1, "{malformed:?}");
+        assert!(malformed.stderr.contains("invalid thread id"));
+        assert_eq!(terminal_count(cx, &workspace), 1, "nothing may be closed");
+    }
+
+    #[gpui::test]
+    async fn test_close_by_title_closes_the_single_match(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, workspace) = project_with_window(cx, "close-title").await;
+        let _keep = new_terminal(cx, &app_state, &root, Some("other (bg)")).await;
+        let gone = new_terminal(cx, &app_state, &root, Some("worker (bg)")).await;
+        cx.run_until_parked();
+
+        // Zero matches (also no substring matching): exit 0, nothing closed.
+        let none = close(cx, None, Some("worker")).await;
+        assert_eq!(none.status, 0, "{none:?}");
+        assert_eq!(none.stdout.unwrap()["closed"], json!(false));
+        assert_eq!(terminal_count(cx, &workspace), 2);
+
+        let outcome = close(cx, None, Some("worker (bg)")).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert_eq!(outcome.stdout.unwrap()["id"], json!(gone));
+        cx.run_until_parked();
+        assert_eq!(terminal_count(cx, &workspace), 1);
+    }
+
+    #[gpui::test]
+    async fn test_close_by_duplicate_title_refuses_and_lists_ids(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, workspace) = project_with_window(cx, "close-dup").await;
+        let first = new_terminal(cx, &app_state, &root, Some("dup")).await;
+        let second = new_terminal(cx, &app_state, &root, Some("dup")).await;
+        cx.run_until_parked();
+
+        let outcome = close(cx, None, Some("dup")).await;
+        assert_eq!(outcome.status, EXIT_AMBIGUOUS, "{outcome:?}");
+        assert!(outcome.stdout.is_none());
+        assert!(outcome.stderr.contains(&first), "{outcome:?}");
+        assert!(outcome.stderr.contains(&second), "{outcome:?}");
+        cx.run_until_parked();
+        assert_eq!(terminal_count(cx, &workspace), 2, "none may be closed");
+        assert_eq!(stored_ids(cx).len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_close_refuses_an_agent_panel_thread(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, workspace) = project_with_window(cx, "close-nonterm").await;
+        let _id = new_terminal(cx, &app_state, &root, None).await;
+        cx.run_until_parked();
+
+        use agent_ui::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore};
+        let thread_id = ThreadId::new();
+        cx.update(ThreadMetadataStore::init_global);
+        // Let the store's initial DB load finish; it would replace a thread saved before it.
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(
+                    ThreadMetadata {
+                        thread_id,
+                        session_id: None,
+                        agent_id: agent::ZED_AGENT_ID.clone(),
+                        title: Some("an agent-panel thread".into()),
+                        title_override: None,
+                        updated_at: chrono::Utc::now(),
+                        created_at: None,
+                        interacted_at: None,
+                        worktree_paths: Default::default(),
+                        remote_connection: None,
+                        archived: false,
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let id = thread_id.to_key_string();
+        let closed = close(cx, Some(&id), None).await;
+        assert_eq!(closed.status, EXIT_NOT_TERMINAL, "{closed:?}");
+        assert!(closed.stderr.contains("not a terminal"), "{closed:?}");
+        let renamed = rename(cx, &id, "x").await;
+        assert_eq!(renamed.status, EXIT_NOT_TERMINAL, "{renamed:?}");
+        assert_eq!(terminal_count(cx, &workspace), 1);
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            assert!(store.read(cx).entry(thread_id).is_some(), "left untouched");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_close_stale_store_only_thread(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, workspace) = project_with_window(cx, "close-stale").await;
+        let live = new_terminal(cx, &app_state, &root, Some("live")).await;
+        cx.run_until_parked();
+
+        // A thread of a stopped session: persisted, but in no open panel.
+        let stale_id = agent_ui::TerminalId::test_new();
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(
+                    agent_ui::terminal_thread_metadata_store::TerminalThreadMetadata {
+                        terminal_id: stale_id,
+                        title: "stale".into(),
+                        custom_title: Some("old session (bg)".into()),
+                        created_at: chrono::Utc::now(),
+                        worktree_paths: Default::default(),
+                        remote_connection: None,
+                        working_directory: None,
+                    },
+                    cx,
+                );
+            });
+        });
+        let stale = stale_id.to_string();
+        assert!(stored_ids(cx).contains(&stale));
+
+        let outcome = close(cx, None, Some("old session (bg)")).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        let reply = outcome.stdout.unwrap();
+        assert_eq!(reply["id"], json!(stale));
+        assert_eq!(reply["was_open"], json!(false));
+        cx.run_until_parked();
+        let ids = stored_ids(cx);
+        assert!(!ids.contains(&stale) && ids.contains(&live), "{ids:?}");
+        assert_eq!(terminal_count(cx, &workspace), 1);
+    }
+
+    #[gpui::test]
+    async fn test_close_exits_4_when_ai_is_disabled(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, _workspace) = project_with_window(cx, "close-noai").await;
+        let id = new_terminal(cx, &app_state, &root, None).await;
+        cx.run_until_parked();
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.disable_ai = Some(settings::SaturatingBool(true));
+                });
+            });
+        });
+        cx.run_until_parked();
+        let outcome = close(cx, Some(&id), None).await;
+        assert_eq!(outcome.status, 4, "{outcome:?}");
+        let outcome = rename(cx, &id, "x").await;
+        assert_eq!(outcome.status, 4, "{outcome:?}");
+    }
+
+    #[gpui::test]
+    async fn test_rename_sets_the_custom_title_and_replies_like_agent_new(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, _workspace) = project_with_window(cx, "rename").await;
+        let id = new_terminal(cx, &app_state, &root, Some("before")).await;
+        cx.run_until_parked();
+
+        let outcome = rename(cx, &id, "after (bg)").await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        let reply = outcome.stdout.unwrap();
+        assert_eq!(reply["id"], json!(id));
+        assert_eq!(reply["kind"], json!("terminal"));
+        assert_eq!(reply["title"], json!("after (bg)"));
+        assert!(reply["window_id"].is_u64(), "{reply}");
+        assert!(
+            reply["folder_paths"]
+                .as_array()
+                .is_some_and(|p| !p.is_empty())
+        );
+        assert!(reply.get("workspace_id").is_some());
+        cx.run_until_parked();
+
+        // The stored custom title follows, and a title lookup finds it.
+        let stored = cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .find_map(|metadata| metadata.custom_title.clone())
+        });
+        assert_eq!(stored.as_deref(), Some("after (bg)"));
+        let by_title = close(cx, None, Some("before")).await;
+        assert_eq!(by_title.stdout.unwrap()["closed"], json!(false));
+    }
+
+    #[gpui::test]
+    async fn test_rename_unknown_id_exits_3_and_bad_titles_are_rejected(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, _workspace) = project_with_window(cx, "rename-bad").await;
+        let id = new_terminal(cx, &app_state, &root, Some("t")).await;
+        cx.run_until_parked();
+
+        let unknown = rename(cx, &uuid::Uuid::new_v4().to_string(), "x").await;
+        assert_eq!(unknown.status, 3, "{unknown:?}");
+        assert!(unknown.stderr.contains("no such thread"));
+
+        for bad in ["", "   ", "a\nb"] {
+            let outcome = rename(cx, &id, bad).await;
+            assert_eq!(outcome.status, 1, "{bad:?} {outcome:?}");
+        }
+        let malformed = rename(cx, "nope", "x").await;
+        assert_eq!(malformed.status, 1, "{malformed:?}");
+    }
+
+    #[gpui::test]
+    async fn test_rename_stale_store_only_thread(cx: &mut TestAppContext) {
+        let (_dirs, _app_state, _root, _workspace) = project_with_window(cx, "rename-stale").await;
+        let stale_id = agent_ui::TerminalId::test_new();
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(
+                    agent_ui::terminal_thread_metadata_store::TerminalThreadMetadata {
+                        terminal_id: stale_id,
+                        title: "stale".into(),
+                        custom_title: None,
+                        created_at: chrono::Utc::now(),
+                        worktree_paths: Default::default(),
+                        remote_connection: None,
+                        working_directory: None,
+                    },
+                    cx,
+                );
+            });
+        });
+        let outcome = rename(cx, &stale_id.to_string(), "renamed").await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        let reply = outcome.stdout.unwrap();
+        assert_eq!(reply["title"], json!("renamed"));
+        assert!(reply["window_id"].is_null());
     }
 }

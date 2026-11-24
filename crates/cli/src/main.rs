@@ -62,7 +62,8 @@ Examples:
           Open your project in Zed
     `zed -n path-to-file `
           Open file/folder in a new window",
-    after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
+    after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'",
+    group = clap::ArgGroup::new("title_owner").args(["agent_new", "agent_close"]).multiple(true)
 )]
 struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
@@ -137,13 +138,31 @@ struct Args {
     #[arg(long)]
     agent_list: bool,
     /// Create a new terminal agent thread in the running Zed.
-    #[arg(long, conflicts_with_all = ["paths_with_position", "agent_list", "debug_state", "diff"])]
+    #[arg(long, conflicts_with_all = ["paths_with_position", "agent_list", "debug_state", "diff", "agent_close", "agent_rename"])]
     agent_new: bool,
+    /// Close a terminal thread by id (`--agent-close <ID>`) or by exact title
+    /// (`--agent-close --title <TITLE>`). An unknown id/title is not an error.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        value_name = "ID",
+        conflicts_with_all = ["paths_with_position", "agent_list", "debug_state", "diff", "agent_new", "agent_rename"]
+    )]
+    agent_close: Option<Option<String>>,
+    /// Set a terminal thread's title: `--agent-rename <ID> <TITLE>`.
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["ID", "TITLE"],
+        conflicts_with_all = ["paths_with_position", "agent_list", "debug_state", "diff", "agent_new", "agent_close"]
+    )]
+    agent_rename: Option<Vec<String>>,
     /// Command to type into the new terminal thread (requires --agent-new).
     #[arg(long, requires = "agent_new", value_name = "CMD")]
     command: Option<String>,
-    /// Title for the new terminal thread (requires --agent-new).
-    #[arg(long, requires = "agent_new", value_name = "TITLE")]
+    /// Title for the new terminal thread (--agent-new), or the exact title of
+    /// the thread to close (--agent-close).
+    #[arg(long, requires = "title_owner", value_name = "TITLE")]
     title: Option<String>,
     /// Working directory for the new terminal thread (default: current directory).
     #[arg(long, requires = "agent_new", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
@@ -286,6 +305,35 @@ fn create_empty_stub(temp_dir: &mut TempDir, rel: &Path) -> anyhow::Result<PathB
     Ok(stub_path)
 }
 
+/// Builds the `--agent-close` / `--agent-rename` request, if one was given.
+/// `--agent-close` needs exactly one of an id or `--title`.
+fn build_agent_manage_request(args: &Args) -> Result<Option<CliRequest>> {
+    if let Some(close) = &args.agent_close {
+        let id = close.clone().filter(|id| !id.is_empty());
+        anyhow::ensure!(
+            id.is_some() != args.title.is_some(),
+            "--agent-close needs exactly one of a thread id or --title"
+        );
+        return Ok(Some(CliRequest::CloseAgentThread {
+            id,
+            title: args.title.clone(),
+        }));
+    }
+    if let Some(rename) = &args.agent_rename {
+        anyhow::ensure!(
+            !args.title.is_some(),
+            "--agent-rename takes the new title as its second value, not --title"
+        );
+        if let [id, title] = rename.as_slice() {
+            return Ok(Some(CliRequest::RenameAgentThread {
+                id: id.clone(),
+                title: title.clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn build_agent_new_request(
     cwd: PathBuf,
     command: Option<String>,
@@ -326,6 +374,45 @@ mod tests {
         assert!(parse(&["--agent-new", "--agent-list"]).is_err());
         assert!(parse(&["--agent-new", "--open-project", "--new-window"]).is_err());
         assert!(parse(&["--command", "x"]).is_err());
+    }
+
+    #[test]
+    fn agent_close_and_rename_flags() {
+        let close = |args: &[&str]| {
+            let args = parse(args).unwrap();
+            build_agent_manage_request(&args)
+        };
+        match close(&["--agent-close", "abc"]).unwrap() {
+            Some(CliRequest::CloseAgentThread { id, title }) => {
+                assert_eq!((id.as_deref(), title), (Some("abc"), None));
+            }
+            other => panic!("{other:?}"),
+        }
+        match close(&["--agent-close", "--title", "T (bg)"]).unwrap() {
+            Some(CliRequest::CloseAgentThread { id, title }) => {
+                assert_eq!((id, title.as_deref()), (None, Some("T (bg)")));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Exactly one of id / title.
+        assert!(close(&["--agent-close"]).is_err());
+        assert!(close(&["--agent-close", "abc", "--title", "T"]).is_err());
+        match close(&["--agent-rename", "abc", "New title"]).unwrap() {
+            Some(CliRequest::RenameAgentThread { id, title }) => {
+                assert_eq!((id.as_str(), title.as_str()), ("abc", "New title"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&["--agent-rename", "abc"]).is_err());
+        // `--title` is not valid with --agent-rename (clap rejects it).
+        assert!(parse(&["--agent-rename", "abc", "t", "--title", "x"]).is_err());
+        // Mutually exclusive with the other agent modes and with paths.
+        assert!(parse(&["--agent-close", "abc", "--agent-new"]).is_err());
+        assert!(parse(&["--agent-close", "abc", "--agent-list"]).is_err());
+        assert!(parse(&["--agent-rename", "a", "b", "--agent-close", "c"]).is_err());
+        assert!(parse(&["--agent-close", "abc", "some/path"]).is_err());
+        // `--title` still needs --agent-new or --agent-close.
+        assert!(parse(&["--title", "x"]).is_err());
     }
 
     #[test]
@@ -737,6 +824,8 @@ fn run() -> Result<()> {
         None
     };
 
+    let agent_manage_request = build_agent_manage_request(&args)?;
+
     anyhow::ensure!(
         args.dev_server_token.is_none(),
         "Dev servers were removed in v0.157.x please upgrade to SSH remoting: https://zed.dev/docs/remote-development"
@@ -777,9 +866,12 @@ fn run() -> Result<()> {
                     cwd: env::current_dir().ok(),
                 };
 
+                let expects_agent_reply = agent_manage_request.is_some();
                 tx.send(if args.debug_state {
                     CliRequest::DebugState
                 } else if let Some(request) = agent_new_request {
+                    request
+                } else if let Some(request) = agent_manage_request {
                     request
                 } else if args.agent_list {
                     CliRequest::ListAgentThreads
@@ -802,6 +894,15 @@ fn run() -> Result<()> {
                             tx.send(CliRequest::SetOpenBehavior { behavior })?;
                         }
                     }
+                }
+
+                // An app built before --agent-close/--agent-rename cannot decode the
+                // request, drops the connection and never replies.
+                if expects_agent_reply && exit_status.lock().is_none() {
+                    eprintln!(
+                        "zed: the running app did not answer this request; it is probably too old for it. Relaunch CPZed and retry."
+                    );
+                    exit_status.lock().replace(1);
                 }
 
                 Ok(())

@@ -230,7 +230,7 @@ impl TerminalId {
         self.0.hyphenated().to_string()
     }
 
-    pub(crate) fn from_key_string(key: &str) -> anyhow::Result<Self> {
+    pub fn from_key_string(key: &str) -> anyhow::Result<Self> {
         Ok(Self(uuid::Uuid::parse_str(key)?))
     }
 }

@@ -764,6 +764,14 @@ pub async fn handle_cli_request(
             )
             .await;
         }
+        CliRequest::CloseAgentThread { id, title } => {
+            crate::zed::cli_agent::handle_close_agent_thread(id, title, responses.as_ref(), cx)
+                .await;
+        }
+        CliRequest::RenameAgentThread { id, title } => {
+            crate::zed::cli_agent::handle_rename_agent_thread(id, title, responses.as_ref(), cx)
+                .await;
+        }
     }
 }
 
