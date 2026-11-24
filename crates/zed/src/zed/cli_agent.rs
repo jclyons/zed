@@ -44,8 +44,10 @@ const EXIT_NO_MATCH: i32 = 3;
 const EXIT_UNSUPPORTED: i32 = 4;
 /// `--agent-close --title` matched several threads; none was closed.
 const EXIT_AMBIGUOUS: i32 = 5;
+/// Longest accepted `--agent-rename` title, in characters.
+const MAX_TITLE_CHARS: usize = 200;
 /// The id belongs to an agent-panel (non-terminal) thread; refused.
-const EXIT_NOT_TERMINAL: i32 = 6;
+const EXIT_NOT_TERMINAL: i32 = 7;
 
 /// Serializes `--agent-new` requests: `AgentPanel::pending_terminal_spawn`
 /// holds a single slot, so two overlapping spawns could let the panel create a
@@ -931,6 +933,11 @@ async fn rename_agent_thread(
         return Err(Failure::internal(
             "the title must be a non-empty single line",
         ));
+    }
+    if title.chars().count() > MAX_TITLE_CHARS {
+        return Err(Failure::internal(format!(
+            "the title is too long (max {MAX_TITLE_CHARS} characters)"
+        )));
     }
     if cx.update(|cx| DisableAiSettings::get_global(cx).disable_ai) {
         return Err(Failure::new(
@@ -2523,6 +2530,12 @@ mod tests {
             let outcome = rename(cx, &id, bad).await;
             assert_eq!(outcome.status, 1, "{bad:?} {outcome:?}");
         }
+        let long = "x".repeat(MAX_TITLE_CHARS + 1);
+        let outcome = rename(cx, &id, &long).await;
+        assert_eq!(outcome.status, 1, "{outcome:?}");
+        assert!(outcome.stderr.contains("too long"), "{outcome:?}");
+        let at_cap = "y".repeat(MAX_TITLE_CHARS);
+        assert_eq!(rename(cx, &id, &at_cap).await.status, 0);
         let malformed = rename(cx, "nope", "x").await;
         assert_eq!(malformed.status, 1, "{malformed:?}");
     }
