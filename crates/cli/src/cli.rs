@@ -89,6 +89,18 @@ pub enum CliRequest {
         #[serde(default)]
         on_no_match: NoMatchBehavior,
     },
+    /// Close one terminal thread (`zed --agent-close`), by id or by exact
+    /// title; exactly one of the two is set (the CLI enforces it). Appended
+    /// last to keep the enum append-only.
+    CloseAgentThread {
+        id: Option<String>,
+        title: Option<String>,
+    },
+    /// Set a terminal thread's custom title (`zed --agent-rename`).
+    RenameAgentThread {
+        id: String,
+        title: String,
+    },
 }
 
 /// What `--agent-new` does when no open project contains the requested cwd.
@@ -172,5 +184,144 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn close_and_rename_requests_round_trip() {
+        let close = CliRequest::CloseAgentThread {
+            id: None,
+            title: Some("worker (bg)".into()),
+        };
+        let json = serde_json::to_string(&close).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<CliRequest>(&json).unwrap(),
+            CliRequest::CloseAgentThread { id: None, title: Some(t) } if t == "worker (bg)"
+        ));
+        let rename = CliRequest::RenameAgentThread {
+            id: "i".into(),
+            title: "t".into(),
+        };
+        let json = serde_json::to_string(&rename).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<CliRequest>(&json).unwrap(),
+            CliRequest::RenameAgentThread { id, title } if id == "i" && title == "t"
+        ));
+    }
+
+    // The wire format is ipc-channel's bincode 1 (positional): variants are
+    // identified by their index, so existing ones must never move and new
+    // ones are only ever appended.
+    fn variant_index(request: &CliRequest) -> u32 {
+        let bytes = bincode::serialize(request).unwrap();
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    fn bincode_string(s: &str) -> Vec<u8> {
+        let mut bytes = (s.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(s.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn bincode_variant_indices_are_stable() {
+        let open = CliRequest::Open {
+            paths: vec![],
+            urls: vec![],
+            diff_paths: vec![],
+            diff_all: false,
+            wsl: None,
+            wait: false,
+            open_behavior: OpenBehavior::default(),
+            env: None,
+            user_data_dir: None,
+            dev_container: false,
+            cwd: None,
+        };
+        let indices = [
+            variant_index(&open),
+            variant_index(&CliRequest::SetOpenBehavior {
+                behavior: CliBehaviorSetting::ExistingWindow,
+            }),
+            variant_index(&CliRequest::DebugState),
+            variant_index(&CliRequest::ListAgentThreads),
+            variant_index(&CliRequest::NewAgentTerminal {
+                cwd: PathBuf::from("/"),
+                command: None,
+                title: None,
+                on_no_match: NoMatchBehavior::Error,
+            }),
+            variant_index(&CliRequest::CloseAgentThread {
+                id: None,
+                title: None,
+            }),
+            variant_index(&CliRequest::RenameAgentThread {
+                id: String::new(),
+                title: String::new(),
+            }),
+        ];
+        assert_eq!(indices, [0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn bincode_golden_bytes_of_existing_variants() {
+        assert_eq!(
+            bincode::serialize(&CliRequest::DebugState).unwrap(),
+            2u32.to_le_bytes()
+        );
+        assert_eq!(
+            bincode::serialize(&CliRequest::ListAgentThreads).unwrap(),
+            3u32.to_le_bytes()
+        );
+        let mut expected = 4u32.to_le_bytes().to_vec();
+        expected.extend(bincode_string("/tmp/p"));
+        expected.push(1); // command: Some
+        expected.extend(bincode_string("echo hi"));
+        expected.push(0); // title: None
+        expected.extend(2u32.to_le_bytes()); // NoMatchBehavior::NewWindow
+        let request = CliRequest::NewAgentTerminal {
+            cwd: PathBuf::from("/tmp/p"),
+            command: Some("echo hi".into()),
+            title: None,
+            on_no_match: NoMatchBehavior::NewWindow,
+        };
+        assert_eq!(bincode::serialize(&request).unwrap(), expected);
+    }
+
+    #[test]
+    fn close_and_rename_golden_bytes_and_bincode_round_trip() {
+        let close = CliRequest::CloseAgentThread {
+            id: None,
+            title: Some("w (bg)".into()),
+        };
+        let mut expected = 5u32.to_le_bytes().to_vec();
+        expected.push(0); // id: None
+        expected.push(1); // title: Some
+        expected.extend(bincode_string("w (bg)"));
+        let bytes = bincode::serialize(&close).unwrap();
+        assert_eq!(bytes, expected);
+        assert!(matches!(
+            bincode::deserialize::<CliRequest>(&bytes).unwrap(),
+            CliRequest::CloseAgentThread { id: None, title: Some(t) } if t == "w (bg)"
+        ));
+
+        let rename = CliRequest::RenameAgentThread {
+            id: "i".into(),
+            title: "t".into(),
+        };
+        let mut expected = 6u32.to_le_bytes().to_vec();
+        expected.extend(bincode_string("i"));
+        expected.extend(bincode_string("t"));
+        let bytes = bincode::serialize(&rename).unwrap();
+        assert_eq!(bytes, expected);
+        assert!(matches!(
+            bincode::deserialize::<CliRequest>(&bytes).unwrap(),
+            CliRequest::RenameAgentThread { id, title } if id == "i" && title == "t"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_variant_index_is_a_clean_decode_error() {
+        // What an app built before these variants sees: an error, no panic.
+        assert!(bincode::deserialize::<CliRequest>(&99u32.to_le_bytes()).is_err());
     }
 }
