@@ -101,6 +101,47 @@ pub enum CliRequest {
         id: String,
         title: String,
     },
+    /// `--agent-set-parent` / `--agent-set-section`: change the hierarchy of
+    /// an existing thread. Appended last to keep the enum append-only.
+    UpdateAgentThread {
+        id: String,
+        parent: Option<ParentChange>,
+        section: Option<SectionChange>,
+    },
+    /// `--agent-new` with `--parent` / `--section`. A separate, appended
+    /// variant (never new fields on `NewAgentTerminal`): bincode is
+    /// positional, so an old app would silently drop trailing fields and
+    /// succeed without placing the thread. The CLI sends `NewAgentTerminal`
+    /// when neither flag is given, so plain `--agent-new` stays compatible.
+    NewAgentTerminalIn {
+        cwd: PathBuf,
+        command: Option<String>,
+        title: Option<String>,
+        on_no_match: NoMatchBehavior,
+        /// Nest the new thread under this thread id (`--parent`).
+        parent: Option<String>,
+        /// Put the new thread in this section of its own project, creating
+        /// the section if missing (`--section`).
+        section: Option<String>,
+    },
+}
+
+/// A requested change of a thread's parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParentChange {
+    /// Nest under the thread with this id.
+    Set(String),
+    /// Un-nest (`none`).
+    Clear,
+}
+
+/// A requested change of a thread's section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SectionChange {
+    /// Move into the section with this name (in the thread's own project).
+    Set(String),
+    /// Make the thread unsectioned (`none`).
+    Clear,
 }
 
 /// What `--agent-new` does when no open project contains the requested cwd.
@@ -323,5 +364,141 @@ mod tests {
     fn an_unknown_variant_index_is_a_clean_decode_error() {
         // What an app built before these variants sees: an error, no panic.
         assert!(bincode::deserialize::<CliRequest>(&99u32.to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn new_agent_terminal_in_round_trips() {
+        let request = CliRequest::NewAgentTerminalIn {
+            cwd: PathBuf::from("/x"),
+            command: None,
+            title: None,
+            on_no_match: NoMatchBehavior::Error,
+            parent: Some("p".into()),
+            section: Some("Personas".into()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        match serde_json::from_str::<CliRequest>(&json).unwrap() {
+            CliRequest::NewAgentTerminalIn {
+                parent, section, ..
+            } => {
+                assert_eq!(parent.as_deref(), Some("p"));
+                assert_eq!(section.as_deref(), Some("Personas"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// S2's variants are appended after #14's (indices 5/6): 7 and 8, with
+    /// golden bytes, so old and new binaries agree on them.
+    #[test]
+    fn s2_variants_are_appended_with_stable_wire_bytes() {
+        let update = CliRequest::UpdateAgentThread {
+            id: "i".into(),
+            parent: Some(ParentChange::Set("p".into())),
+            section: Some(SectionChange::Clear),
+        };
+        let mut expected = 7u32.to_le_bytes().to_vec();
+        expected.extend(bincode_string("i"));
+        expected.push(1); // parent: Some
+        expected.extend(0u32.to_le_bytes()); // ParentChange::Set
+        expected.extend(bincode_string("p"));
+        expected.push(1); // section: Some
+        expected.extend(1u32.to_le_bytes()); // SectionChange::Clear
+        assert_eq!(bincode::serialize(&update).unwrap(), expected);
+
+        let new_in = CliRequest::NewAgentTerminalIn {
+            cwd: PathBuf::from("/x"),
+            command: None,
+            title: None,
+            on_no_match: NoMatchBehavior::Error,
+            parent: Some("p".into()),
+            section: None,
+        };
+        let mut expected = 8u32.to_le_bytes().to_vec();
+        expected.extend(bincode_string("/x"));
+        expected.push(0); // command: None
+        expected.push(0); // title: None
+        expected.extend(0u32.to_le_bytes()); // NoMatchBehavior::Error
+        expected.push(1); // parent: Some
+        expected.extend(bincode_string("p"));
+        expected.push(0); // section: None
+        assert_eq!(bincode::serialize(&new_in).unwrap(), expected);
+    }
+
+    /// The new variants survive a bincode round trip; an app that predates
+    /// them fails to decode (clean rejection), it does not mis-decode them as
+    /// `NewAgentTerminal`.
+    #[test]
+    fn new_variants_round_trip_through_bincode() {
+        let request = CliRequest::NewAgentTerminalIn {
+            cwd: PathBuf::from("/x"),
+            command: None,
+            title: Some("t".into()),
+            on_no_match: NoMatchBehavior::NewWindow,
+            parent: Some("p".into()),
+            section: None,
+        };
+        let bytes = bincode::serialize(&request).unwrap();
+        match bincode::deserialize::<CliRequest>(&bytes).unwrap() {
+            CliRequest::NewAgentTerminalIn {
+                title,
+                on_no_match,
+                parent,
+                section,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("t"));
+                assert_eq!(on_no_match, NoMatchBehavior::NewWindow);
+                assert_eq!(parent.as_deref(), Some("p"));
+                assert_eq!(section, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let update = CliRequest::UpdateAgentThread {
+            id: "abc".into(),
+            parent: Some(ParentChange::Set("p".into())),
+            section: Some(SectionChange::Clear),
+        };
+        let bytes = bincode::serialize(&update).unwrap();
+        match bincode::deserialize::<CliRequest>(&bytes).unwrap() {
+            CliRequest::UpdateAgentThread {
+                id,
+                parent,
+                section,
+            } => {
+                assert_eq!(id, "abc");
+                assert_eq!(parent, Some(ParentChange::Set("p".into())));
+                assert_eq!(section, Some(SectionChange::Clear));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn update_agent_thread_round_trips() {
+        for (parent, section) in [
+            (Some(ParentChange::Set("p".into())), None),
+            (Some(ParentChange::Clear), Some(SectionChange::Clear)),
+            (None, Some(SectionChange::Set("S".into()))),
+        ] {
+            let request = CliRequest::UpdateAgentThread {
+                id: "abc".into(),
+                parent: parent.clone(),
+                section: section.clone(),
+            };
+            let json = serde_json::to_string(&request).unwrap();
+            match serde_json::from_str::<CliRequest>(&json).unwrap() {
+                CliRequest::UpdateAgentThread {
+                    id,
+                    parent: p,
+                    section: s,
+                } => {
+                    assert_eq!(id, "abc");
+                    assert_eq!(p, parent);
+                    assert_eq!(s, section);
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
     }
 }

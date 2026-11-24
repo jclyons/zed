@@ -157,6 +157,39 @@ struct Args {
         conflicts_with_all = ["paths_with_position", "agent_list", "debug_state", "diff", "agent_new", "agent_close"]
     )]
     agent_rename: Option<Vec<String>>,
+    /// Nest the new terminal thread under the thread with this id (requires --agent-new).
+    #[arg(
+        long,
+        requires = "agent_new",
+        conflicts_with = "section",
+        value_name = "ID"
+    )]
+    parent: Option<String>,
+    /// Put the new terminal thread in this section of its project, creating the
+    /// section if missing (requires --agent-new).
+    #[arg(
+        long,
+        requires = "agent_new",
+        conflicts_with = "parent",
+        value_name = "NAME"
+    )]
+    section: Option<String>,
+    /// Set (or, with `none`, clear) the parent of an existing thread: ID (PARENT_ID|none).
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["ID", "PARENT_ID|none"],
+        conflicts_with_all = ["paths_with_position", "agent_list", "agent_new", "debug_state", "diff", "agent_close", "agent_rename", "agent_set_section"]
+    )]
+    agent_set_parent: Option<Vec<String>>,
+    /// Set (or, with `none`, clear) the section of an existing thread: ID (NAME|none).
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["ID", "NAME|none"],
+        conflicts_with_all = ["paths_with_position", "agent_list", "agent_new", "debug_state", "diff", "agent_close", "agent_rename", "agent_set_parent"]
+    )]
+    agent_set_section: Option<Vec<String>>,
     /// Command to type into the new terminal thread (requires --agent-new).
     #[arg(long, requires = "agent_new", value_name = "CMD")]
     command: Option<String>,
@@ -340,6 +373,8 @@ fn build_agent_new_request(
     title: Option<String>,
     open_project: bool,
     new_window: bool,
+    parent: Option<String>,
+    section: Option<String>,
 ) -> CliRequest {
     let on_no_match = if new_window {
         cli::NoMatchBehavior::NewWindow
@@ -348,12 +383,59 @@ fn build_agent_new_request(
     } else {
         cli::NoMatchBehavior::Error
     };
-    CliRequest::NewAgentTerminal {
-        cwd,
-        command,
-        title,
-        on_no_match,
+    // Plain `--agent-new` keeps sending the original variant so it works against
+    // an app that predates --parent/--section; the new fields need the new variant
+    // (an old app rejects it instead of silently dropping the placement).
+    if parent.is_none() && section.is_none() {
+        CliRequest::NewAgentTerminal {
+            cwd,
+            command,
+            title,
+            on_no_match,
+        }
+    } else {
+        CliRequest::NewAgentTerminalIn {
+            cwd,
+            command,
+            title,
+            on_no_match,
+            parent,
+            section,
+        }
     }
+}
+
+/// `none` (exactly) clears; anything else sets.
+fn build_update_request(
+    set_parent: Option<&[String]>,
+    set_section: Option<&[String]>,
+) -> Option<CliRequest> {
+    let (id, parent, section) = match (set_parent, set_section) {
+        (Some([id, value]), _) => (
+            id.clone(),
+            Some(if value == "none" {
+                cli::ParentChange::Clear
+            } else {
+                cli::ParentChange::Set(value.clone())
+            }),
+            None,
+        ),
+        (_, Some([id, value])) => (
+            id.clone(),
+            None,
+            Some(if value == "none" {
+                cli::SectionChange::Clear
+            } else {
+                cli::SectionChange::Set(value.clone())
+            }),
+        ),
+        _ => return None,
+    };
+    Some(CliRequest::UpdateAgentThread {
+        id,
+        parent,
+        section,
+    })
 }
 
 #[cfg(test)]
@@ -416,14 +498,124 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_flags_and_conflicts() {
+        let args = parse(&["--agent-new", "--parent", "abc"]).unwrap();
+        assert_eq!(args.parent.as_deref(), Some("abc"));
+        let args = parse(&["--agent-new", "--section", "Personas"]).unwrap();
+        assert_eq!(args.section.as_deref(), Some("Personas"));
+        assert!(parse(&["--agent-new", "--parent", "a", "--section", "S"]).is_err());
+        assert!(parse(&["--parent", "a"]).is_err());
+        assert!(parse(&["--section", "S"]).is_err());
+
+        let args = parse(&["--agent-set-parent", "c", "p"]).unwrap();
+        assert_eq!(args.agent_set_parent, Some(vec!["c".into(), "p".into()]));
+        assert!(parse(&["--agent-set-parent", "c"]).is_err());
+        assert!(parse(&["--agent-set-parent", "c", "p", "some/path"]).is_err());
+        assert!(parse(&["--agent-set-parent", "c", "p", "--agent-list"]).is_err());
+        assert!(parse(&["--agent-set-parent", "c", "p", "--agent-new"]).is_err());
+        assert!(parse(&["--agent-set-section", "c", "S", "--agent-list"]).is_err());
+        assert!(parse(&["--agent-set-section", "c", "S", "--agent-new"]).is_err());
+        assert!(
+            parse(&[
+                "--agent-set-section",
+                "c",
+                "S",
+                "--agent-set-parent",
+                "c",
+                "p"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn update_request_none_parsing() {
+        let parent = |v: &[&str]| {
+            let v: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+            build_update_request(Some(&v), None).unwrap()
+        };
+        match parent(&["c", "none"]) {
+            CliRequest::UpdateAgentThread {
+                id,
+                parent,
+                section,
+            } => {
+                assert_eq!(id, "c");
+                assert_eq!(parent, Some(cli::ParentChange::Clear));
+                assert_eq!(section, None);
+            }
+            _ => unreachable!(),
+        }
+        match parent(&["c", "p"]) {
+            CliRequest::UpdateAgentThread { parent, .. } => {
+                assert_eq!(parent, Some(cli::ParentChange::Set("p".into())));
+            }
+            _ => unreachable!(),
+        }
+        let v: Vec<String> = vec!["c".into(), "none".into()];
+        match build_update_request(None, Some(&v)).unwrap() {
+            CliRequest::UpdateAgentThread {
+                section, parent, ..
+            } => {
+                assert_eq!(section, Some(cli::SectionChange::Clear));
+                assert_eq!(parent, None);
+            }
+            _ => unreachable!(),
+        }
+        let v: Vec<String> = vec!["c".into(), "None".into()];
+        match build_update_request(None, Some(&v)).unwrap() {
+            CliRequest::UpdateAgentThread { section, .. } => {
+                assert_eq!(section, Some(cli::SectionChange::Set("None".into())));
+            }
+            _ => unreachable!(),
+        }
+        assert!(build_update_request(None, None).is_none());
+    }
+
+    #[test]
     fn agent_new_request_mapping() {
-        let map = |o, n| match build_agent_new_request("/a".into(), Some("x".into()), None, o, n) {
+        let map = |o, n| match build_agent_new_request(
+            "/a".into(),
+            Some("x".into()),
+            None,
+            o,
+            n,
+            None,
+            None,
+        ) {
             CliRequest::NewAgentTerminal { on_no_match, .. } => on_no_match,
             _ => unreachable!(),
         };
         assert_eq!(map(false, false), cli::NoMatchBehavior::Error);
         assert_eq!(map(true, false), cli::NoMatchBehavior::OpenProject);
         assert_eq!(map(false, true), cli::NoMatchBehavior::NewWindow);
+    }
+
+    #[test]
+    fn hierarchy_flags_pick_the_new_variant_only_when_used() {
+        let build = |parent: Option<&str>, section: Option<&str>| {
+            build_agent_new_request(
+                "/a".into(),
+                None,
+                None,
+                false,
+                false,
+                parent.map(Into::into),
+                section.map(Into::into),
+            )
+        };
+        assert!(matches!(
+            build(None, None),
+            CliRequest::NewAgentTerminal { .. }
+        ));
+        assert!(matches!(
+            build(Some("p"), None),
+            CliRequest::NewAgentTerminalIn { .. }
+        ));
+        assert!(matches!(
+            build(None, Some("S")),
+            CliRequest::NewAgentTerminalIn { .. }
+        ));
     }
     use util::path;
     use util::paths::SanitizedPath;
@@ -819,12 +1011,18 @@ fn run() -> Result<()> {
             args.title.clone(),
             args.open_project,
             args.new_window,
+            args.parent.clone(),
+            args.section.clone(),
         ))
     } else {
         None
     };
 
     let agent_manage_request = build_agent_manage_request(&args)?;
+    let agent_update_request = build_update_request(
+        args.agent_set_parent.as_deref(),
+        args.agent_set_section.as_deref(),
+    );
 
     anyhow::ensure!(
         args.dev_server_token.is_none(),
@@ -866,12 +1064,19 @@ fn run() -> Result<()> {
                     cwd: env::current_dir().ok(),
                 };
 
-                let expects_agent_reply = agent_manage_request.is_some();
+                let expects_agent_reply = agent_manage_request.is_some()
+                    || agent_update_request.is_some()
+                    || matches!(
+                        &agent_new_request,
+                        Some(CliRequest::NewAgentTerminalIn { .. })
+                    );
                 tx.send(if args.debug_state {
                     CliRequest::DebugState
                 } else if let Some(request) = agent_new_request {
                     request
                 } else if let Some(request) = agent_manage_request {
+                    request
+                } else if let Some(request) = agent_update_request {
                     request
                 } else if args.agent_list {
                     CliRequest::ListAgentThreads

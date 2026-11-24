@@ -22581,6 +22581,7 @@ dependencies = [
  "copilot",
  "copilot_chat",
  "copilot_ui",
+ "cpzed_hierarchy",
  "crashes",
  "dap_adapters",
  "db",

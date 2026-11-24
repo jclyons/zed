@@ -25,7 +25,8 @@
 
 use agent_ui::terminal_thread_metadata_store::TerminalThreadMetadataStore;
 use agent_ui::{AgentPanel, AgentPanelEvent, TerminalId};
-use cli::{CliResponse, CliResponseSink, NoMatchBehavior};
+use cli::{CliResponse, CliResponseSink, NoMatchBehavior, ParentChange, SectionChange};
+use cpzed_hierarchy::{GroupKey, HierarchyStore, Refusal, RowKey};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt, select_biased};
 use gpui::{App, AppContext as _, AsyncApp, Entity, WindowHandle};
@@ -48,6 +49,8 @@ const EXIT_AMBIGUOUS: i32 = 5;
 const MAX_TITLE_CHARS: usize = 200;
 /// The id belongs to an agent-panel (non-terminal) thread; refused.
 const EXIT_NOT_TERMINAL: i32 = 7;
+/// The hierarchy refused the change (a cycle, an invalid section name, ...).
+const EXIT_REFUSED: i32 = 6;
 
 /// Serializes `--agent-new` requests: `AgentPanel::pending_terminal_spawn`
 /// holds a single slot, so two overlapping spawns could let the panel create a
@@ -104,6 +107,8 @@ pub async fn handle_new_agent_terminal(
     command: Option<String>,
     title: Option<String>,
     on_no_match: NoMatchBehavior,
+    parent: Option<String>,
+    section: Option<String>,
     app_state: Arc<AppState>,
     responses: &dyn CliResponseSink,
     cx: &mut AsyncApp,
@@ -113,6 +118,8 @@ pub async fn handle_new_agent_terminal(
         command,
         title,
         on_no_match,
+        parent,
+        section,
         app_state,
         Timeouts::default(),
         responses,
@@ -126,13 +133,26 @@ pub async fn handle_new_agent_terminal_with_timeouts(
     command: Option<String>,
     title: Option<String>,
     on_no_match: NoMatchBehavior,
+    parent: Option<String>,
+    section: Option<String>,
     app_state: Arc<AppState>,
     timeouts: Timeouts,
     responses: &dyn CliResponseSink,
     cx: &mut AsyncApp,
 ) {
     // Never hold the spawn lock when replying: the reply can block on IPC.
-    let outcome = run(cwd, command, title, on_no_match, app_state, timeouts, cx).await;
+    let outcome = run(
+        cwd,
+        command,
+        title,
+        on_no_match,
+        parent,
+        section,
+        app_state,
+        timeouts,
+        cx,
+    )
+    .await;
     let status = match outcome {
         Ok(message) => {
             responses.send(CliResponse::Stdout { message }).log_err();
@@ -155,6 +175,8 @@ async fn run(
     command: Option<String>,
     title: Option<String>,
     on_no_match: NoMatchBehavior,
+    parent: Option<String>,
+    section: Option<String>,
     app_state: Arc<AppState>,
     timeouts: Timeouts,
     cx: &mut AsyncApp,
@@ -183,13 +205,327 @@ async fn run(
         ));
     }
 
+    // Validate the hierarchy request before anything is created, so a bad
+    // `--parent` or an unwritable store never leaves a stray thread behind.
+    let hierarchy = if parent.is_some() || section.is_some() {
+        if let Some(name) = &section {
+            validate_section_name(name)?;
+        }
+        let store = cx.update(|cx| HierarchyStore::init(cx));
+        if cx.update(|cx| store.read(cx).is_read_only()) {
+            return Err(refusal_failure(Refusal::ReadOnly));
+        }
+        if let Some(parent) = &parent {
+            let metadata = cx.update(|cx| TerminalThreadMetadataStore::try_global(cx));
+            find_terminal(metadata.as_ref(), parent, timeouts, cx)
+                .await?
+                .ok_or_else(|| {
+                    Failure::new(EXIT_NO_MATCH, format!("unknown parent thread id: {parent}"))
+                })?;
+        }
+        Some(store)
+    } else {
+        None
+    };
+
     let _guard = SPAWN_LOCK.lock().await;
     #[cfg(test)]
     let _probe = tests::ConcurrencyProbe::enter();
 
     let target = resolve_target(&cwd, on_no_match, &app_state, timeouts, cx).await?;
     let panel = wait_for_panel(&target, timeouts.panel_load, cx).await?;
-    spawn_and_confirm(&target, &panel, cwd, command, title, timeouts, cx).await
+    let (terminal_id, mut reply) =
+        spawn_and_confirm(&target, &panel, cwd, command, title, timeouts, cx).await?;
+    drop(_guard);
+
+    if let Some(store) = hierarchy {
+        let id = terminal_id.to_string();
+        let row = RowKey::Terminal(id.clone());
+        let metadata = cx.update(|cx| TerminalThreadMetadataStore::try_global(cx));
+        let group = match find_terminal(metadata.as_ref(), &id, timeouts, cx).await {
+            Ok(Some(group)) => group,
+            _ => group_key_from_reply(&reply),
+        };
+        let applied = cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.edit(cx, |h| {
+                    let mut created = None;
+                    if let Some(parent) = &parent {
+                        h.set_parent(&row, Some(&RowKey::Terminal(parent.clone())))?;
+                    }
+                    if let Some(name) = &section {
+                        let (section_id, was_created) = h.create_section(&group, name)?;
+                        h.set_section(&row, &group, Some(&section_id))?;
+                        created = Some(was_created);
+                    }
+                    Ok(created)
+                })
+            })
+        });
+        match applied {
+            Ok(created) => {
+                reply["parent"] = parent.map_or(serde_json::Value::Null, Into::into);
+                if let Some(name) = section {
+                    reply["section"] = name.into();
+                    reply["section_created"] = created.unwrap_or(false).into();
+                }
+            }
+            Err(refusal) => {
+                let mut failure = refusal_failure(refusal);
+                failure.message = format!(
+                    "{} (the terminal thread {id} was created, but not placed)",
+                    failure.message
+                );
+                return Err(failure);
+            }
+        }
+    }
+    Ok(reply.to_string())
+}
+
+fn refusal_failure(refusal: Refusal) -> Failure {
+    match refusal {
+        Refusal::ReadOnly => Failure::internal(refusal.to_string()),
+        other => Failure::new(EXIT_REFUSED, other.to_string()),
+    }
+}
+
+/// The project group of a terminal thread: its main worktree paths (the
+/// project it belongs to even from a linked worktree), else its folder paths.
+/// A local host (`None`); remote projects are out of scope (CPZED-10).
+fn group_key(
+    metadata: &agent_ui::terminal_thread_metadata_store::TerminalThreadMetadata,
+) -> GroupKey {
+    let main = metadata.main_worktree_paths();
+    let paths = if main.paths().is_empty() {
+        metadata.folder_paths()
+    } else {
+        main
+    };
+    GroupKey::new(None, paths.paths().to_vec())
+}
+
+/// `folder_paths` of a spawn reply, as a fallback group key.
+fn group_key_from_reply(reply: &serde_json::Value) -> GroupKey {
+    let paths = reply["folder_paths"]
+        .as_array()
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(|path| path.as_str().map(PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    GroupKey::new(None, paths)
+}
+
+/// Longest section name accepted by the CLI (the hierarchy crate only rejects
+/// empty names).
+const MAX_SECTION_NAME_CHARS: usize = 200;
+
+/// Checked before anything is created, so a bad name never leaves a stray thread.
+fn validate_section_name(name: &str) -> Result<(), Failure> {
+    if name.trim().is_empty() {
+        return Err(Failure::new(EXIT_REFUSED, Refusal::EmptyName.to_string()));
+    }
+    if name.trim().chars().count() > MAX_SECTION_NAME_CHARS {
+        return Err(Failure::new(
+            EXIT_REFUSED,
+            format!("section names are limited to {MAX_SECTION_NAME_CHARS} characters"),
+        ));
+    }
+    Ok(())
+}
+
+/// Looks a terminal thread up by its id string, after the metadata store has
+/// loaded. `Ok(None)` = unknown id (exit 3); a store that is missing or did not
+/// load in time is an error (exit 1 / 2), not "unknown".
+async fn find_terminal(
+    store: Option<&Entity<TerminalThreadMetadataStore>>,
+    id: &str,
+    timeouts: Timeouts,
+    cx: &mut AsyncApp,
+) -> Result<Option<GroupKey>, Failure> {
+    let store = store.ok_or_else(|| Failure::internal("agent thread store is not initialized"))?;
+    let reload = cx.update(|cx| store.read(cx).reload_task());
+    if bounded(reload, timeouts.metadata, cx).await.is_none() {
+        return Err(Failure::new(
+            EXIT_NOT_CONFIRMED,
+            "timed out loading agent thread metadata",
+        ));
+    }
+    Ok(cx.update(|cx| {
+        store
+            .read(cx)
+            .entries()
+            .find(|metadata| metadata.terminal_id.to_string() == id)
+            .map(group_key)
+    }))
+}
+
+/// `--agent-set-parent` / `--agent-set-section`.
+pub async fn handle_update_agent_thread(
+    id: String,
+    parent: Option<ParentChange>,
+    section: Option<SectionChange>,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    handle_update_agent_thread_with_timeouts(
+        id,
+        parent,
+        section,
+        Timeouts::default(),
+        responses,
+        cx,
+    )
+    .await
+}
+
+pub async fn handle_update_agent_thread_with_timeouts(
+    id: String,
+    parent: Option<ParentChange>,
+    section: Option<SectionChange>,
+    timeouts: Timeouts,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    let status = match update_thread(id, parent, section, timeouts, cx).await {
+        Ok(message) => {
+            responses.send(CliResponse::Stdout { message }).log_err();
+            0
+        }
+        Err(failure) => {
+            responses
+                .send(CliResponse::Stderr {
+                    message: failure.message,
+                })
+                .log_err();
+            failure.status
+        }
+    };
+    responses.send(CliResponse::Exit { status }).log_err();
+}
+
+async fn update_thread(
+    id: String,
+    parent: Option<ParentChange>,
+    section: Option<SectionChange>,
+    timeouts: Timeouts,
+    cx: &mut AsyncApp,
+) -> Result<String, Failure> {
+    let metadata = cx.update(|cx| TerminalThreadMetadataStore::try_global(cx));
+    let group = find_terminal(metadata.as_ref(), &id, timeouts, cx)
+        .await?
+        .ok_or_else(|| Failure::new(EXIT_NO_MATCH, format!("unknown thread id: {id}")))?;
+    if let Some(SectionChange::Set(name)) = &section {
+        validate_section_name(name)?;
+    }
+    let row = RowKey::Terminal(id.clone());
+
+    if let Some(ParentChange::Set(parent_id)) = &parent {
+        find_terminal(metadata.as_ref(), parent_id, timeouts, cx)
+            .await?
+            .ok_or_else(|| {
+                Failure::new(
+                    EXIT_NO_MATCH,
+                    format!("unknown parent thread id: {parent_id}"),
+                )
+            })?;
+    }
+
+    let store = cx.update(|cx| HierarchyStore::init(cx));
+    let result = cx.update(|cx| {
+        store.update(cx, |store, cx| {
+            store.edit(cx, |h| {
+                let mut created = None;
+                match &parent {
+                    Some(ParentChange::Set(parent_id)) => {
+                        h.set_parent(&row, Some(&RowKey::Terminal(parent_id.clone())))?
+                    }
+                    Some(ParentChange::Clear) => h.set_parent(&row, None)?,
+                    None => {}
+                }
+                match &section {
+                    Some(SectionChange::Set(name)) => {
+                        let (section_id, was_created) = h.create_section(&group, name)?;
+                        h.set_section(&row, &group, Some(&section_id))?;
+                        created = Some(was_created);
+                    }
+                    Some(SectionChange::Clear) => h.set_section(&row, &group, None)?,
+                    None => {}
+                }
+                Ok(created)
+            })
+        })
+    });
+    let created = result.map_err(refusal_failure)?;
+
+    let mut reply = serde_json::json!({ "id": id });
+    match &parent {
+        Some(ParentChange::Set(parent_id)) => reply["parent"] = parent_id.clone().into(),
+        Some(ParentChange::Clear) => reply["parent"] = serde_json::Value::Null,
+        None => {}
+    }
+    match &section {
+        Some(SectionChange::Set(name)) => {
+            reply["section"] = name.clone().into();
+            reply["section_created"] = created.unwrap_or(false).into();
+        }
+        Some(SectionChange::Clear) => reply["section"] = serde_json::Value::Null,
+        None => {}
+    }
+    Ok(reply.to_string())
+}
+
+/// Adds `parent`, `section` and `depth` to each row of the `--agent-list`
+/// JSON array, from the hierarchy store. A missing store reads as an empty
+/// hierarchy (all roots).
+pub fn annotate_agent_list(list: &mut serde_json::Value, cx: &App) {
+    let store = HierarchyStore::try_global(cx);
+    let hierarchy = store.as_ref().map(|store| store.read(cx).hierarchy());
+    let Some(rows) = list.as_array_mut() else {
+        return;
+    };
+    for row in rows {
+        let Some(id) = row["id"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let key = RowKey::Terminal(id);
+        let (parent, section, depth) = match hierarchy {
+            Some(h) => {
+                let parent = h.parents.get(&key).map(|parent| match parent {
+                    RowKey::Terminal(id) => (id.clone(), "terminal"),
+                    RowKey::Thread(id) => (id.clone(), "thread"),
+                });
+                let section = h.section_of(&key).and_then(|(group, section_id)| {
+                    h.section(group, section_id).map(|s| s.name.clone())
+                });
+                // Walk the ancestors with a visited guard (a stored cycle is
+                // repaired on load, but never loop on one).
+                let mut depth = 0usize;
+                let mut seen = std::collections::BTreeSet::new();
+                let mut cursor = &key;
+                while let Some(parent) = h.parents.get(cursor) {
+                    if !seen.insert(parent) {
+                        break;
+                    }
+                    depth += 1;
+                    cursor = parent;
+                }
+                (parent, section, depth)
+            }
+            None => (None, None, 0),
+        };
+        // `parent_kind` disambiguates ids: "terminal" (a row of this list) or
+        // "thread" (a UI-made agent thread, not listed here).
+        row["parent_kind"] = parent
+            .as_ref()
+            .map_or(serde_json::Value::Null, |(_, kind)| (*kind).into());
+        row["parent"] = parent.map_or(serde_json::Value::Null, |(id, _)| id.into());
+        row["section"] = section.map_or(serde_json::Value::Null, Into::into);
+        row["depth"] = depth.into();
+    }
 }
 
 #[derive(Clone)]
@@ -527,7 +863,7 @@ async fn spawn_and_confirm(
     title: Option<String>,
     timeouts: Timeouts,
     cx: &mut AsyncApp,
-) -> Result<String, Failure> {
+) -> Result<(TerminalId, serde_json::Value), Failure> {
     let (events_tx, mut events_rx) = mpsc::unbounded::<()>();
     let spawn_cwd = cwd.clone();
     // Do the spawn through the target window only: updating a background
@@ -585,7 +921,10 @@ async fn spawn_and_confirm(
         ));
     }
 
-    Ok(reply_json(target, panel, terminal_id, &cwd, timeouts, cx).await)
+    Ok((
+        terminal_id,
+        reply_json(target, panel, terminal_id, &cwd, timeouts, cx).await,
+    ))
 }
 
 /// The reply's `title` is exactly the custom title given with `--title`, else
@@ -605,7 +944,7 @@ async fn reply_json(
     cwd: &Path,
     timeouts: Timeouts,
     cx: &mut AsyncApp,
-) -> String {
+) -> serde_json::Value {
     let store = cx.update(|cx| TerminalThreadMetadataStore::try_global(cx));
     let mut folder_paths: Option<Vec<String>> = None;
     if let Some(store) = store {
@@ -657,7 +996,6 @@ async fn reply_json(
             "window_id": target.window.window_id().as_u64(),
             "workspace_id": workspace_id,
         })
-        .to_string()
     })
 }
 
@@ -980,7 +1318,8 @@ async fn rename_agent_thread(
             timeouts,
             cx,
         )
-        .await),
+        .await
+        .to_string()),
         None => Ok(cx.update(|cx| {
             let metadata = store.read(cx).entry(terminal_id).cloned();
             serde_json::json!({
@@ -1183,6 +1522,8 @@ mod tests {
             command.map(str::to_string),
             None,
             on_no_match,
+            None,
+            None,
             app_state.clone(),
             timeouts,
             &sink,
@@ -1554,6 +1895,8 @@ mod tests {
                 None,
                 None,
                 NoMatchBehavior::Error,
+                None,
+                None,
                 app_state.clone(),
                 Timeouts::default(),
                 &first_sink,
@@ -1564,6 +1907,8 @@ mod tests {
                 None,
                 None,
                 NoMatchBehavior::Error,
+                None,
+                None,
                 app_state.clone(),
                 Timeouts::default(),
                 &second_sink,
@@ -2087,6 +2432,8 @@ mod tests {
             None,
             Some("my agent".to_string()),
             NoMatchBehavior::Error,
+            None,
+            None,
             app_state.clone(),
             Timeouts::default(),
             &sink,
@@ -2138,6 +2485,8 @@ mod tests {
             None,
             None,
             NoMatchBehavior::Error,
+            None,
+            None,
             app_state.clone(),
             Timeouts {
                 git: Duration::from_millis(100),
@@ -2229,6 +2578,8 @@ mod tests {
             None,
             title.map(str::to_string),
             NoMatchBehavior::Error,
+            None,
+            None,
             app_state.clone(),
             Timeouts::default(),
             &sink,
@@ -2565,5 +2916,263 @@ mod tests {
         let reply = outcome.stdout.unwrap();
         assert_eq!(reply["title"], json!("renamed"));
         assert!(reply["window_id"].is_null());
+    }
+
+    // ---- CPZED-S2: hierarchy (parent / section) -------------------------------------------
+    //
+    // These tests use the fake file system, real temp dirs under the OS temp
+    // directory for terminal cwds, and a test key-value database. They never
+    // touch the real HOME, Zed data dirs or keychain.
+
+    async fn new_thread(
+        cx: &mut TestAppContext,
+        app_state: &Arc<AppState>,
+        cwd: &Path,
+        parent: Option<&str>,
+        section: Option<&str>,
+    ) -> Outcome {
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        handle_new_agent_terminal_with_timeouts(
+            cwd.to_path_buf(),
+            None,
+            None,
+            NoMatchBehavior::Error,
+            parent.map(str::to_string),
+            section.map(str::to_string),
+            app_state.clone(),
+            Timeouts::default(),
+            &sink,
+            &mut async_cx,
+        )
+        .await;
+        Outcome::from(&sink)
+    }
+
+    async fn update_thread_request(
+        cx: &mut TestAppContext,
+        id: &str,
+        parent: Option<ParentChange>,
+        section: Option<SectionChange>,
+    ) -> Outcome {
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        handle_update_agent_thread_with_timeouts(
+            id.to_string(),
+            parent,
+            section,
+            Timeouts::default(),
+            &sink,
+            &mut async_cx,
+        )
+        .await;
+        Outcome::from(&sink)
+    }
+
+    fn with_hierarchy<T>(
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&cpzed_hierarchy::Hierarchy) -> T,
+    ) -> T {
+        cx.update(|cx| f(HierarchyStore::global(cx).read(cx).hierarchy()))
+    }
+
+    fn reply_id(outcome: &Outcome) -> String {
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        outcome.stdout.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn hierarchy_project(
+        cx: &mut TestAppContext,
+        name: &str,
+    ) -> (Arc<AppState>, TestDirs, PathBuf) {
+        let app_state = init_agent_test(cx);
+        let dirs = TestDirs::new(name);
+        let root = dirs.dir("project");
+        insert_dirs(&app_state, &root, json!({})).await;
+        let _ = open_window(cx, &app_state, &root).await;
+        (app_state, dirs, root)
+    }
+
+    #[gpui::test]
+    async fn test_agent_new_parent_nests_the_new_terminal(cx: &mut TestAppContext) {
+        let (app_state, _dirs, root) = hierarchy_project(cx, "s2parent").await;
+        let parent = reply_id(&new_thread(cx, &app_state, &root, None, None).await);
+        let outcome = new_thread(cx, &app_state, &root, Some(&parent), None).await;
+        let child = reply_id(&outcome);
+        assert_eq!(outcome.stdout.as_ref().unwrap()["parent"], parent.as_str());
+        let (p, c) = (RowKey::Terminal(parent), RowKey::Terminal(child));
+        assert_eq!(with_hierarchy(cx, |h| h.parents.get(&c).cloned()), Some(p));
+    }
+
+    #[gpui::test]
+    async fn test_agent_new_unknown_parent_is_refused_before_spawning(cx: &mut TestAppContext) {
+        let (app_state, _dirs, root) = hierarchy_project(cx, "s2noparent").await;
+        let outcome = new_thread(
+            cx,
+            &app_state,
+            &root,
+            Some("00000000-0000-0000-0000-000000000000"),
+            None,
+        )
+        .await;
+        assert_eq!(outcome.status, 3, "{outcome:?}");
+        assert!(outcome.stderr.contains("unknown parent"), "{outcome:?}");
+        let count = cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .count()
+        });
+        assert_eq!(count, 0, "no terminal may be created");
+    }
+
+    #[gpui::test]
+    async fn test_invalid_section_names_are_refused_before_spawning(cx: &mut TestAppContext) {
+        let (app_state, _dirs, root) = hierarchy_project(cx, "s2badname").await;
+        let too_long = "x".repeat(MAX_SECTION_NAME_CHARS + 1);
+        for bad in ["", "   ", too_long.as_str()] {
+            let outcome = new_thread(cx, &app_state, &root, None, Some(bad)).await;
+            assert_eq!(outcome.status, 6, "{outcome:?}");
+        }
+        let count = cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries()
+                .count()
+        });
+        assert_eq!(count, 0, "no stray thread for a bad section name");
+        // --agent-set-section validates the name too, and changes nothing.
+        let a = reply_id(&new_thread(cx, &app_state, &root, None, None).await);
+        let before = with_hierarchy(cx, |h| h.to_json().unwrap());
+        let outcome =
+            update_thread_request(cx, &a, None, Some(SectionChange::Set("  ".into()))).await;
+        assert_eq!(outcome.status, 6, "{outcome:?}");
+        assert_eq!(with_hierarchy(cx, |h| h.to_json().unwrap()), before);
+    }
+
+    #[gpui::test]
+    async fn test_agent_new_section_creates_it_once_in_the_threads_project(
+        cx: &mut TestAppContext,
+    ) {
+        let (app_state, _dirs, root) = hierarchy_project(cx, "s2section").await;
+        let first = new_thread(cx, &app_state, &root, None, Some("Personas")).await;
+        let a = reply_id(&first);
+        assert_eq!(first.stdout.as_ref().unwrap()["section_created"], true);
+        let second = new_thread(cx, &app_state, &root, None, Some("personas")).await;
+        let b = reply_id(&second);
+        assert_eq!(second.stdout.as_ref().unwrap()["section_created"], false);
+
+        let (a_key, b_key) = (RowKey::Terminal(a), RowKey::Terminal(b));
+        with_hierarchy(cx, |h| {
+            assert_eq!(h.sections.len(), 1, "one project");
+            let sections = h.sections.values().next().unwrap();
+            assert_eq!(sections.len(), 1, "no duplicate section");
+            assert_eq!(sections[0].name, "Personas");
+            // The newest thread goes on top of the section.
+            assert_eq!(sections[0].items, vec![b_key, a_key]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_set_parent_cycle_exits_6_and_changes_nothing(cx: &mut TestAppContext) {
+        let (app_state, _dirs, root) = hierarchy_project(cx, "s2cycle").await;
+        let a = reply_id(&new_thread(cx, &app_state, &root, None, None).await);
+        let b = reply_id(&new_thread(cx, &app_state, &root, Some(&a), None).await);
+        let before = with_hierarchy(cx, |h| h.to_json().unwrap());
+        let outcome = update_thread_request(cx, &a, Some(ParentChange::Set(b.clone())), None).await;
+        assert_eq!(outcome.status, 6, "{outcome:?}");
+        assert!(outcome.stderr.contains("ancestor"), "{outcome:?}");
+        assert_eq!(with_hierarchy(cx, |h| h.to_json().unwrap()), before);
+        // A thread cannot be its own parent either.
+        let outcome = update_thread_request(cx, &a, Some(ParentChange::Set(a.clone())), None).await;
+        assert_eq!(outcome.status, 6, "{outcome:?}");
+    }
+
+    #[gpui::test]
+    async fn test_unknown_id_and_unknown_parent_both_exit_3(cx: &mut TestAppContext) {
+        let (app_state, _dirs, root) = hierarchy_project(cx, "s2unknown").await;
+        let a = reply_id(&new_thread(cx, &app_state, &root, None, None).await);
+        let ghost = "11111111-1111-1111-1111-111111111111";
+        let outcome = update_thread_request(cx, ghost, Some(ParentChange::Clear), None).await;
+        assert_eq!(outcome.status, 3, "{outcome:?}");
+        let outcome =
+            update_thread_request(cx, &a, Some(ParentChange::Set(ghost.into())), None).await;
+        assert_eq!(outcome.status, 3, "{outcome:?}");
+        assert!(outcome.stderr.contains("unknown parent"), "{outcome:?}");
+    }
+
+    #[gpui::test]
+    async fn test_set_section_none_unsections_and_set_parent_leaves_the_section(
+        cx: &mut TestAppContext,
+    ) {
+        let (app_state, _dirs, root) = hierarchy_project(cx, "s2setsection").await;
+        let p = reply_id(&new_thread(cx, &app_state, &root, None, None).await);
+        let a = reply_id(&new_thread(cx, &app_state, &root, None, Some("S")).await);
+        let a_key = RowKey::Terminal(a.clone());
+        assert!(with_hierarchy(cx, |h| h.section_of(&a_key).is_some()));
+
+        let outcome = update_thread_request(cx, &a, None, Some(SectionChange::Clear)).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert!(outcome.stdout.as_ref().unwrap()["section"].is_null());
+        assert!(with_hierarchy(cx, |h| h.section_of(&a_key).is_none()));
+
+        // Back into the section (created now: it exists, so `false`), then nest.
+        let outcome =
+            update_thread_request(cx, &a, None, Some(SectionChange::Set("s".into()))).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert_eq!(outcome.stdout.as_ref().unwrap()["section_created"], false);
+        assert!(with_hierarchy(cx, |h| h.section_of(&a_key).is_some()));
+        let outcome = update_thread_request(cx, &a, Some(ParentChange::Set(p.clone())), None).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        with_hierarchy(cx, |h| {
+            assert!(h.section_of(&a_key).is_none(), "nesting leaves the section");
+            assert_eq!(h.parents.get(&a_key), Some(&RowKey::Terminal(p.clone())));
+        });
+
+        // `none` un-nests.
+        let outcome = update_thread_request(cx, &a, Some(ParentChange::Clear), None).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert!(with_hierarchy(cx, |h| !h.parents.contains_key(&a_key)));
+    }
+
+    #[gpui::test]
+    async fn test_agent_list_reports_parent_section_and_depth(cx: &mut TestAppContext) {
+        let (app_state, _dirs, root) = hierarchy_project(cx, "s2list").await;
+        let a = reply_id(&new_thread(cx, &app_state, &root, None, Some("Personas")).await);
+        let b = reply_id(&new_thread(cx, &app_state, &root, Some(&a), None).await);
+        let c = reply_id(&new_thread(cx, &app_state, &root, Some(&b), None).await);
+        let d = reply_id(&new_thread(cx, &app_state, &root, None, None).await);
+
+        let list = cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let mut list = store.read(cx).list_json();
+            annotate_agent_list(&mut list, cx);
+            list
+        });
+        let row = |id: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row(&a)["depth"], 0);
+        assert_eq!(row(&a)["section"], "Personas");
+        assert!(row(&a)["parent"].is_null());
+        assert_eq!(row(&b)["depth"], 1);
+        assert_eq!(row(&b)["parent"], a.as_str());
+        assert_eq!(row(&b)["parent_kind"], "terminal");
+        assert_eq!(row(&a)["parent_kind"], serde_json::Value::Null);
+        assert!(row(&b)["section"].is_null());
+        assert_eq!(row(&c)["depth"], 2);
+        assert_eq!(row(&c)["parent"], b.as_str());
+        assert_eq!(row(&d)["depth"], 0);
+        assert!(row(&d)["section"].is_null());
+        // Existing fields are unchanged.
+        assert_eq!(row(&a)["kind"], "terminal");
     }
 }
