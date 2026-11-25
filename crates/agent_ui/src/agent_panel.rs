@@ -1254,6 +1254,9 @@ pub struct AgentPanel {
     terminals: HashMap<TerminalId, AgentTerminal>,
     /// CPZed: terminals being restored (value = was already stale).
     restoring_terminals: HashMap<TerminalId, bool>,
+    /// Test seam: a canned `claude agents --json` instead of running claude.
+    #[cfg(test)]
+    test_agents_json: Option<String>,
     pending_terminal_spawn: Option<TerminalId>,
     #[cfg(test)]
     test_terminal_spawn_gate: Option<futures::channel::oneshot::Receiver<()>>,
@@ -1596,6 +1599,7 @@ impl AgentPanel {
                     if let Some(metadata) = terminal_to_restore {
                         panel.restore_terminal_for_panel_load(
                             metadata,
+                            true,
                             false,
                             AgentThreadSource::AgentPanel,
                             Some(workspace),
@@ -1616,7 +1620,7 @@ impl AgentPanel {
                         );
                     }
                     for metadata in other_terminals_to_restore {
-                        panel.restore_terminal_with_selection(
+                        panel.restore_terminal_for_panel_load(
                             metadata,
                             false,
                             false,
@@ -1735,6 +1739,8 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             restoring_terminals: HashMap::default(),
+            #[cfg(test)]
+            test_agents_json: None,
             pending_terminal_spawn: None,
             #[cfg(test)]
             test_terminal_spawn_gate: None,
@@ -2286,22 +2292,42 @@ impl AgentPanel {
                     window,
                     cx,
                 );
-                this.remember_terminal_init_command(terminal_id, saved_init_command, cx);
-                match this.restoring_terminals.remove(&terminal_id) {
-                    Some(true) => {
-                        if let Some(terminal) = this.terminals.get_mut(&terminal_id) {
-                            terminal.stale = true;
-                        }
-                        this.persist_terminal_metadata(terminal_id, cx);
-                    }
-                    Some(false) => this.check_terminal_stale(terminal_id, cx),
-                    None => {}
-                }
+                this.finish_terminal_spawn(terminal_id, saved_init_command, cx);
                 Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
             })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// CPZed: after a terminal lands, remember its command and settle the
+    /// restore bookkeeping (already-stale, or check the target).
+    fn finish_terminal_spawn(
+        &mut self,
+        terminal_id: TerminalId,
+        command: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.remember_terminal_init_command(terminal_id, command, cx);
+        match self.restoring_terminals.remove(&terminal_id) {
+            Some(true) => {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    terminal.stale = true;
+                }
+                self.persist_terminal_metadata(terminal_id, cx);
+            }
+            Some(false) => self.check_terminal_stale(terminal_id, cx),
+            None => {}
+        }
+    }
+
+    /// CPZed: the command a restored thread re-runs; a stale one is not re-run.
+    fn restore_init_command(metadata: &TerminalThreadMetadata) -> TerminalInitCommand {
+        match (&metadata.restore.init_command, metadata.restore.stale) {
+            (Some(_), true) => TerminalInitCommand::None,
+            (Some(command), false) => TerminalInitCommand::Explicit(command.clone()),
+            (None, _) => TerminalInitCommand::FromSettings,
+        }
     }
 
     /// CPZed: persist the command so a restart can re-run it.
@@ -2334,7 +2360,15 @@ impl AgentPanel {
             return;
         }
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        #[cfg(test)]
+        let agents_json_override = self.test_agents_json.clone();
         let stale = cx.background_spawn(async move {
+            #[cfg(test)]
+            if let Some(json) = agents_json_override {
+                return crate::terminal_restore::attach_target(&command)
+                    .and_then(|target| crate::terminal_restore::target_is_alive(&json, target))
+                    .is_some_and(|alive| !alive);
+            }
             crate::terminal_restore::command_is_stale(&command, &shell, true)
         });
         cx.spawn(async move |this, cx| {
@@ -2733,11 +2767,7 @@ impl AgentPanel {
                 .insert(terminal_id, metadata.restore.stale);
         }
         // CPZed: re-run the saved command; a stale one is not re-run.
-        let init_command = match (&metadata.restore.init_command, metadata.restore.stale) {
-            (Some(_), true) => TerminalInitCommand::None,
-            (Some(command), false) => TerminalInitCommand::Explicit(command.clone()),
-            (None, _) => TerminalInitCommand::FromSettings,
-        };
+        let init_command = Self::restore_init_command(&metadata);
         self.spawn_terminal(
             terminal_id,
             working_directory,
@@ -2756,6 +2786,7 @@ impl AgentPanel {
     fn restore_terminal_for_panel_load(
         &mut self,
         metadata: TerminalThreadMetadata,
+        select: bool,
         focus: bool,
         source: AgentThreadSource,
         workspace: Option<&Workspace>,
@@ -2763,11 +2794,15 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         #[cfg(test)]
-        self.restore_test_terminal(metadata, focus, source, workspace, window, cx)
-            .log_err();
+        self.restore_test_terminal_with_selection(
+            metadata, select, focus, source, workspace, window, cx,
+        )
+        .log_err();
 
         #[cfg(not(test))]
-        self.restore_terminal(metadata, focus, source, workspace, window, cx);
+        self.restore_terminal_with_selection(
+            metadata, select, focus, source, workspace, window, cx,
+        );
     }
 
     fn terminal_restore_working_directory(
@@ -7186,6 +7221,22 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        self.restore_test_terminal_with_selection(
+            metadata, true, focus, source, workspace, window, cx,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn restore_test_terminal_with_selection(
+        &mut self,
+        metadata: TerminalThreadMetadata,
+        select: bool,
+        focus: bool,
+        source: AgentThreadSource,
+        workspace: Option<&Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
         if self.has_terminal(metadata.terminal_id) {
             self.activate_terminal(metadata.terminal_id, focus, window, cx);
             return Ok(());
@@ -7197,15 +7248,19 @@ impl AgentPanel {
 
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
+        if metadata.restore.init_command.is_some() {
+            self.restoring_terminals
+                .insert(metadata.terminal_id, metadata.restore.stale);
+        }
         self.insert_display_only_terminal(
             metadata.terminal_id,
             working_directory,
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
-            true,
+            select,
             focus,
-            TerminalInitCommand::FromSettings,
+            Self::restore_init_command(&metadata),
             source,
             window,
             cx,
@@ -7243,6 +7298,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         let init_command = Self::terminal_init_command(init_command, cx);
+        let saved_init_command = init_command.clone();
         let terminal = self.build_display_only_terminal(cx);
         let terminal_for_init_command = terminal.clone();
         let terminal_view = cx.new(|cx| {
@@ -7270,6 +7326,7 @@ impl AgentPanel {
             window,
             cx,
         );
+        self.finish_terminal_spawn(terminal_id, saved_init_command, cx);
         Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
         Ok(())
     }
@@ -7979,6 +8036,215 @@ mod tests {
                 "active terminal metadata should be restored into the loaded panel"
             );
         });
+    }
+
+    fn restore_row(
+        title: &str,
+        root: &str,
+        command: Option<&str>,
+        open: bool,
+        age_secs: i64,
+    ) -> TerminalThreadMetadata {
+        TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: title.to_string().into(),
+            custom_title: None,
+            created_at: Utc::now() - chrono::Duration::seconds(age_secs),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                root,
+            )])),
+            remote_connection: None,
+            working_directory: Some(PathBuf::from(root)),
+            restore: crate::terminal_thread_metadata_store::TerminalRestoreState {
+                init_command: command.map(str::to_string),
+                open,
+                stale: false,
+            },
+        }
+    }
+
+    /// Startup restore, PER PROJECT: the workspace is project `/project`;
+    /// only its open rows come back, none of `/other`'s, not a closed row,
+    /// and not a pre-change row (default `open = false`). Fake FS and the
+    /// in-memory test DB only.
+    #[gpui::test]
+    async fn test_panel_load_reopens_only_this_projects_open_threads(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            TerminalThreadMetadataStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let a1 = restore_row("A1", "/project", Some("claude attach aaaa1111"), true, 30);
+        let a2 = restore_row("A2", "/project", None, true, 20);
+        let other = restore_row("Other", "/other", Some("claude attach bbbb2222"), true, 10);
+        let closed = restore_row("Closed", "/project", None, false, 5);
+        let mut pre_change = restore_row("PreChange", "/project", None, false, 4);
+        pre_change.restore = Default::default();
+        let (a1_id, a2_id) = (a1.terminal_id, a2.terminal_id);
+        let store = cx.update(|_, cx| TerminalThreadMetadataStore::global(cx));
+        store.update(cx, |store, cx| {
+            for row in [&a1, &a2, &other, &closed, &pre_change] {
+                store.save(row.clone(), cx);
+            }
+        });
+        cx.run_until_parked();
+
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let loaded = AgentPanel::load(workspace.downgrade(), async_cx)
+            .await
+            .expect("panel load should succeed");
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        loaded.read_with(cx, |panel, _cx| {
+            let mut restored: Vec<_> = panel.terminals.keys().copied().collect();
+            restored.sort_by_key(|id| id.to_key_string());
+            let mut expected = vec![a1_id, a2_id];
+            expected.sort_by_key(|id| id.to_key_string());
+            assert_eq!(
+                restored, expected,
+                "only this project's open threads are reopened"
+            );
+            assert_eq!(
+                panel.terminals[&a1_id].init_command.as_deref(),
+                Some("claude attach aaaa1111"),
+                "the saved command is kept for the next restart"
+            );
+        });
+
+        // The command was re-run in the restored terminal, once.
+        let terminal = loaded.read_with(cx, |panel, cx| {
+            panel.terminals[&a1_id].view.read(cx).terminal().clone()
+        });
+        let input_log = terminal.update(cx, |terminal, _| terminal.take_input_log());
+        assert_eq!(input_log, vec![b"claude attach aaaa1111\r".to_vec()]);
+
+        // Idempotent: restoring the same rows again adds no thread and re-runs nothing.
+        for row in [a1.clone(), a2.clone()] {
+            loaded
+                .update_in(cx, |panel, window, cx| {
+                    panel.restore_test_terminal_with_selection(
+                        row,
+                        false,
+                        false,
+                        AgentThreadSource::AgentPanel,
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap();
+        }
+        cx.run_until_parked();
+        assert_eq!(loaded.read_with(cx, |panel, _| panel.terminals.len()), 2);
+        assert!(
+            terminal
+                .update(cx, |terminal, _| terminal.take_input_log())
+                .is_empty()
+        );
+    }
+
+    /// A restored `claude attach` whose target is gone is marked stale
+    /// (persisted, `[stale]` title), and its command is not re-run; a live
+    /// target is not marked. Uses a canned `claude agents --json`, never the
+    /// real claude.
+    #[gpui::test]
+    async fn test_restored_attach_to_dead_session_is_marked_stale(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        // The store's initial DB load must land first, or it overwrites saves.
+        let reload = cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .reload_task()
+        });
+        reload.await;
+        panel.update(&mut cx, |panel, _| {
+            panel.test_agents_json = Some(
+                r#"[{"id":"alive123","sessionId":"alive123-x","name":"cpzed-reviewer"}]"#.into(),
+            );
+        });
+        let live = restore_row("Live", "/project", Some("claude attach alive123"), true, 2);
+        let dead = restore_row("Dead", "/project", Some("claude attach dead9999"), true, 1);
+        let (live_id, dead_id) = (live.terminal_id, dead.terminal_id);
+        for row in [live, dead] {
+            panel
+                .update_in(&mut cx, |panel, window, cx| {
+                    panel.restore_test_terminal_with_selection(
+                        row,
+                        false,
+                        false,
+                        AgentThreadSource::AgentPanel,
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap();
+        }
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        panel.read_with(&cx, |panel, _| {
+            assert!(!panel.terminals[&live_id].stale);
+            assert!(panel.terminals[&dead_id].stale);
+        });
+        let store = cx.update(|_, cx| TerminalThreadMetadataStore::global(cx));
+        store.read_with(&cx, |store, _| {
+            assert!(!store.entry(live_id).unwrap().restore.stale);
+            let dead = store.entry(dead_id).unwrap();
+            assert!(dead.restore.stale);
+            assert!(dead.display_title().starts_with("[stale] "));
+            assert!(
+                dead.restore.open,
+                "a stale thread stays listed, not dropped"
+            );
+        });
+
+        // Restoring an already-stale row does not re-run its command.
+        let mut stale_row = restore_row("S", "/project", Some("claude attach dead9999"), true, 0);
+        stale_row.restore.stale = true;
+        let stale_id = stale_row.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal_with_selection(
+                    stale_row,
+                    false,
+                    false,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel.terminals[&stale_id].view.read(cx).terminal().clone()
+        });
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty()
+        );
+        assert!(panel.read_with(&cx, |panel, _| panel.terminals[&stale_id].stale));
     }
 
     #[gpui::test]
