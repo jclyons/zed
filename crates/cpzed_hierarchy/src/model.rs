@@ -84,6 +84,9 @@ pub enum Refusal {
     DuplicateName,
     /// This drag/target pairing has no meaning.
     InvalidTarget,
+    /// The target row is shown one level up because its parent is closed (D4), so there is no
+    /// visible order to drop into.
+    ParentClosed,
     /// The stored hierarchy could not be read safely (newer version, read error, failed backup):
     /// nothing is changed or saved until it is resolved.
     ReadOnly,
@@ -103,6 +106,9 @@ impl std::fmt::Display for Refusal {
             Refusal::EmptyName => "section names cannot be empty",
             Refusal::DuplicateName => "a section with that name already exists in this project",
             Refusal::InvalidTarget => "cannot drop here",
+            Refusal::ParentClosed => {
+                "that row is shown one level up because its parent is closed; drop next to another row"
+            }
             Refusal::ReadOnly => {
                 "the saved sidebar hierarchy could not be loaded safely, so it is read-only"
             }

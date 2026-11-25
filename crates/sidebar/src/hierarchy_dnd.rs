@@ -50,7 +50,9 @@ impl Render for DraggedSidebarItem {
 /// Where the pointer currently is over a row, for the drop indicator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DropPreview {
-    pub ix: usize,
+    /// Keyed on the target, not the render-time row index: `update_entries` can rebuild the
+    /// list between a drag event and the next paint.
+    pub target: DropTarget,
     pub zone: Zone,
     /// Set when dropping here would be refused: the indicator turns red.
     pub refusal: Option<SharedString>,
@@ -266,28 +268,31 @@ impl Sidebar {
         self.note_refusal(result, cx).is_some()
     }
 
-    fn update_drop_preview(
+    pub(crate) fn update_drop_preview(
         &mut self,
-        ix: usize,
+        target: DropTarget,
         item: &DragItem,
         zone: Zone,
         cx: &mut Context<Self>,
     ) {
-        let preview = match self.drop_target_at(ix) {
-            None => None,
-            Some(target) => match self.plan_drop_on(item, &target, zone, cx) {
-                Ok(_) => Some(DropPreview {
-                    ix,
-                    zone,
-                    refusal: None,
-                }),
-                Err(Refusal::SameTarget) => None,
-                Err(refusal) => Some(DropPreview {
-                    ix,
-                    zone,
-                    refusal: Some(SharedString::from(format!("{refusal}"))),
-                }),
-            },
+        let zone = Self::effective_zone(item, &target, zone);
+        let planned = if self.hierarchy.store.read(cx).is_read_only() {
+            Err(Refusal::ReadOnly)
+        } else {
+            self.plan_drop_on(item, &target, zone, cx)
+        };
+        let preview = match planned {
+            Ok(_) => Some(DropPreview {
+                target,
+                zone,
+                refusal: None,
+            }),
+            Err(Refusal::SameTarget) => None,
+            Err(refusal) => Some(DropPreview {
+                target,
+                zone,
+                refusal: Some(SharedString::from(format!("{refusal}"))),
+            }),
         };
         if self.hierarchy.drop_preview != preview {
             self.hierarchy.drop_preview = preview;
@@ -295,14 +300,31 @@ impl Sidebar {
         }
     }
 
-    fn finish_drop(&mut self, ix: usize, dragged: &DraggedSidebarItem, cx: &mut Context<Self>) {
+    /// A row dropped on a section or project header always goes into / out to that header, so
+    /// the indicator always shows the whole header (never an edge line that looks like the end
+    /// of the container above).
+    fn effective_zone(item: &DragItem, target: &DropTarget, zone: Zone) -> Zone {
+        match (item, target) {
+            (
+                DragItem::Row { .. },
+                DropTarget::SectionHeader { .. } | DropTarget::ProjectHeader { .. },
+            ) => Zone::Into,
+            _ => zone,
+        }
+    }
+
+    pub(crate) fn finish_drop(
+        &mut self,
+        target: DropTarget,
+        dragged: &DraggedSidebarItem,
+        cx: &mut Context<Self>,
+    ) {
         let zone = match self.hierarchy.drop_preview.take() {
-            Some(preview) if preview.ix == ix => preview.zone,
+            Some(preview) if preview.target == target => preview.zone,
             _ => Zone::Into,
         };
-        if let Some(target) = self.drop_target_at(ix) {
-            self.drop_item_on(&dragged.item, &target, zone, cx);
-        }
+        let zone = Self::effective_zone(&dragged.item, &target, zone);
+        self.drop_item_on(&dragged.item, &target, zone, cx);
         cx.notify();
     }
 
@@ -319,16 +341,24 @@ impl Sidebar {
         }
         let colors = cx.theme().colors();
         let error = cx.theme().status().error;
+        // The drop target is captured by KEY now, at render time: the handlers below must not
+        // re-resolve `ix` against entries that `update_entries` may have rebuilt since.
+        let target = self.drop_target_at(ix);
+        let Some(target) = target else {
+            return element;
+        };
         let preview = if cx.has_active_drag() {
             self.hierarchy
                 .drop_preview
                 .clone()
-                .filter(|preview| preview.ix == ix)
+                .filter(|preview| preview.target == target)
         } else {
             None
         };
         let dragged = self.dragged_item_at(ix);
+        let sidebar = cx.entity().downgrade();
 
+        let (move_target, drop_target) = (target.clone(), target);
         let wrapper = div()
             .id(("hierarchy-dnd", ix))
             .relative()
@@ -363,7 +393,18 @@ impl Sidebar {
                 }
             })
             .when_some(dragged, |this, dragged| {
-                this.on_drag(dragged, |dragged, _offset, _window, cx| {
+                this.on_drag(dragged, move |dragged, _offset, _window, cx| {
+                    // A new drag starts with no indicator (a previous drag may have ended off-row).
+                    let sidebar = sidebar.clone();
+                    cx.defer(move |cx| {
+                        sidebar
+                            .update(cx, |this, cx| {
+                                if this.hierarchy.drop_preview.take().is_some() {
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    });
                     cx.new(|_| dragged.clone())
                 })
             })
@@ -374,7 +415,7 @@ impl Sidebar {
                             .hierarchy
                             .drop_preview
                             .as_ref()
-                            .is_some_and(|preview| preview.ix == ix)
+                            .is_some_and(|preview| preview.target == move_target)
                         {
                             this.hierarchy.drop_preview = None;
                             cx.notify();
@@ -383,12 +424,12 @@ impl Sidebar {
                     }
                     let zone = zone_at(event.event.position.y, event.bounds);
                     let dragged = event.drag(cx).clone();
-                    this.update_drop_preview(ix, &dragged.item, zone, cx);
+                    this.update_drop_preview(move_target.clone(), &dragged.item, zone, cx);
                 },
             ))
             .on_drop(
                 cx.listener(move |this, dragged: &DraggedSidebarItem, _window, cx| {
-                    this.finish_drop(ix, dragged, cx);
+                    this.finish_drop(drop_target.clone(), dragged, cx);
                 }),
             );
 

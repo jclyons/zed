@@ -361,3 +361,58 @@ fn a_target_row_that_no_longer_exists_is_refused() {
         );
     }
 }
+
+#[test]
+fn edge_drops_among_a_parents_children_never_change_a_project() {
+    // D1: parent P (project b) has child S (b) and child C (a). Reordering S next to C, or C
+    // next to S, is a reorder inside Children(P), not a cross-project move.
+    let (a, b) = (g("a"), g("b"));
+    let mut h = Hierarchy::default();
+    h.set_parent(&term("s"), Some(&term("p"))).unwrap();
+    h.set_parent(&thr("c"), Some(&term("p"))).unwrap();
+    for (item, item_group, target, target_group) in
+        [(term("s"), &b, thr("c"), &a), (thr("c"), &a, term("s"), &b)]
+    {
+        for (zone, side) in [(Zone::Before, Side::Before), (Zone::After, Side::After)] {
+            assert_eq!(
+                plan(
+                    &row(&item, item_group),
+                    &on_row(&target, target_group),
+                    zone,
+                    &h
+                ),
+                Ok(DropAction::Reorder {
+                    container: Container::Children(term("p")),
+                    key: item.clone(),
+                    target: target.clone(),
+                    side,
+                    visible: h.child_order.get(&term("p")).cloned().unwrap_or_default(),
+                })
+            );
+        }
+    }
+    // A root row of another project is still a cross-project drop.
+    assert_eq!(
+        plan(
+            &row(&thr("x"), &a),
+            &on_row(&term("r"), &b),
+            Zone::After,
+            &h
+        ),
+        Err(Refusal::AgentThreadAcrossProjects)
+    );
+}
+
+#[test]
+fn an_edge_drop_next_to_a_child_of_a_closed_parent_says_so() {
+    let a = g("a");
+    let mut h = Hierarchy::default();
+    h.set_parent(&term("child"), Some(&term("ghost"))).unwrap();
+    // "ghost" no longer exists (closed): its children are lifted in the sidebar.
+    for zone in [Zone::Before, Zone::After] {
+        assert_eq!(
+            plan(&row(&term("x"), &a), &on_row(&term("child"), &a), zone, &h),
+            Err(Refusal::ParentClosed)
+        );
+    }
+}

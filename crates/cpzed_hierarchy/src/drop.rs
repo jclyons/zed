@@ -196,16 +196,21 @@ fn plan_row_drop(
                         parent: target_key.clone(),
                     })
                 }
-                // Before/After a row of another project counts as a drop onto that project.
-                Zone::Before | Zone::After if target_group != group => {
-                    cross_project(key, group, target_group, None)
-                }
                 Zone::Before | Zone::After => {
-                    let container = container_of(h, target_key, group);
-                    if let Container::Children(parent) = &container
-                        && h.would_cycle(key, parent)
-                    {
-                        return Err(Refusal::Cycle);
+                    let container = container_of(h, target_key, target_group);
+                    // Before/After a row of another project counts as a drop onto that project,
+                    // except among a parent's children: those never change any project (D1).
+                    if target_group != group && !matches!(container, Container::Children(_)) {
+                        return cross_project(key, group, target_group, None);
+                    }
+                    if let Container::Children(parent) = &container {
+                        if h.would_cycle(key, parent) {
+                            return Err(Refusal::Cycle);
+                        }
+                        // A closed parent lifts its children (D4): no visible order to use.
+                        if !(ctx.row_exists)(parent) {
+                            return Err(Refusal::ParentClosed);
+                        }
                     }
                     let visible = (ctx.visible)(&container);
                     if !visible.contains(target_key) {

@@ -78,6 +78,14 @@ fn key(id: TerminalId) -> RowKey {
 
 /// Saves a terminal in `path`'s group. A larger `age_secs` sorts lower (older).
 fn add_terminal(cx: &mut VisualTestContext, title: &str, path: &str, age_secs: i64) -> TerminalId {
+    let terminal_id = save_terminal(cx, title, path, age_secs);
+    cx.run_until_parked();
+    terminal_id
+}
+
+/// Like `add_terminal` but does not let the app run, so no repaint happens before the caller's
+/// next step.
+fn save_terminal(cx: &mut VisualTestContext, title: &str, path: &str, age_secs: i64) -> TerminalId {
     let terminal_id = TerminalId::test_new();
     let paths = PathList::new(&[PathBuf::from(path)]);
     let metadata = TerminalThreadMetadata {
@@ -92,7 +100,6 @@ fn add_terminal(cx: &mut VisualTestContext, title: &str, path: &str, age_secs: i
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
-    cx.run_until_parked();
     terminal_id
 }
 
@@ -997,6 +1004,7 @@ async fn test_read_only_store_refuses_drops_visibly(cx: &mut TestAppContext) {
     });
     refresh(&sidebar, &mut cx);
     let p = "/project-a";
+    let (json_before, rows_before) = (hierarchy_json(&mut cx), rows(&sidebar, &mut cx));
     assert!(!drop_on(
         &sidebar,
         &mut cx,
@@ -1005,6 +1013,8 @@ async fn test_read_only_store_refuses_drops_visibly(cx: &mut TestAppContext) {
         Zone::Into
     ));
     assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("read-only")));
+    assert_eq!(hierarchy_json(&mut cx), json_before);
+    assert_eq!(rows(&sidebar, &mut cx), rows_before);
 }
 
 // Sections: a row dropped on a section header moves into it; on its own project header it leaves
@@ -1282,5 +1292,291 @@ async fn test_real_pointer_drag_nests_and_edge_drag_reorders(cx: &mut TestAppCon
     assert_eq!(
         rows(&sidebar, &mut cx),
         ["[project-b]", "[project-a]", "  a", "    b"]
+    );
+}
+
+// Un-nesting: the menu's "Remove from Parent" and a drop on the own project header are the same
+// action, and the result is flat rows with an empty `parents` map.
+#[gpui::test]
+async fn test_unnest_drop_flattens_rows_and_clears_parents(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let a = add_terminal(&mut cx, "a", "/project-a", 10);
+    let b = add_terminal(&mut cx, "b", "/project-a", 20);
+    refresh(&sidebar, &mut cx);
+    let p = "/project-a";
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(b, p),
+        &row_target(a, p),
+        Zone::Into
+    ));
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  a", "    b"]
+    );
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(b, p),
+        &DropTarget::ProjectHeader { group: group(p) },
+        Zone::Into
+    ));
+    let rows_after = rows(&sidebar, &mut cx);
+    assert!(
+        rows_after.contains(&"  a".to_string()) && rows_after.contains(&"  b".to_string()),
+        "{rows_after:?}"
+    );
+    assert!(cx.update(|_, cx| {
+        HierarchyStore::global(cx)
+            .read(cx)
+            .hierarchy()
+            .parents
+            .is_empty()
+    }));
+}
+
+// Agent threads never change project; a terminal dropped (on an edge) next to a row of another
+// project is announced as not available yet. Neither writes.
+#[gpui::test]
+async fn test_cross_project_drops_are_refused_or_announced_without_writing(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let term = add_terminal(&mut cx, "term", "/project-a", 10);
+    let other = add_terminal(&mut cx, "other", "/project-b", 10);
+    refresh(&sidebar, &mut cx);
+    let before = hierarchy_json(&mut cx);
+
+    let agent = DragItem::Row {
+        key: RowKey::Thread("agent-1".to_string()),
+        group: group("/project-a"),
+    };
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &agent,
+        &DropTarget::ProjectHeader {
+            group: group("/project-b")
+        },
+        Zone::Into
+    ));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("agent threads cannot move")));
+    assert_eq!(hierarchy_json(&mut cx), before);
+
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(term, "/project-a"),
+        &row_target(other, "/project-b"),
+        Zone::After
+    ));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("not available yet")));
+    assert_eq!(hierarchy_json(&mut cx), before);
+}
+
+// D4: an edge drop next to a child lifted from a closed parent explains itself.
+#[gpui::test]
+async fn test_edge_drop_next_to_a_lifted_child_is_explained(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let parent = add_terminal(&mut cx, "parent", "/project-a", 10);
+    let child = add_terminal(&mut cx, "child", "/project-b", 20);
+    let other = add_terminal(&mut cx, "other", "/project-b", 30);
+    edit(&mut cx, |store, cx| {
+        store
+            .set_parent(&key(child), Some(&key(parent)), cx)
+            .unwrap();
+    });
+    cx.update(|_, cx| {
+        TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| store.delete(parent, cx));
+    });
+    refresh(&sidebar, &mut cx);
+    let before = hierarchy_json(&mut cx);
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(other, "/project-b"),
+        &row_target(child, "/project-b"),
+        Zone::After
+    ));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("parent is closed")));
+    assert_eq!(hierarchy_json(&mut cx), before);
+}
+
+// The indicator never promises what the drop will not do: a read-only store shows invalid, and a
+// row over a header always shows the whole header (Into), whatever quarter the pointer is in.
+#[gpui::test]
+async fn test_drop_preview_shows_read_only_and_whole_header(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let x = add_terminal(&mut cx, "x", "/project-a", 10);
+    let ga = group("/project-a");
+    let section = {
+        let id = std::cell::RefCell::new(None);
+        edit(&mut cx, |store, cx| {
+            *id.borrow_mut() = Some(store.create_section(&ga, "S", cx).unwrap().0);
+        });
+        id.into_inner().unwrap()
+    };
+    refresh(&sidebar, &mut cx);
+    let header = DropTarget::SectionHeader {
+        id: section,
+        group: ga.clone(),
+    };
+    let item = row_item(x, "/project-a");
+    sidebar.update(&mut cx, |sidebar, cx| {
+        sidebar.update_drop_preview(header.clone(), &item, Zone::Before, cx)
+    });
+    let preview = sidebar
+        .read_with(&cx, |sidebar, _| sidebar.hierarchy.drop_preview.clone())
+        .expect("a preview");
+    assert_eq!(
+        (preview.zone, preview.refusal.is_none()),
+        (Zone::Into, true)
+    );
+
+    let db = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx));
+    db.scoped(cpzed_hierarchy::KVP_SCOPE)
+        .write(
+            cpzed_hierarchy::KVP_KEY.to_string(),
+            r#"{"version":99}"#.to_string(),
+        )
+        .await
+        .unwrap();
+    cx.update(|_, cx| {
+        HierarchyStore::global(cx).update(cx, |store, cx| *store = HierarchyStore::new(db, cx))
+    });
+    sidebar.update(&mut cx, |sidebar, cx| {
+        sidebar.update_drop_preview(header.clone(), &item, Zone::Into, cx)
+    });
+    let preview = sidebar
+        .read_with(&cx, |sidebar, _| sidebar.hierarchy.drop_preview.clone())
+        .expect("a preview");
+    assert!(preview.refusal.is_some_and(|r| r.contains("read-only")));
+}
+
+fn row_bounds(
+    sidebar: &Entity<Sidebar>,
+    id: TerminalId,
+    cx: &mut VisualTestContext,
+) -> gpui::Bounds<gpui::Pixels> {
+    let ix = entry_index(sidebar, id, cx);
+    let selector: &'static str = Box::leak(format!("hierarchy-dnd-{ix}").into_boxed_str());
+    cx.debug_bounds(selector).expect("row is laid out")
+}
+
+fn pointer_drag(
+    cx: &mut VisualTestContext,
+    from: gpui::Point<gpui::Pixels>,
+    to: gpui::Point<gpui::Pixels>,
+) {
+    let none = gpui::Modifiers::default();
+    cx.simulate_mouse_move(from, None, none);
+    cx.simulate_mouse_down(from, gpui::MouseButton::Left, none);
+    for step in 1..=4 {
+        let t = step as f32 / 4.;
+        cx.simulate_mouse_move(from + (to - from) * t, gpui::MouseButton::Left, none);
+    }
+    cx.simulate_mouse_up(to, gpui::MouseButton::Left, none);
+    cx.run_until_parked();
+}
+
+// Real pointer edge drags: the top 10% of a row puts the dragged row before it, the bottom 10%
+// after it.
+#[gpui::test]
+async fn test_real_pointer_edge_drags_reorder(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let a = add_terminal(&mut cx, "a", "/project-a", 10);
+    let b = add_terminal(&mut cx, "b", "/project-a", 20);
+    let c = add_terminal(&mut cx, "c", "/project-a", 30);
+    refresh(&sidebar, &mut cx);
+    let at = |bounds: gpui::Bounds<gpui::Pixels>, fraction: f32| {
+        gpui::point(
+            bounds.center().x,
+            bounds.origin.y + bounds.size.height * fraction,
+        )
+    };
+
+    let (from, to) = (
+        row_bounds(&sidebar, c, &mut cx),
+        row_bounds(&sidebar, a, &mut cx),
+    );
+    pointer_drag(&mut cx, from.center(), at(to, 0.1));
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  c", "  a", "  b"]
+    );
+
+    let (from, to) = (
+        row_bounds(&sidebar, c, &mut cx),
+        row_bounds(&sidebar, b, &mut cx),
+    );
+    pointer_drag(&mut cx, from.center(), at(to, 0.9));
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  a", "  b", "  c"]
+    );
+}
+
+// Review: the handlers carry the target's key, not the render-time row index, so a list rebuilt
+// between the last pointer move and the mouse-up (a new thread on top) cannot redirect the drop.
+#[gpui::test]
+async fn test_drop_lands_on_the_originally_targeted_row_after_the_list_changes(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let a = add_terminal(&mut cx, "a", "/project-a", 10);
+    let b = add_terminal(&mut cx, "b", "/project-a", 20);
+    refresh(&sidebar, &mut cx);
+    let (from, to) = (
+        row_bounds(&sidebar, b, &mut cx),
+        row_bounds(&sidebar, a, &mut cx),
+    );
+    let none = gpui::Modifiers::default();
+    cx.simulate_mouse_move(from.center(), None, none);
+    cx.simulate_mouse_down(from.center(), gpui::MouseButton::Left, none);
+    for step in 1..=4 {
+        let t = step as f32 / 4.;
+        cx.simulate_mouse_move(
+            from.center() + (to.center() - from.center()) * t,
+            gpui::MouseButton::Left,
+            none,
+        );
+    }
+    // The preview is keyed on the target row, not on its index.
+    let preview = sidebar
+        .read_with(&cx, |sidebar, _| sidebar.hierarchy.drop_preview.clone())
+        .expect("a preview while hovering a");
+    assert_eq!(preview.target, row_target(a, "/project-a"));
+    // A new thread appears on top and the entries are rebuilt: `a` is no longer at its old index.
+    let _new = save_terminal(&mut cx, "new", "/project-a", 1);
+    refresh(&sidebar, &mut cx);
+    assert_ne!(entry_index(&sidebar, a, &mut cx), 2);
+    // The handlers captured the target key at render time and finish the drop with it.
+    let dragged = hierarchy_dnd::DraggedSidebarItem {
+        item: row_item(b, "/project-a"),
+        title: "b".into(),
+    };
+    sidebar.update(&mut cx, |sidebar, cx| {
+        sidebar.finish_drop(preview.target.clone(), &dragged, cx)
+    });
+    cx.run_until_parked();
+    let shown = rows(&sidebar, &mut cx);
+    let a_at = shown.iter().position(|r| r == "  a").unwrap();
+    assert_eq!(
+        shown.get(a_at + 1),
+        Some(&"    b".to_string()),
+        "b nests under a, not under the new top row: {shown:?}"
     );
 }
