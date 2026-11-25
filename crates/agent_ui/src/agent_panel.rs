@@ -1561,22 +1561,9 @@ impl AgentPanel {
                     restore_store.update(cx, |restore_store, cx| {
                         restore_store.retain_ids(&existing, cx)
                     });
-                    for metadata in rows {
-                        if Some(metadata.terminal_id) == active_id {
-                            continue;
-                        }
-                        let claimed = restore_store.update(cx, |restore_store, _| {
-                            restore_store.try_claim(&metadata.terminal_id.to_key_string())
-                        });
-                        if claimed {
-                            other_terminals_to_restore.push(metadata);
-                        }
-                    }
-                    if let Some(active_id) = active_id {
-                        restore_store.update(cx, |restore_store, _| {
-                            restore_store.try_claim(&active_id.to_key_string());
-                        });
-                    }
+                    other_terminals_to_restore = restore_store.update(cx, |restore_store, _| {
+                        restore_store.claim_for_restore(rows, active_id)
+                    });
                     let ids: Vec<TerminalId> = other_terminals_to_restore
                         .iter()
                         .map(|metadata| metadata.terminal_id)

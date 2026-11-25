@@ -151,6 +151,29 @@ impl TerminalRestoreStore {
         self.claimed.insert(terminal_id.to_string())
     }
 
+    /// Claims `rows` for this panel, skipping the active terminal (the load
+    /// restores it itself; spawning it again would start a second shell) and
+    /// anything another panel already claimed. The active id is claimed too.
+    pub fn claim_for_restore(
+        &mut self,
+        rows: Vec<TerminalThreadMetadata>,
+        active: Option<crate::TerminalId>,
+    ) -> Vec<TerminalThreadMetadata> {
+        let mut claimed = Vec::new();
+        for row in rows {
+            if Some(row.terminal_id) == active {
+                continue;
+            }
+            if self.try_claim(&row.terminal_id.to_key_string()) {
+                claimed.push(row);
+            }
+        }
+        if let Some(active) = active {
+            self.try_claim(&active.to_key_string());
+        }
+        claimed
+    }
+
     fn schedule_write(&mut self, cx: &mut Context<Self>) {
         if self.read_only {
             return;
@@ -303,5 +326,120 @@ mod tests {
         cx.run_until_parked();
         let again = cx.new(|cx| TerminalRestoreStore::new(db, cx));
         again.read_with(cx, |store, _| assert_eq!(store.state("stale-id"), stale));
+    }
+
+    fn meta(
+        title: &str,
+        root: &str,
+        remote: Option<RemoteConnectionOptions>,
+    ) -> TerminalThreadMetadata {
+        TerminalThreadMetadata {
+            terminal_id: crate::TerminalId::new(),
+            title: title.to_string().into(),
+            custom_title: None,
+            created_at: chrono::Utc::now(),
+            worktree_paths: crate::thread_metadata_store::WorktreePaths::from_folder_paths(
+                &workspace::PathList::new(&[p(root)]),
+            ),
+            remote_connection: remote,
+            working_directory: Some(p(root)),
+        }
+    }
+
+    fn open_state() -> TerminalRestoreState {
+        TerminalRestoreState {
+            open: true,
+            ..Default::default()
+        }
+    }
+
+    /// `retain_ids` forgets state for ids not in the keep set, and a store
+    /// reopened on the same db agrees.
+    #[gpui::test]
+    async fn test_retain_ids_prunes_and_persists(cx: &mut gpui::TestAppContext) {
+        let db = KeyValueStore::open_test_db("terminal_restore_retain").await;
+        let store = cx.new(|cx| TerminalRestoreStore::new(db.clone(), cx));
+        store.update(cx, |store, cx| {
+            store.set("keep", open_state(), cx);
+            store.set("drop", open_state(), cx);
+        });
+        cx.run_until_parked();
+        store.update(cx, |store, cx| {
+            store.retain_ids(&HashSet::from(["keep".to_string()]), cx)
+        });
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert!(store.has_state("keep"));
+            assert!(!store.has_state("drop"));
+        });
+        let reopened = cx.new(|cx| TerminalRestoreStore::new(db, cx));
+        reopened.read_with(cx, |store, _| {
+            assert!(store.has_state("keep"));
+            assert!(!store.has_state("drop"));
+        });
+    }
+
+    /// A remote thread is never restored into a local workspace, nor a local
+    /// one into a remote workspace; the same remote restores its own.
+    #[gpui::test]
+    async fn test_restore_filters_by_remote_connection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+        let db = KeyValueStore::open_test_db("terminal_restore_remote").await;
+        let restore = cx.new(|cx| TerminalRestoreStore::new(db, cx));
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 7 });
+        let other_remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 8 });
+        let local = meta("local", "/code/a", None);
+        let remote_row = meta("remote", "/code/a", Some(remote.clone()));
+        let store = cx.update(|cx| TerminalThreadMetadataStore::global(cx));
+        let reload = store.read_with(cx, |store, _| store.reload_task());
+        reload.await;
+        for row in [&local, &remote_row] {
+            store.update(cx, |store, cx| store.save((*row).clone(), cx));
+            restore.update(cx, |restore, cx| {
+                restore.set(&row.terminal_id.to_key_string(), open_state(), cx)
+            });
+        }
+        cx.run_until_parked();
+        let roots = [p("/code/a")];
+        let ids = |remote: Option<&RemoteConnectionOptions>, cx: &mut gpui::TestAppContext| {
+            store.read_with(cx, |store, cx| {
+                entries_to_restore(store, restore.read(cx), &roots, remote, None)
+                    .iter()
+                    .map(|row| row.title.to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(ids(None, cx), vec!["local"]);
+        assert_eq!(ids(Some(&remote), cx), vec!["remote"]);
+        assert!(ids(Some(&other_remote), cx).is_empty());
+    }
+
+    /// The active terminal is restored by the load itself, so it is excluded
+    /// from the extra rows (else a second shell would spawn), yet claimed so
+    /// another panel does not restore it either; others are claimed once.
+    #[gpui::test]
+    async fn test_claim_skips_the_active_terminal_and_claims_once(cx: &mut gpui::TestAppContext) {
+        let active = meta("active", "/code/a", None);
+        let other = meta("other", "/code/a", None);
+        let rows = vec![active.clone(), other.clone()];
+        let db = KeyValueStore::open_test_db("terminal_restore_claim").await;
+        let store = cx.new(|cx| TerminalRestoreStore::new(db, cx));
+        let claimed = store.update(cx, |store, _| {
+            store.claim_for_restore(rows.clone(), Some(active.terminal_id))
+        });
+        assert_eq!(
+            claimed.iter().map(|r| r.terminal_id).collect::<Vec<_>>(),
+            vec![other.terminal_id]
+        );
+        // Both are now claimed: a second panel restores nothing.
+        assert!(
+            store
+                .update(cx, |store, _| store.claim_for_restore(rows, None))
+                .is_empty()
+        );
     }
 }
