@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cpzed_hierarchy::{
-    ArrangeInput, GroupKey, Hierarchy, HierarchyStore, Refusal, Rollup, RowInfo, RowKey, SectionId,
-    Slot, arrange_rows,
+    ArrangeInput, DragItem, DropTarget, GroupKey, Hierarchy, HierarchyStore, Refusal, Rollup,
+    RowInfo, RowKey, SectionId, Slot, Zone, arrange_rows,
 };
 use editor::Editor;
 use gpui::{Entity, Subscription, WeakEntity};
@@ -69,6 +69,8 @@ pub(crate) struct HierarchyUi {
     pub notice: Option<SharedString>,
     /// Every row the last rebuild saw (including collapsed subtrees), for the 30-day prune.
     pub seen_rows: Vec<RowKey>,
+    /// The drop indicator while a drag is over a row (S4).
+    pub drop_preview: Option<super::hierarchy_dnd::DropPreview>,
     pub _store_subscription: Subscription,
 }
 
@@ -87,7 +89,7 @@ pub(crate) fn thread_key(id: ThreadId) -> RowKey {
     RowKey::Thread(id.to_key_string())
 }
 
-fn entry_row_key(entry: &ListEntry) -> Option<RowKey> {
+pub(crate) fn entry_row_key(entry: &ListEntry) -> Option<RowKey> {
     match entry {
         ListEntry::Thread(thread) => Some(thread_key(thread.metadata.thread_id)),
         ListEntry::Terminal(terminal) => Some(terminal_key(terminal.metadata.terminal_id)),
@@ -355,17 +357,45 @@ pub(crate) fn edit_store<T>(
         .flatten()
 }
 
-/// Make `child` a subthread of `parent` (or un-nest it with `None`).
+/// Make `child` a subthread of `parent` (or un-nest it with `None`). This is the drop path: the
+/// menu entry and the drag-and-drop equivalent (middle drop / drop on the project header) run the
+/// same `plan_drop` and applier.
 pub(crate) fn set_parent_action(
     sidebar: &WeakEntity<Sidebar>,
     cx: &mut App,
     child: &RowKey,
     parent: Option<&RowKey>,
 ) {
-    edit_store(sidebar, cx, |store, cx| store.set_parent(child, parent, cx));
+    sidebar
+        .update(cx, |sidebar, cx| {
+            let Some(group) = sidebar.row_group(child) else {
+                return;
+            };
+            let target = match parent {
+                Some(parent) => {
+                    let Some(parent_group) = sidebar.row_group(parent) else {
+                        return;
+                    };
+                    DropTarget::Row {
+                        key: parent.clone(),
+                        group: parent_group,
+                    }
+                }
+                None => DropTarget::ProjectHeader {
+                    group: group.clone(),
+                },
+            };
+            let item = DragItem::Row {
+                key: child.clone(),
+                group,
+            };
+            sidebar.drop_item_on(&item, &target, Zone::Into, cx);
+        })
+        .ok();
 }
 
-/// Put a row in a section of its own project, or in the unsectioned area with `None`.
+/// Put a row in a section of its own project, or in the unsectioned area with `None` (the same
+/// path as dropping it on the section header or its own project header).
 pub(crate) fn set_section_action(
     sidebar: &WeakEntity<Sidebar>,
     cx: &mut App,
@@ -373,9 +403,24 @@ pub(crate) fn set_section_action(
     group: &GroupKey,
     section: Option<&SectionId>,
 ) {
-    edit_store(sidebar, cx, |store, cx| {
-        store.set_section(row, group, section, cx)
-    });
+    sidebar
+        .update(cx, |sidebar, cx| {
+            let target = match section {
+                Some(id) => DropTarget::SectionHeader {
+                    id: id.clone(),
+                    group: group.clone(),
+                },
+                None => DropTarget::ProjectHeader {
+                    group: group.clone(),
+                },
+            };
+            let item = DragItem::Row {
+                key: row.clone(),
+                group: group.clone(),
+            };
+            sidebar.drop_item_on(&item, &target, Zone::Into, cx);
+        })
+        .ok();
 }
 
 /// What the row context menu offers. Built from the live sidebar, so it also works on the
@@ -409,6 +454,7 @@ impl Sidebar {
             section_edit: None,
             notice: None,
             seen_rows: Vec::new(),
+            drop_preview: None,
             _store_subscription: subscription,
         }
     }
@@ -940,7 +986,7 @@ impl Sidebar {
 
     /// The group a row belongs to: its layout when arranged, else the nearest project header
     /// above it (the starting state has no layout).
-    fn row_group(&self, key: &RowKey) -> Option<GroupKey> {
+    pub(crate) fn row_group(&self, key: &RowKey) -> Option<GroupKey> {
         if let Some(layout) = self.hierarchy.row_layout.get(key) {
             return Some(layout.group.clone());
         }
