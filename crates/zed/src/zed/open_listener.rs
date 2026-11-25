@@ -723,7 +723,13 @@ pub async fn handle_cli_request(
                     // empty list for a store that failed to load.
                     let reload_task = cx.update(|cx| store.read(cx).reload_task());
                     reload_task.await;
-                    let list = cx.update(|cx| store.read(cx).list_json_if_loaded());
+                    let list = cx.update(|cx| {
+                        let mut list = store.read(cx).list_json_if_loaded();
+                        if let Some(list) = list.as_mut() {
+                            crate::zed::cli_agent::annotate_agent_list(list, cx);
+                        }
+                        list
+                    });
                     match list {
                         Some(list) => match serde_json::to_string_pretty(&list) {
                             Ok(message) => CliResponse::Stdout { message },
@@ -758,6 +764,8 @@ pub async fn handle_cli_request(
                 command,
                 title,
                 on_no_match,
+                None,
+                None,
                 app_state,
                 responses.as_ref(),
                 cx,
@@ -771,6 +779,41 @@ pub async fn handle_cli_request(
         CliRequest::RenameAgentThread { id, title } => {
             crate::zed::cli_agent::handle_rename_agent_thread(id, title, responses.as_ref(), cx)
                 .await;
+        }
+        CliRequest::NewAgentTerminalIn {
+            cwd,
+            command,
+            title,
+            on_no_match,
+            parent,
+            section,
+        } => {
+            crate::zed::cli_agent::handle_new_agent_terminal(
+                cwd,
+                command,
+                title,
+                on_no_match,
+                parent,
+                section,
+                app_state,
+                responses.as_ref(),
+                cx,
+            )
+            .await;
+        }
+        CliRequest::UpdateAgentThread {
+            id,
+            parent,
+            section,
+        } => {
+            crate::zed::cli_agent::handle_update_agent_thread(
+                id,
+                parent,
+                section,
+                responses.as_ref(),
+                cx,
+            )
+            .await;
         }
     }
 }
