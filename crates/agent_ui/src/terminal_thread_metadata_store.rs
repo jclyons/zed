@@ -56,38 +56,9 @@ pub struct TerminalThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
-    pub restore: TerminalRestoreState,
-}
-
-/// CPZed: what is needed to bring a terminal thread back after a restart.
-/// Rows written before this existed load as `Default` (not open, no command),
-/// so the first upgrade does not respawn every old row.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TerminalRestoreState {
-    /// The command typed into the shell when the thread was started
-    /// (e.g. `claude attach <id>`); re-run on restore.
-    pub init_command: Option<String>,
-    /// The thread was open in a panel when it was last persisted. Stays true
-    /// across a quit; explicit close deletes the row.
-    pub open: bool,
-    /// The command's target is gone (dead claude session).
-    pub stale: bool,
 }
 
 impl TerminalThreadMetadata {
-    /// Whether this thread belongs to a project with the given root paths:
-    /// one of its folder paths is a root, or its cwd is inside a root.
-    pub fn belongs_to_roots(&self, roots: &[PathBuf]) -> bool {
-        self.folder_paths()
-            .paths()
-            .iter()
-            .any(|folder| roots.iter().any(|root| root == folder))
-            || self
-                .working_directory
-                .as_ref()
-                .is_some_and(|cwd| roots.iter().any(|root| cwd.starts_with(root)))
-    }
-
     pub fn folder_paths(&self) -> &PathList {
         self.worktree_paths.folder_path_list()
     }
@@ -97,15 +68,10 @@ impl TerminalThreadMetadata {
     }
 
     pub fn display_title(&self) -> SharedString {
-        let title = compose_terminal_thread_title(
+        compose_terminal_thread_title(
             self.title.as_ref(),
             self.custom_title.as_ref().map(|title| title.as_ref()),
-        );
-        if self.restore.stale {
-            SharedString::from(format!("[stale] {title}"))
-        } else {
-            title
-        }
+        )
     }
 
     pub fn editable_title(&self) -> SharedString {
@@ -254,28 +220,6 @@ impl TerminalThreadMetadataStore {
         self.terminals.values()
     }
 
-    /// Threads that were open before the last shutdown and belong to the
-    /// project with these roots, oldest first. Other projects' threads are
-    /// never returned (restore is per project).
-    pub fn entries_to_restore(
-        &self,
-        roots: &[PathBuf],
-        remote_connection: Option<&RemoteConnectionOptions>,
-    ) -> Vec<TerminalThreadMetadata> {
-        let mut entries: Vec<_> = self
-            .entries()
-            .filter(|terminal| {
-                terminal.restore.open
-                    && terminal.remote_connection.as_ref().map(|o| o.identity())
-                        == remote_connection.map(|o| o.identity())
-                    && terminal.belongs_to_roots(roots)
-            })
-            .cloned()
-            .collect();
-        entries.sort_by_cached_key(|m| (m.created_at, m.terminal_id.to_key_string()));
-        entries
-    }
-
     /// A JSON snapshot of every known terminal thread, oldest first, for the
     /// CLI (`zed --agent-list`). Kept here so callers outside this crate need
     /// no access to `TerminalId` internals.
@@ -308,8 +252,6 @@ impl TerminalThreadMetadataStore {
                             .as_ref()
                             .map(|path| path.to_string_lossy().into_owned()),
                         "remote": metadata.remote_connection.is_some(),
-                        "command": metadata.restore.init_command,
-                        "stale": metadata.restore.stale,
                     })
                 })
                 .collect(),
@@ -611,16 +553,6 @@ impl Domain for TerminalThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_terminal_threads ADD COLUMN delta_clones TEXT;
         ),
-        // CPZED-RESTORE: append-only; old rows default to not open.
-        sql!(
-            ALTER TABLE sidebar_terminal_threads ADD COLUMN init_command TEXT;
-        ),
-        sql!(
-            ALTER TABLE sidebar_terminal_threads ADD COLUMN was_open INTEGER NOT NULL DEFAULT 0;
-        ),
-        sql!(
-            ALTER TABLE sidebar_terminal_threads ADD COLUMN stale INTEGER NOT NULL DEFAULT 0;
-        ),
     ];
 }
 
@@ -631,8 +563,7 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection, delta_clones, \
-            init_command, was_open, stale \
+            main_worktree_paths_order, remote_connection, delta_clones \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -667,13 +598,10 @@ impl TerminalThreadMetadataDb {
             .transpose()
             .context("serialize terminal thread remote connection")?;
         let delta_clones = row.worktree_paths.serialized_delta_clones();
-        let init_command = row.restore.init_command.clone();
-        let was_open = row.restore.open as i64;
-        let stale = row.restore.stale as i64;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, delta_clones, init_command, was_open, stale) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, delta_clones) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -684,10 +612,7 @@ impl TerminalThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           delta_clones = excluded.delta_clones, \
-                           init_command = excluded.init_command, \
-                           was_open = excluded.was_open, \
-                           stale = excluded.stale";
+                           delta_clones = excluded.delta_clones";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -699,10 +624,7 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            i = stmt.bind(&delta_clones, i)?;
-            i = stmt.bind(&init_command, i)?;
-            i = stmt.bind(&was_open, i)?;
-            stmt.bind(&stale, i)?;
+            stmt.bind(&delta_clones, i)?;
             stmt.exec()
         })
         .await
@@ -739,9 +661,6 @@ impl Column for TerminalThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (delta_clones, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (init_command, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (was_open, next): (i64, i32) = Column::column(statement, next)?;
-        let (stale, next): (i64, i32) = Column::column(statement, next)?;
 
         let remote_connection = remote_connection_json
             .as_deref()
@@ -768,11 +687,6 @@ impl Column for TerminalThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
-                restore: TerminalRestoreState {
-                    init_command: init_command.filter(|command| !command.trim().is_empty()),
-                    open: was_open != 0,
-                    stale: stale != 0,
-                },
             },
             next,
         ))
@@ -799,7 +713,6 @@ mod tests {
     fn metadata(title: &str, worktree_paths: WorktreePaths) -> TerminalThreadMetadata {
         let now = Utc::now();
         TerminalThreadMetadata {
-            restore: Default::default(),
             terminal_id: TerminalId::new(),
             title: SharedString::from(title.to_string()),
             custom_title: None,
@@ -876,8 +789,6 @@ mod tests {
                     "folder_paths": ["/projects/a"],
                     "working_directory": null,
                     "remote": false,
-                    "command": null,
-                    "stale": false,
                 },
                 {
                     "id": newer_id.to_key_string(),
@@ -888,124 +799,9 @@ mod tests {
                     "folder_paths": ["/projects/b"],
                     "working_directory": "/projects/b/sub",
                     "remote": false,
-                    "command": null,
-                    "stale": false,
                 },
             ])
         );
-    }
-
-    fn open_metadata(title: &str, root: &str, command: Option<&str>) -> TerminalThreadMetadata {
-        let mut entry = metadata(
-            title,
-            WorktreePaths::from_folder_paths(&PathList::new(&[Path::new(root)])),
-        );
-        entry.working_directory = Some(PathBuf::from(root));
-        entry.restore = TerminalRestoreState {
-            init_command: command.map(str::to_string),
-            open: true,
-            stale: false,
-        };
-        entry
-    }
-
-    /// Restart simulation: rows written, in-memory state dropped, reloaded
-    /// from the DB. Uses the in-memory test DB only.
-    #[gpui::test]
-    async fn test_restore_state_survives_a_store_reload(cx: &mut TestAppContext) {
-        init_test(cx);
-        let store = cx.update(|cx| TerminalThreadMetadataStore::global(cx));
-        let mut stale = open_metadata("Dead", "/projects/a", Some("claude attach dead"));
-        stale.restore.stale = true;
-        let live = open_metadata("Live", "/projects/a", Some("claude attach abc12345"));
-        let (live_id, stale_id) = (live.terminal_id, stale.terminal_id);
-        store.update(cx, |store, cx| {
-            store.save(live.clone(), cx);
-            store.save(stale.clone(), cx);
-        });
-        cx.run_until_parked();
-
-        store.update(cx, |store, cx| {
-            store.terminals.clear();
-            store.terminals_by_paths.clear();
-            store.terminals_by_main_paths.clear();
-            store.reload(cx);
-        });
-        cx.run_until_parked();
-
-        store.read_with(cx, |store, _| {
-            let live = store.entry(live_id).unwrap();
-            assert_eq!(
-                live.restore,
-                TerminalRestoreState {
-                    init_command: Some("claude attach abc12345".into()),
-                    open: true,
-                    stale: false
-                }
-            );
-            let stale = store.entry(stale_id).unwrap();
-            assert!(stale.restore.stale);
-            assert_eq!(stale.display_title().as_ref(), "[stale] Dead");
-            let json = store.list_json();
-            let dead = json
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|entry| entry["id"] == stale_id.to_key_string())
-                .unwrap();
-            assert_eq!(dead["stale"], serde_json::json!(true));
-            assert_eq!(dead["command"], serde_json::json!("claude attach dead"));
-        });
-    }
-
-    /// Rows from before the restore columns existed load as not open, so the
-    /// first upgrade does not respawn every old row.
-    #[gpui::test]
-    async fn test_rows_without_restore_state_load_as_not_open(cx: &mut TestAppContext) {
-        init_test(cx);
-        let store = cx.update(|cx| TerminalThreadMetadataStore::global(cx));
-        let mut old_row = open_metadata("Old", "/projects/a", None);
-        old_row.restore = TerminalRestoreState::default();
-        store.update(cx, |store, cx| store.save(old_row, cx));
-        cx.run_until_parked();
-        let restorable = store.read_with(cx, |store, _| {
-            store.entries_to_restore(&[PathBuf::from("/projects/a")], None)
-        });
-        assert!(restorable.is_empty());
-    }
-
-    /// Restore is per project: opening A restores only A's open threads.
-    #[gpui::test]
-    async fn test_entries_to_restore_are_per_project(cx: &mut TestAppContext) {
-        init_test(cx);
-        let store = cx.update(|cx| TerminalThreadMetadataStore::global(cx));
-        let a1 = open_metadata("A1", "/projects/a", Some("claude attach a1"));
-        let mut a2 = open_metadata("A2", "/projects/a", None);
-        a2.created_at = a1.created_at + chrono::Duration::seconds(1);
-        a2.worktree_paths = WorktreePaths::from_folder_paths(&PathList::default());
-        a2.working_directory = Some(PathBuf::from("/projects/a/sub"));
-        let b1 = open_metadata("B1", "/projects/b", Some("claude attach b1"));
-        let mut a_closed = open_metadata("AClosed", "/projects/a", None);
-        a_closed.restore.open = false;
-        store.update(cx, |store, cx| {
-            for entry in [&a1, &a2, &b1, &a_closed] {
-                store.save(entry.clone(), cx);
-            }
-        });
-        cx.run_until_parked();
-
-        let titles = |root: &str| {
-            store.read_with(cx, |store, _| {
-                store
-                    .entries_to_restore(&[PathBuf::from(root)], None)
-                    .into_iter()
-                    .map(|entry| entry.title.to_string())
-                    .collect::<Vec<_>>()
-            })
-        };
-        assert_eq!(titles("/projects/a"), vec!["A1", "A2"]);
-        assert_eq!(titles("/projects/b"), vec!["B1"]);
-        assert!(titles("/projects/c").is_empty());
     }
 
     #[gpui::test]

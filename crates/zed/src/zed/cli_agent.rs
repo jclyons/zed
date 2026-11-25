@@ -484,6 +484,7 @@ async fn update_thread(
 pub fn annotate_agent_list(list: &mut serde_json::Value, cx: &App) {
     let store = HierarchyStore::try_global(cx);
     let hierarchy = store.as_ref().map(|store| store.read(cx).hierarchy());
+    let restore = agent_ui::terminal_restore_store::TerminalRestoreStore::try_global(cx);
     let Some(rows) = list.as_array_mut() else {
         return;
     };
@@ -491,6 +492,15 @@ pub fn annotate_agent_list(list: &mut serde_json::Value, cx: &App) {
         let Some(id) = row["id"].as_str().map(str::to_string) else {
             continue;
         };
+        // Append-only restore fields: the saved command and the stale flag.
+        let state = restore
+            .as_ref()
+            .map(|store| store.read(cx).state(&id))
+            .unwrap_or_default();
+        row["command"] = state
+            .init_command
+            .map_or(serde_json::Value::Null, Into::into);
+        row["stale"] = state.stale.into();
         let key = RowKey::Terminal(id);
         let (parent, section, depth) = match hierarchy {
             Some(h) => {
@@ -2789,7 +2799,6 @@ mod tests {
             store.update(cx, |store, cx| {
                 store.save(
                     agent_ui::terminal_thread_metadata_store::TerminalThreadMetadata {
-                        restore: Default::default(),
                         terminal_id: stale_id,
                         title: "stale".into(),
                         custom_title: Some("old session (bg)".into()),
@@ -2900,7 +2909,6 @@ mod tests {
             TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
                     agent_ui::terminal_thread_metadata_store::TerminalThreadMetadata {
-                        restore: Default::default(),
                         terminal_id: stale_id,
                         title: "stale".into(),
                         custom_title: None,

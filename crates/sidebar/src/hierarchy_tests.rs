@@ -89,7 +89,6 @@ fn save_terminal(cx: &mut VisualTestContext, title: &str, path: &str, age_secs: 
     let terminal_id = TerminalId::test_new();
     let paths = PathList::new(&[PathBuf::from(path)]);
     let metadata = TerminalThreadMetadata {
-        restore: Default::default(),
         terminal_id,
         title: title.to_string().into(),
         custom_title: None,

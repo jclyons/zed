@@ -18,8 +18,9 @@ pub fn attach_target(command: &str) -> Option<&str> {
     (words.next().is_none()).then_some(target.trim_matches(|c| c == '"' || c == '\''))
 }
 
-/// Whether `target` (an id or a name, whole or the start/part of a name, as
-/// `claude attach` accepts) is in the output of `claude agents --json`.
+/// Whether `target` names a live session in the output of
+/// `claude agents --json`: an exact (case-insensitive) match on `id`,
+/// `sessionId` or `name`, or, for a target of 6+ characters, an id prefix.
 /// `None` when the output is not the expected JSON, so unknown is never
 /// reported as stale.
 pub fn target_is_alive(agents_json: &str, target: &str) -> Option<bool> {
@@ -33,7 +34,8 @@ pub fn target_is_alive(agents_json: &str, target: &str) -> Option<bool> {
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| {
                     let value = value.to_lowercase();
-                    value == target || (*key == "name" && value.contains(&target))
+                    value == target
+                        || (*key != "name" && target.len() >= 6 && value.starts_with(&target))
                 })
         })
     }))
@@ -42,6 +44,8 @@ pub fn target_is_alive(agents_json: &str, target: &str) -> Option<bool> {
 /// Runs `claude agents --json` through `shell` (a login shell, so the app's
 /// minimal GUI PATH still finds `claude`) and returns its stdout, or `None`
 /// if it could not be run or exited non-zero.
+// Only ever called from a background thread (see `agents_json_fetcher`).
+#[allow(clippy::disallowed_methods)]
 pub fn agents_json(shell: &str, login: bool) -> Option<String> {
     let mut command = Command::new(shell);
     if login {
@@ -59,15 +63,44 @@ pub fn agents_json(shell: &str, login: bool) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// `Some(true)` when the command's target is gone. Blocking; call from a
-/// background thread.
-pub fn command_is_stale(command: &str, shell: &str, login: bool) -> bool {
+/// `true` when `command` is a `claude attach <target>` whose target is not in
+/// `agents_json`. Unknown (no JSON, not an attach command) is never stale.
+pub fn is_stale(command: &str, agents_json: Option<&str>) -> bool {
     let Some(target) = attach_target(command) else {
         return false;
     };
-    agents_json(shell, login)
-        .and_then(|json| target_is_alive(&json, target))
+    agents_json
+        .and_then(|json| target_is_alive(json, target))
         .is_some_and(|alive| !alive)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AGENTS_JSON: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: the canned `claude agents --json` output. Under `cfg(test)` the
+/// fetcher NEVER runs a shell or the real claude: it returns this (default
+/// `None`, i.e. unknown, so nothing is marked stale).
+#[cfg(test)]
+pub fn set_test_agents_json(json: Option<&str>) {
+    TEST_AGENTS_JSON.with(|cell| *cell.borrow_mut() = json.map(str::to_string));
+}
+
+/// A closure that fetches `claude agents --json` once (run it on a background
+/// thread). Capture it on the foreground: under test it carries the canned
+/// value and never spawns a process.
+pub fn agents_json_fetcher() -> impl FnOnce() -> Option<String> + Send + 'static {
+    #[cfg(test)]
+    {
+        let canned = TEST_AGENTS_JSON.with(|cell| cell.borrow().clone());
+        move || canned
+    }
+    #[cfg(not(test))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        move || agents_json(&shell, true)
+    }
 }
 
 #[cfg(test)]
@@ -94,13 +127,19 @@ mod tests {
     fn alive_matches_id_session_or_name() {
         assert_eq!(target_is_alive(AGENTS, "6fadf34c"), Some(true));
         assert_eq!(target_is_alive(AGENTS, "6fadf34c-af80"), Some(true));
-        assert_eq!(target_is_alive(AGENTS, "reviewer"), Some(true));
+        assert_eq!(target_is_alive(AGENTS, "cpzed-reviewer"), Some(true));
+        // Names match exactly, not by substring; ids match by a long prefix.
+        assert_eq!(target_is_alive(AGENTS, "reviewer"), Some(false));
+        assert_eq!(target_is_alive(AGENTS, "c"), Some(false));
+        assert_eq!(target_is_alive(AGENTS, "6fadf3"), Some(true));
+        assert_eq!(target_is_alive(AGENTS, "6fad"), Some(false));
         assert_eq!(target_is_alive(AGENTS, "deadbeef"), Some(false));
         assert_eq!(target_is_alive("not json", "x"), None);
     }
 
     /// Runs a fake `claude` placed on a temp PATH; touches no real HOME.
     #[test]
+    #[allow(clippy::disallowed_methods)] // test-only, fake claude in a temp dir
     fn stale_detection_with_fake_claude() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
@@ -124,7 +163,19 @@ mod tests {
     }
 
     #[test]
-    fn non_attach_commands_are_never_stale() {
-        assert!(!command_is_stale("echo hi", "/bin/sh", false));
+    fn non_attach_and_unknown_are_never_stale() {
+        assert!(!is_stale("echo hi", Some(AGENTS)));
+        assert!(!is_stale("claude attach deadbeef", None));
+        assert!(!is_stale("claude attach deadbeef", Some("not json")));
+        assert!(is_stale("claude attach deadbeef", Some(AGENTS)));
+        assert!(!is_stale("claude attach 6fadf34c", Some(AGENTS)));
+    }
+
+    #[test]
+    fn test_fetcher_never_runs_a_shell() {
+        assert_eq!(agents_json_fetcher()(), None);
+        set_test_agents_json(Some("[]"));
+        assert_eq!(agents_json_fetcher()().as_deref(), Some("[]"));
+        set_test_agents_json(None);
     }
 }
