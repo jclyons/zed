@@ -1579,3 +1579,116 @@ async fn test_real_mouse_up_drops_on_the_row_painted_under_the_pointer(cx: &mut 
         "c nests under a (the row that was under the pointer), not under b: {shown:?}"
     );
 }
+
+// Review (V1/V2): the visible order of a parent's children skips grandchildren and stops at the
+// next row that is not deeper than the parent, even when that row has children of its own.
+#[gpui::test]
+async fn test_visible_children_skip_grandchildren_and_stop_at_the_next_sibling(
+    cx: &mut TestAppContext,
+) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let p = add_terminal(&mut cx, "p", "/project-a", 60);
+    let c1 = add_terminal(&mut cx, "c1", "/project-a", 50);
+    let g = add_terminal(&mut cx, "g", "/project-a", 40);
+    let c2 = add_terminal(&mut cx, "c2", "/project-a", 30);
+    let s = add_terminal(&mut cx, "s", "/project-a", 20);
+    let d = add_terminal(&mut cx, "d", "/project-a", 10);
+    edit(&mut cx, |store, cx| {
+        store.set_parent(&key(c1), Some(&key(p)), cx).unwrap();
+        store.set_parent(&key(g), Some(&key(c1)), cx).unwrap();
+        store.set_parent(&key(c2), Some(&key(p)), cx).unwrap();
+        store.set_parent(&key(d), Some(&key(s)), cx).unwrap();
+    });
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        [
+            "[project-b]",
+            "[project-a]",
+            "  s",
+            "    d",
+            "  p",
+            "    c1",
+            "      g",
+            "    c2"
+        ]
+    );
+    sidebar.read_with(&cx, |sidebar, _| {
+        use cpzed_hierarchy::Container;
+        assert_eq!(
+            sidebar.visible_in(&Container::Children(key(p))),
+            vec![key(c1), key(c2)]
+        );
+        assert_eq!(
+            sidebar.visible_in(&Container::Children(key(c1))),
+            vec![key(g)]
+        );
+        assert_eq!(
+            sidebar.visible_in(&Container::Children(key(s))),
+            vec![key(d)]
+        );
+    });
+}
+
+// Review (G1): a child shown under a parent of another project (D1) belongs to its OWN project;
+// only the row layout knows that, the header-scan fallback would say the parent's project.
+#[gpui::test]
+async fn test_row_group_uses_the_rows_own_project_under_a_foreign_parent(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let parent = add_terminal(&mut cx, "parent", "/project-a", 20);
+    let child = add_terminal(&mut cx, "child", "/project-b", 10);
+    edit(&mut cx, |store, cx| {
+        store
+            .set_parent(&key(child), Some(&key(parent)), cx)
+            .unwrap();
+    });
+    refresh(&sidebar, &mut cx);
+    sidebar.read_with(&cx, |sidebar, _| {
+        assert_eq!(
+            sidebar.row_group(&key(child)),
+            Some(group("/project-b")),
+            "{:?}",
+            sidebar.contents.entries.len()
+        );
+        assert_eq!(sidebar.row_group(&key(parent)), Some(group("/project-a")));
+    });
+}
+
+// Review (DP): starting a new drag clears an indicator a previous drag left behind, before the
+// pointer has moved over any row.
+#[gpui::test]
+async fn test_starting_a_drag_clears_a_stale_preview(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let a = add_terminal(&mut cx, "a", "/project-a", 10);
+    let c = add_terminal(&mut cx, "c", "/project-a", 30);
+    refresh(&sidebar, &mut cx);
+    let from = row_bounds(&sidebar, c, &mut cx);
+    sidebar.update(&mut cx, |sidebar, _| {
+        sidebar.hierarchy.drop_preview = Some(hierarchy_dnd::DropPreview {
+            target: row_target(a, "/project-a"),
+            zone: cpzed_hierarchy::Zone::Into,
+            refusal: None,
+        });
+    });
+    let none = gpui::Modifiers::default();
+    cx.simulate_mouse_move(from.center(), None, none);
+    cx.simulate_mouse_down(from.center(), gpui::MouseButton::Left, none);
+    cx.simulate_mouse_move(
+        from.center() + gpui::point(gpui::px(0.), gpui::px(12.)),
+        gpui::MouseButton::Left,
+        none,
+    );
+    cx.run_until_parked();
+    sidebar.read_with(&cx, |sidebar, _| {
+        assert_ne!(
+            sidebar.hierarchy.drop_preview.as_ref().map(|p| &p.target),
+            Some(&row_target(a, "/project-a")),
+            "the stale preview on `a` is gone"
+        );
+    });
+}

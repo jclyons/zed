@@ -145,7 +145,7 @@ impl Sidebar {
 
     /// The order of a container as the user currently sees it (collapsed rows are not in it; the
     /// store keeps them after the visible ones).
-    fn visible_in(&self, container: &Container) -> Vec<RowKey> {
+    pub(crate) fn visible_in(&self, container: &Container) -> Vec<RowKey> {
         let entries = &self.contents.entries;
         let start = match container {
             Container::Children(parent) => entries
