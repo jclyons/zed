@@ -802,3 +802,485 @@ async fn test_touch_seen_records_only_mentioned_rows_and_never_writes_when_empty
         "a row with no hierarchy data is never recorded"
     );
 }
+
+// ---- S4: drag and drop -----------------------------------------------------------------------
+
+use cpzed_hierarchy::{DragItem, DropTarget, Zone};
+
+fn row_item(id: TerminalId, path: &str) -> DragItem {
+    DragItem::Row {
+        key: key(id),
+        group: group(path),
+    }
+}
+
+fn row_target(id: TerminalId, path: &str) -> DropTarget {
+    DropTarget::Row {
+        key: key(id),
+        group: group(path),
+    }
+}
+
+/// Run one drop through the same applier the real drop handler uses.
+fn drop_on(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut VisualTestContext,
+    item: &DragItem,
+    target: &DropTarget,
+    zone: Zone,
+) -> bool {
+    let changed = sidebar.update(cx, |sidebar, cx| {
+        sidebar.drop_item_on(item, target, zone, cx)
+    });
+    cx.run_until_parked();
+    changed
+}
+
+fn hierarchy_json(cx: &mut VisualTestContext) -> String {
+    cx.update(|_, cx| {
+        HierarchyStore::global(cx)
+            .read(cx)
+            .hierarchy()
+            .to_json()
+            .unwrap()
+    })
+}
+
+#[gpui::test]
+fn test_zone_at_splits_25_50_25(_cx: &mut TestAppContext) {
+    let bounds = gpui::Bounds {
+        origin: gpui::point(gpui::px(0.), gpui::px(100.)),
+        size: gpui::size(gpui::px(200.), gpui::px(40.)),
+    };
+    let zone = |y: f32| hierarchy_dnd::zone_at(gpui::px(y), bounds);
+    assert_eq!(zone(101.), Zone::Before);
+    assert_eq!(zone(109.), Zone::Before);
+    assert_eq!(zone(111.), Zone::Into);
+    assert_eq!(zone(120.), Zone::Into);
+    assert_eq!(zone(129.), Zone::Into);
+    assert_eq!(zone(131.), Zone::After);
+    assert_eq!(zone(139.), Zone::After);
+}
+
+// A middle drop nests; an edge drop reorders and re-parents.
+#[gpui::test]
+async fn test_middle_drop_nests_and_edge_drop_reorders_and_reparents(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let a = add_terminal(&mut cx, "a", "/project-a", 10);
+    let b = add_terminal(&mut cx, "b", "/project-a", 20);
+    let c = add_terminal(&mut cx, "c", "/project-a", 30);
+    refresh(&sidebar, &mut cx);
+    let p = "/project-a";
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  a", "  b", "  c"]
+    );
+
+    // Middle: c becomes a child of a.
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(c, p),
+        &row_target(a, p),
+        Zone::Into
+    ));
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  a", "    c", "  b"]
+    );
+
+    // Edge: c dropped After b leaves a and becomes a root after b (re-parent).
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(c, p),
+        &row_target(b, p),
+        Zone::After
+    ));
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  a", "  b", "  c"]
+    );
+
+    // Edge: c dropped Before a reorders the roots.
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(c, p),
+        &row_target(a, p),
+        Zone::Before
+    ));
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  c", "  a", "  b"]
+    );
+    assert_eq!(notice(&sidebar, &mut cx), None);
+}
+
+// A refused drop (cycle, own descendant, missing target, ReadOnly) changes nothing and says why.
+#[gpui::test]
+async fn test_refused_drops_change_nothing_and_show_why(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let top = add_terminal(&mut cx, "top", "/project-a", 10);
+    let mid = add_terminal(&mut cx, "mid", "/project-a", 20);
+    let leaf = add_terminal(&mut cx, "leaf", "/project-a", 30);
+    let ghost = TerminalId::test_new();
+    let p = "/project-a";
+    edit(&mut cx, |store, cx| {
+        store.set_parent(&key(mid), Some(&key(top)), cx).unwrap();
+        store.set_parent(&key(leaf), Some(&key(mid)), cx).unwrap();
+    });
+    refresh(&sidebar, &mut cx);
+    let before = hierarchy_json(&mut cx);
+    let rows_before = rows(&sidebar, &mut cx);
+
+    // The top dropped into its own grandchild: a cycle.
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(top, p),
+        &row_target(leaf, p),
+        Zone::Into
+    ));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("ancestor")));
+    // An edge drop inside its own subtree: also a cycle.
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(top, p),
+        &row_target(leaf, p),
+        Zone::After
+    ));
+    // A target that is not in the list.
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(leaf, p),
+        &row_target(ghost, p),
+        Zone::Into
+    ));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("not in the list")));
+    // Onto itself: nothing to do.
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(top, p),
+        &row_target(top, p),
+        Zone::Into
+    ));
+
+    assert_eq!(hierarchy_json(&mut cx), before);
+    assert_eq!(rows(&sidebar, &mut cx), rows_before);
+}
+
+#[gpui::test]
+async fn test_read_only_store_refuses_drops_visibly(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let top = add_terminal(&mut cx, "top", "/project-a", 10);
+    let low = add_terminal(&mut cx, "low", "/project-a", 20);
+    let db = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx));
+    db.scoped(cpzed_hierarchy::KVP_SCOPE)
+        .write(
+            cpzed_hierarchy::KVP_KEY.to_string(),
+            r#"{"version":99}"#.to_string(),
+        )
+        .await
+        .unwrap();
+    cx.update(|_, cx| {
+        HierarchyStore::global(cx).update(cx, |store, cx| *store = HierarchyStore::new(db, cx))
+    });
+    refresh(&sidebar, &mut cx);
+    let p = "/project-a";
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(low, p),
+        &row_target(top, p),
+        Zone::Into
+    ));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("read-only")));
+}
+
+// Sections: a row dropped on a section header moves into it; on its own project header it leaves
+// it; a section dropped on another section reorders within its project; a cross-project drop
+// is announced (S5), not applied.
+#[gpui::test]
+async fn test_section_drops(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let x = add_terminal(&mut cx, "x", "/project-a", 10);
+    let y = add_terminal(&mut cx, "y", "/project-a", 20);
+    let other = add_terminal(&mut cx, "other", "/project-b", 10);
+    let ga = group("/project-a");
+    let gb = group("/project-b");
+    let (s1, s2, sb) = {
+        let ids = std::cell::RefCell::new(Vec::new());
+        edit(&mut cx, |store, cx| {
+            let (one, _) = store.create_section(&ga, "One", cx).unwrap();
+            let (two, _) = store.create_section(&ga, "Two", cx).unwrap();
+            let (bsec, _) = store.create_section(&gb, "B", cx).unwrap();
+            ids.borrow_mut().extend([one, two, bsec]);
+        });
+        let ids = ids.into_inner();
+        (ids[0].clone(), ids[1].clone(), ids[2].clone())
+    };
+    refresh(&sidebar, &mut cx);
+    let p = "/project-a";
+
+    // x into section Two.
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(x, p),
+        &DropTarget::SectionHeader {
+            id: s2.clone(),
+            group: ga.clone()
+        },
+        Zone::Into
+    ));
+    let shown = rows(&sidebar, &mut cx);
+    let two_at = shown.iter().position(|r| r == "  § Two").unwrap();
+    assert_eq!(shown[two_at + 1], "    x");
+
+    // Section Two dropped Before section One reorders the sections.
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &DragItem::Section {
+            id: s2.clone(),
+            group: ga.clone()
+        },
+        &DropTarget::SectionHeader {
+            id: s1.clone(),
+            group: ga.clone()
+        },
+        Zone::Before
+    ));
+    let shown = rows(&sidebar, &mut cx);
+    let two_at = shown.iter().position(|r| r == "  § Two").unwrap();
+    let one_at = shown.iter().position(|r| r == "  § One").unwrap();
+    assert!(two_at < one_at, "{shown:?}");
+
+    // A section cannot move to another project: refused, nothing changes.
+    let before = hierarchy_json(&mut cx);
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &DragItem::Section {
+            id: s1.clone(),
+            group: ga.clone()
+        },
+        &DropTarget::SectionHeader {
+            id: sb.clone(),
+            group: gb.clone()
+        },
+        Zone::Into
+    ));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("another project")));
+    assert_eq!(hierarchy_json(&mut cx), before);
+
+    // x back out onto its own project header.
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(x, p),
+        &DropTarget::ProjectHeader { group: ga.clone() },
+        Zone::Into
+    ));
+    let shown = rows(&sidebar, &mut cx);
+    let a_at = shown.iter().position(|r| r == "[project-a]").unwrap();
+    let first_section = a_at
+        + shown[a_at..]
+            .iter()
+            .position(|r| r.starts_with("  §"))
+            .unwrap();
+    let x_at = shown.iter().position(|r| r == "  x").unwrap();
+    assert!(
+        a_at < x_at && x_at < first_section,
+        "x is unsectioned, above the sections: {shown:?}"
+    );
+
+    // A terminal dropped on another project is announced, not applied (S5).
+    let before = hierarchy_json(&mut cx);
+    assert!(!drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(y, p),
+        &DropTarget::ProjectHeader { group: gb.clone() },
+        Zone::Into
+    ));
+    assert!(notice(&sidebar, &mut cx).is_some_and(|n| n.contains("not available yet")));
+    assert_eq!(hierarchy_json(&mut cx), before);
+    let _ = other;
+}
+
+// The order survives a restart (KVP).
+#[gpui::test]
+async fn test_drop_result_survives_restart(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let a = add_terminal(&mut cx, "a", "/project-a", 10);
+    let b = add_terminal(&mut cx, "b", "/project-a", 20);
+    let c = add_terminal(&mut cx, "c", "/project-a", 30);
+    let p = "/project-a";
+    refresh(&sidebar, &mut cx);
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(c, p),
+        &row_target(a, p),
+        Zone::Before
+    ));
+    assert!(drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(b, p),
+        &row_target(c, p),
+        Zone::Into
+    ));
+    let expected = rows(&sidebar, &mut cx);
+    assert_eq!(
+        expected,
+        ["[project-b]", "[project-a]", "  c", "    b", "  a"]
+    );
+
+    let flush =
+        cx.update(|_, cx| HierarchyStore::global(cx).update(cx, |store, cx| store.flush(cx)));
+    flush.await;
+    cx.update(|_, cx| {
+        let db = db::kvp::KeyValueStore::global(cx);
+        HierarchyStore::global(cx).update(cx, |store, cx| *store = HierarchyStore::new(db, cx));
+    });
+    assert_eq!(rows(&sidebar, &mut cx), expected);
+}
+
+// A context-menu action equals the drop action.
+#[gpui::test]
+async fn test_menu_actions_equal_drop_actions(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let top = add_terminal(&mut cx, "top", "/project-a", 10);
+    let low = add_terminal(&mut cx, "low", "/project-a", 20);
+    let ga = group("/project-a");
+    let p = "/project-a";
+    let (section, _) = {
+        let ids = std::cell::RefCell::new(None);
+        edit(&mut cx, |store, cx| {
+            *ids.borrow_mut() = Some(store.create_section(&ga, "S", cx).unwrap());
+        });
+        ids.into_inner().unwrap()
+    };
+    refresh(&sidebar, &mut cx);
+    let weak = sidebar.downgrade();
+    let reset = |cx: &mut VisualTestContext| {
+        edit(cx, |store, cx| {
+            store
+                .edit(cx, |h| {
+                    h.parents.clear();
+                    h.child_order.clear();
+                    h.unsectioned_order.clear();
+                    for sections in h.sections.values_mut() {
+                        for s in sections {
+                            s.items.clear();
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        });
+    };
+
+    // Make Subthread Of == middle drop.
+    cx.update(|_, cx| hierarchy_ui::set_parent_action(&weak, cx, &key(low), Some(&key(top))));
+    cx.run_until_parked();
+    let by_menu = hierarchy_json(&mut cx);
+    reset(&mut cx);
+    drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(low, p),
+        &row_target(top, p),
+        Zone::Into,
+    );
+    assert_eq!(hierarchy_json(&mut cx), by_menu);
+
+    // Remove from Parent == drop on the project header.
+    cx.update(|_, cx| hierarchy_ui::set_parent_action(&weak, cx, &key(low), None));
+    cx.run_until_parked();
+    let by_menu = hierarchy_json(&mut cx);
+    reset(&mut cx);
+    drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(low, p),
+        &row_target(top, p),
+        Zone::Into,
+    );
+    drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(low, p),
+        &DropTarget::ProjectHeader { group: ga.clone() },
+        Zone::Into,
+    );
+    assert_eq!(hierarchy_json(&mut cx), by_menu);
+
+    // Move to Section == drop on the section header.
+    cx.update(|_, cx| hierarchy_ui::set_section_action(&weak, cx, &key(low), &ga, Some(&section)));
+    cx.run_until_parked();
+    let by_menu = hierarchy_json(&mut cx);
+    reset(&mut cx);
+    drop_on(
+        &sidebar,
+        &mut cx,
+        &row_item(low, p),
+        &DropTarget::SectionHeader {
+            id: section.clone(),
+            group: ga.clone(),
+        },
+        Zone::Into,
+    );
+    assert_eq!(hierarchy_json(&mut cx), by_menu);
+}
+
+// A real pointer drag: mouse down on one row, move over the middle of another, release.
+#[gpui::test]
+async fn test_real_pointer_drag_nests_and_edge_drag_reorders(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let a = add_terminal(&mut cx, "a", "/project-a", 10);
+    let b = add_terminal(&mut cx, "b", "/project-a", 20);
+    refresh(&sidebar, &mut cx);
+    let a_ix = entry_index(&sidebar, a, &mut cx);
+    let b_ix = entry_index(&sidebar, b, &mut cx);
+    let selector =
+        |ix: usize| -> &'static str { Box::leak(format!("hierarchy-dnd-{ix}").into_boxed_str()) };
+    let a_bounds = cx.debug_bounds(selector(a_ix)).expect("row a is laid out");
+    let b_bounds = cx.debug_bounds(selector(b_ix)).expect("row b is laid out");
+    let none = gpui::Modifiers::default();
+
+    // Drag b onto the middle of a: nests.
+    cx.simulate_mouse_move(b_bounds.center(), None, none);
+    cx.simulate_mouse_down(b_bounds.center(), gpui::MouseButton::Left, none);
+    for step in 1..=4 {
+        let t = step as f32 / 4.;
+        let pos = b_bounds.center() + (a_bounds.center() - b_bounds.center()) * t;
+        cx.simulate_mouse_move(pos, gpui::MouseButton::Left, none);
+    }
+    cx.simulate_mouse_up(a_bounds.center(), gpui::MouseButton::Left, none);
+    cx.run_until_parked();
+    assert_eq!(
+        rows(&sidebar, &mut cx),
+        ["[project-b]", "[project-a]", "  a", "    b"]
+    );
+}

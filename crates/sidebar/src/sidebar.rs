@@ -1,3 +1,4 @@
+mod hierarchy_dnd;
 mod hierarchy_ui;
 mod thread_switcher;
 
@@ -2466,6 +2467,7 @@ impl Sidebar {
             }
             ListEntry::Section(section) => self.render_section_header(ix, section, is_selected, cx),
         };
+        let rendered = self.wrap_drag_drop(ix, rendered, cx);
 
         if is_group_header_after_first {
             v_flex()
