@@ -5,6 +5,7 @@
 //! dead thread as if it were live.
 
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// The target of a `claude attach <target>` command, if `command` is one.
 pub fn attach_target(command: &str) -> Option<&str> {
@@ -44,6 +45,9 @@ pub fn target_is_alive(agents_json: &str, target: &str) -> Option<bool> {
 /// Runs `claude agents --json` through `shell` (a login shell, so the app's
 /// minimal GUI PATH still finds `claude`) and returns its stdout, or `None`
 /// if it could not be run or exited non-zero.
+/// How long `claude agents --json` may take before the answer is "unknown".
+const AGENTS_TIMEOUT: Duration = Duration::from_secs(5);
+
 // Only ever called from a background thread (see `agents_json_fetcher`).
 #[allow(clippy::disallowed_methods)]
 pub fn agents_json(shell: &str, login: bool) -> Option<String> {
@@ -51,16 +55,43 @@ pub fn agents_json(shell: &str, login: bool) -> Option<String> {
     if login {
         command.arg("-l");
     }
-    let output = command
-        .args(["-c", "claude agents --json"])
+    // `exec` so killing the shell on timeout kills claude itself.
+    command.args(["-c", "exec claude agents --json"]);
+    run_with_timeout(command, AGENTS_TIMEOUT)
+}
+
+/// Runs `command`, returning its stdout if it exits 0 within `timeout`. On
+/// timeout the child is killed and the answer is `None` (unknown, never stale).
+#[allow(clippy::disallowed_methods)]
+fn run_with_timeout(mut command: Command, timeout: Duration) -> Option<String> {
+    use std::io::Read as _;
+    let mut child = command
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).ok().map(|_| out)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+        }
+    };
+    // On timeout the reader is left to finish on its own: a grandchild might
+    // still hold the pipe open and joining could hang.
+    let status = status.filter(|status| status.success())?;
+    reader.join().ok().flatten().filter(|_| status.success())
 }
 
 /// `true` when `command` is a `claude attach <target>` whose target is not in
@@ -177,5 +208,25 @@ mod tests {
         set_test_agents_json(Some("[]"));
         assert_eq!(agents_json_fetcher()().as_deref(), Some("[]"));
         set_test_agents_json(None);
+    }
+
+    /// A hung `claude` (fake, sleeps) is killed at the timeout and reported as
+    /// unknown (`None`), so it can neither block startup nor mark anything stale.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn hung_claude_times_out_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec claude agents --json"])
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()));
+        let started = Instant::now();
+        assert_eq!(run_with_timeout(command, Duration::from_millis(300)), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!is_stale("claude attach 6fadf34c", None));
     }
 }

@@ -2342,6 +2342,7 @@ impl AgentPanel {
                         .update(cx, |workspace, cx| workspace.show_error(error, cx))
                         .log_err();
                     this.update(cx, |this, cx| {
+                        this.restoring_terminals.remove(&terminal_id);
                         if this.pending_terminal_spawns.remove(&terminal_id) {
                             cx.notify();
                         }
@@ -5629,7 +5630,8 @@ impl AgentPanel {
                             window,
                             cx,
                         );
-                    } else if this.pending_terminal_spawns.remove(&terminal_id) {
+                    } else {
+                        this.pending_terminal_spawns.remove(&terminal_id);
                     }
                 });
             } else {
@@ -5700,6 +5702,7 @@ impl AgentPanel {
             cx,
         ) {
             log::error!("failed to spawn test agent panel terminal: {error:#}");
+            self.restoring_terminals.remove(&terminal_id);
             if self.pending_terminal_spawns.remove(&terminal_id) {
                 cx.notify();
             }

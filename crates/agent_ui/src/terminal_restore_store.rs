@@ -135,6 +135,10 @@ impl TerminalRestoreStore {
 
     /// Drop entries whose thread no longer exists (closed or deleted).
     pub fn retain_ids(&mut self, keep: &HashSet<String>, cx: &mut Context<Self>) {
+        // An empty/failed metadata load must never wipe the overlay.
+        if keep.is_empty() {
+            return;
+        }
         let before = self.threads.len();
         self.threads.retain(|id, _| keep.contains(id));
         if self.threads.len() != before {
@@ -263,5 +267,41 @@ mod tests {
             &[p("/Users/me/code")],
             None
         ));
+    }
+
+    /// The overlay survives a real quit/reopen: a second store opened on the
+    /// same KVP db reads back command/open/stale (not the in-memory map).
+    #[gpui::test]
+    async fn test_overlay_round_trips_through_the_kvp_db(cx: &mut gpui::TestAppContext) {
+        let db = KeyValueStore::open_test_db("terminal_restore_round_trip").await;
+        let first = cx.new(|cx| TerminalRestoreStore::new(db.clone(), cx));
+        let stale = TerminalRestoreState {
+            init_command: Some("claude attach dead9999".into()),
+            open: true,
+            stale: true,
+        };
+        let live = TerminalRestoreState {
+            init_command: Some("claude attach aaaa1111".into()),
+            open: false,
+            stale: false,
+        };
+        first.update(cx, |store, cx| {
+            store.set("stale-id", stale.clone(), cx);
+            store.set("live-id", live.clone(), cx);
+        });
+        cx.run_until_parked();
+        drop(first);
+
+        let reopened = cx.new(|cx| TerminalRestoreStore::new(db.clone(), cx));
+        reopened.read_with(cx, |store, _| {
+            assert_eq!(store.state("stale-id"), stale);
+            assert_eq!(store.state("live-id"), live);
+            assert!(!store.has_state("missing"));
+        });
+        // An empty keep-set must never wipe the overlay.
+        reopened.update(cx, |store, cx| store.retain_ids(&HashSet::new(), cx));
+        cx.run_until_parked();
+        let again = cx.new(|cx| TerminalRestoreStore::new(db, cx));
+        again.read_with(cx, |store, _| assert_eq!(store.state("stale-id"), stale));
     }
 }
