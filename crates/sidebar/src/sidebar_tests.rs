@@ -3381,6 +3381,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
     });
     let now = Utc::now();
     let metadata = TerminalThreadMetadata {
+        restore: Default::default(),
         terminal_id,
         title: "Dev Server".into(),
         custom_title: None,
@@ -4612,6 +4613,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
 
     let created_at = chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap();
     let metadata = TerminalThreadMetadata {
+        restore: Default::default(),
         terminal_id,
         title: "Feature Terminal".into(),
         custom_title: None,
@@ -4719,6 +4721,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
     let worktree_folder_paths =
         PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]);
     let metadata = TerminalThreadMetadata {
+        restore: Default::default(),
         terminal_id,
         title: "Feature Terminal".into(),
         custom_title: None,
@@ -4995,6 +4998,7 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
     let worktree_folder_paths =
         PathList::new(&[PathBuf::from("/worktrees/project/feature-a/project")]);
     let metadata = TerminalThreadMetadata {
+        restore: Default::default(),
         terminal_id,
         title: "Feature Terminal".into(),
         custom_title: None,
@@ -18055,6 +18059,7 @@ fn save_terminal_metadata_with_main_paths(
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.save(
                 TerminalThreadMetadata {
+                    restore: Default::default(),
                     terminal_id: agent_ui::TerminalId::test_new(),
                     title: title.into(),
                     custom_title: None,

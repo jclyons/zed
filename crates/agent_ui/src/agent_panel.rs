@@ -1079,6 +1079,10 @@ struct AgentTerminal {
     last_known_terminal_title: String,
     last_observed_program: Option<String>,
     working_directory: Option<PathBuf>,
+    /// CPZed: the command typed into the shell at start, re-run on restore.
+    init_command: Option<String>,
+    /// CPZed: the command's target is gone (see `terminal_restore`).
+    stale: bool,
     created_at: DateTime<Utc>,
     has_notification: bool,
     search_bar: Option<Entity<BufferSearchBar>>,
@@ -1248,6 +1252,8 @@ pub struct AgentPanel {
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
+    /// CPZed: terminals being restored (value = was already stale).
+    restoring_terminals: HashMap<TerminalId, bool>,
     pending_terminal_spawn: Option<TerminalId>,
     #[cfg(test)]
     test_terminal_spawn_gate: Option<futures::channel::oneshot::Receiver<()>>,
@@ -1487,6 +1493,54 @@ impl AgentPanel {
                 None
             };
 
+            // CPZed: restore PER PROJECT. Every thread that was open before
+            // shutdown and belongs to this workspace's roots comes back;
+            // other projects' threads are left alone until their project opens.
+            let other_terminals_to_restore = if has_open_project {
+                let project = workspace
+                    .read_with(cx, |workspace, cx| {
+                        (
+                            workspace
+                                .root_paths(cx)
+                                .iter()
+                                .map(|path| path.to_path_buf())
+                                .collect::<Vec<_>>(),
+                            workspace
+                                .project()
+                                .read(cx)
+                                .remote_connection_options(cx)
+                                .cloned(),
+                        )
+                    })
+                    .ok();
+                let store = cx
+                    .update(|_window, cx| {
+                        TerminalThreadMetadataStore::try_global(cx).map(|store| {
+                            let reload_task = store.read(cx).reload_task();
+                            (store, reload_task)
+                        })
+                    })
+                    .ok()
+                    .flatten();
+                match (project, store) {
+                    (Some((roots, remote)), Some((store, reload_task))) => {
+                        reload_task.await;
+                        let active_id = terminal_to_restore
+                            .as_ref()
+                            .map(|metadata| metadata.terminal_id);
+                        store.read_with(cx, |store, _cx| {
+                            store.entries_to_restore(&roots, remote.as_ref())
+                        })
+                        .into_iter()
+                        .filter(|metadata| Some(metadata.terminal_id) != active_id)
+                        .collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+
             let panel = workspace.update_in(cx, |workspace, window, cx| {
                 let panel = cx.new(|cx| Self::new(workspace, window, cx));
 
@@ -1557,6 +1611,17 @@ impl AgentPanel {
                             info.title.clone().map(Into::into),
                             false,
                             AgentThreadSource::AgentPanel,
+                            window,
+                            cx,
+                        );
+                    }
+                    for metadata in other_terminals_to_restore {
+                        panel.restore_terminal_with_selection(
+                            metadata,
+                            false,
+                            false,
+                            AgentThreadSource::AgentPanel,
+                            Some(workspace),
                             window,
                             cx,
                         );
@@ -1669,6 +1734,7 @@ impl AgentPanel {
             persist_selected_agent_task: Task::ready(()),
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
+            restoring_terminals: HashMap::default(),
             pending_terminal_spawn: None,
             #[cfg(test)]
             test_terminal_spawn_gate: None,
@@ -2175,6 +2241,7 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
         let init_command = Self::terminal_init_command(init_command, cx);
+        let saved_init_command = init_command.clone();
         let terminal_task = self.create_terminal_shell(working_directory, cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
@@ -2219,11 +2286,71 @@ impl AgentPanel {
                     window,
                     cx,
                 );
+                this.remember_terminal_init_command(terminal_id, saved_init_command, cx);
+                match this.restoring_terminals.remove(&terminal_id) {
+                    Some(true) => {
+                        if let Some(terminal) = this.terminals.get_mut(&terminal_id) {
+                            terminal.stale = true;
+                        }
+                        this.persist_terminal_metadata(terminal_id, cx);
+                    }
+                    Some(false) => this.check_terminal_stale(terminal_id, cx),
+                    None => {}
+                }
                 Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
             })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// CPZed: persist the command so a restart can re-run it.
+    fn remember_terminal_init_command(
+        &mut self,
+        terminal_id: TerminalId,
+        command: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id)
+            && terminal.init_command != command
+        {
+            terminal.init_command = command;
+            self.persist_terminal_metadata(terminal_id, cx);
+        }
+    }
+
+    /// CPZed: after a restore, check that a `claude attach <id>` target still
+    /// exists; mark the thread stale (visible in the sidebar title and
+    /// `--agent-list`) when it does not.
+    fn check_terminal_stale(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        let Some(command) = self
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.init_command.clone())
+        else {
+            return;
+        };
+        if crate::terminal_restore::attach_target(&command).is_none() {
+            return;
+        }
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let stale = cx.background_spawn(async move {
+            crate::terminal_restore::command_is_stale(&command, &shell, true)
+        });
+        cx.spawn(async move |this, cx| {
+            if stale.await {
+                this.update(cx, |this, cx| {
+                    if let Some(terminal) = this.terminals.get_mut(&terminal_id) {
+                        terminal.stale = true;
+                        this.persist_terminal_metadata(terminal_id, cx);
+                        cx.emit(AgentPanelEvent::EntryChanged);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn create_terminal_shell(
@@ -2379,6 +2506,8 @@ impl AgentPanel {
             last_known_terminal_title,
             last_observed_program: None,
             working_directory,
+            init_command: None,
+            stale: false,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
             search_bar: None,
@@ -2555,12 +2684,32 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx).cloned(),
             working_directory: terminal.working_directory.clone(),
+            restore: crate::terminal_thread_metadata_store::TerminalRestoreState {
+                init_command: terminal.init_command.clone(),
+                open: true,
+                stale: terminal.stale,
+            },
         })
     }
 
     pub fn restore_terminal(
         &mut self,
         metadata: TerminalThreadMetadata,
+        focus: bool,
+        source: AgentThreadSource,
+        workspace: Option<&Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_terminal_with_selection(metadata, true, focus, source, workspace, window, cx);
+    }
+
+    /// CPZed: like `restore_terminal`, but a startup restore of a project's
+    /// other threads must not steal the active view (`select = false`).
+    fn restore_terminal_with_selection(
+        &mut self,
+        metadata: TerminalThreadMetadata,
+        select: bool,
         focus: bool,
         source: AgentThreadSource,
         workspace: Option<&Workspace>,
@@ -2578,15 +2727,26 @@ impl AgentPanel {
 
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
+        let terminal_id = metadata.terminal_id;
+        if metadata.restore.init_command.is_some() {
+            self.restoring_terminals
+                .insert(terminal_id, metadata.restore.stale);
+        }
+        // CPZed: re-run the saved command; a stale one is not re-run.
+        let init_command = match (&metadata.restore.init_command, metadata.restore.stale) {
+            (Some(_), true) => TerminalInitCommand::None,
+            (Some(command), false) => TerminalInitCommand::Explicit(command.clone()),
+            (None, _) => TerminalInitCommand::FromSettings,
+        };
         self.spawn_terminal(
-            metadata.terminal_id,
+            terminal_id,
             working_directory,
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
-            true,
+            select,
             focus,
-            TerminalInitCommand::FromSettings,
+            init_command,
             source,
             window,
             cx,
@@ -7870,6 +8030,7 @@ mod tests {
         );
 
         let metadata = TerminalThreadMetadata {
+            restore: Default::default(),
             terminal_id: TerminalId::new(),
             title: "Dev Server".into(),
             custom_title: None,
@@ -8008,6 +8169,7 @@ mod tests {
         });
 
         let metadata = TerminalThreadMetadata {
+            restore: Default::default(),
             terminal_id: TerminalId::new(),
             title: "Restored Terminal".into(),
             custom_title: None,
@@ -8181,6 +8343,7 @@ mod tests {
         });
 
         let metadata = TerminalThreadMetadata {
+            restore: Default::default(),
             terminal_id: TerminalId::new(),
             title: "Restored Terminal".into(),
             custom_title: None,
@@ -10617,6 +10780,7 @@ mod tests {
         let terminal_id = TerminalId::new();
         let now = Utc::now();
         let metadata = TerminalThreadMetadata {
+            restore: Default::default(),
             terminal_id,
             title: "Persisted Shell Title".into(),
             custom_title: None,
@@ -10668,6 +10832,7 @@ mod tests {
         let terminal_id = TerminalId::new();
         let now = Utc::now();
         let metadata = TerminalThreadMetadata {
+            restore: Default::default(),
             terminal_id,
             title: "Persisted Shell Title".into(),
             custom_title: None,

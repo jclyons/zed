@@ -2789,6 +2789,7 @@ mod tests {
             store.update(cx, |store, cx| {
                 store.save(
                     agent_ui::terminal_thread_metadata_store::TerminalThreadMetadata {
+                        restore: Default::default(),
                         terminal_id: stale_id,
                         title: "stale".into(),
                         custom_title: Some("old session (bg)".into()),
@@ -2899,6 +2900,7 @@ mod tests {
             TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(
                     agent_ui::terminal_thread_metadata_store::TerminalThreadMetadata {
+                        restore: Default::default(),
                         terminal_id: stale_id,
                         title: "stale".into(),
                         custom_title: None,
