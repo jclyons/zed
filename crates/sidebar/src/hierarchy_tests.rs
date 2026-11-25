@@ -1064,7 +1064,7 @@ async fn test_section_drops(cx: &mut TestAppContext) {
         &sidebar,
         &mut cx,
         &DragItem::Section {
-            id: s2.clone(),
+            id: s2,
             group: ga.clone()
         },
         &DropTarget::SectionHeader {
@@ -1084,11 +1084,11 @@ async fn test_section_drops(cx: &mut TestAppContext) {
         &sidebar,
         &mut cx,
         &DragItem::Section {
-            id: s1.clone(),
+            id: s1,
             group: ga.clone()
         },
         &DropTarget::SectionHeader {
-            id: sb.clone(),
+            id: sb,
             group: gb.clone()
         },
         Zone::Into
@@ -1527,20 +1527,21 @@ async fn test_real_pointer_edge_drags_reorder(cx: &mut TestAppContext) {
     );
 }
 
-// Review: the handlers carry the target's key, not the render-time row index, so a list rebuilt
-// between the last pointer move and the mouse-up (a new thread on top) cannot redirect the drop.
+// Review: the on_drop listener carries the target's key, not the render-time row index. The
+// entries are reordered (as `update_entries` does outside render) after the last paint and
+// before the mouse-up, with no repaint in between, so the LAST-PAINTED listener runs over the
+// row's old on-screen position. An index lookup would hit the row that now sits at that index.
 #[gpui::test]
-async fn test_drop_lands_on_the_originally_targeted_row_after_the_list_changes(
-    cx: &mut TestAppContext,
-) {
+async fn test_real_mouse_up_drops_on_the_row_painted_under_the_pointer(cx: &mut TestAppContext) {
     init(cx);
     let fs = new_fs(cx).await;
     let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
     let a = add_terminal(&mut cx, "a", "/project-a", 10);
     let b = add_terminal(&mut cx, "b", "/project-a", 20);
+    let c = add_terminal(&mut cx, "c", "/project-a", 30);
     refresh(&sidebar, &mut cx);
     let (from, to) = (
-        row_bounds(&sidebar, b, &mut cx),
+        row_bounds(&sidebar, c, &mut cx),
         row_bounds(&sidebar, a, &mut cx),
     );
     let none = gpui::Modifiers::default();
@@ -1554,29 +1555,27 @@ async fn test_drop_lands_on_the_originally_targeted_row_after_the_list_changes(
             none,
         );
     }
-    // The preview is keyed on the target row, not on its index.
     let preview = sidebar
         .read_with(&cx, |sidebar, _| sidebar.hierarchy.drop_preview.clone())
         .expect("a preview while hovering a");
     assert_eq!(preview.target, row_target(a, "/project-a"));
-    // A new thread appears on top and the entries are rebuilt: `a` is no longer at its old index.
-    let _new = save_terminal(&mut cx, "new", "/project-a", 1);
-    refresh(&sidebar, &mut cx);
-    assert_ne!(entry_index(&sidebar, a, &mut cx), 2);
-    // The handlers captured the target key at render time and finish the drop with it.
-    let dragged = hierarchy_dnd::DraggedSidebarItem {
-        item: row_item(b, "/project-a"),
-        title: "b".into(),
-    };
-    sidebar.update(&mut cx, |sidebar, cx| {
-        sidebar.finish_drop(preview.target.clone(), &dragged, cx)
+
+    // `a` and `b` trade places in the entries, without a notify (no repaint before the drop).
+    let (a_ix, b_ix) = (
+        entry_index(&sidebar, a, &mut cx),
+        entry_index(&sidebar, b, &mut cx),
+    );
+    sidebar.update(&mut cx, |sidebar, _| {
+        sidebar.contents.entries.swap(a_ix, b_ix)
     });
+    cx.simulate_mouse_up(to.center(), gpui::MouseButton::Left, none);
     cx.run_until_parked();
+
     let shown = rows(&sidebar, &mut cx);
     let a_at = shown.iter().position(|r| r == "  a").unwrap();
     assert_eq!(
         shown.get(a_at + 1),
-        Some(&"    b".to_string()),
-        "b nests under a, not under the new top row: {shown:?}"
+        Some(&"    c".to_string()),
+        "c nests under a (the row that was under the pointer), not under b: {shown:?}"
     );
 }
