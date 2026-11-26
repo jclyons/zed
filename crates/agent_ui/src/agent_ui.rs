@@ -24,6 +24,8 @@ mod model_selector_popover;
 mod profile_selector;
 mod terminal_codegen;
 mod terminal_inline_assistant;
+pub mod terminal_restore;
+pub mod terminal_restore_store;
 pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -685,6 +687,7 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    terminal_restore_store::TerminalRestoreStore::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);

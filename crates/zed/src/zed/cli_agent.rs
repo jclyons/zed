@@ -484,6 +484,7 @@ async fn update_thread(
 pub fn annotate_agent_list(list: &mut serde_json::Value, cx: &App) {
     let store = HierarchyStore::try_global(cx);
     let hierarchy = store.as_ref().map(|store| store.read(cx).hierarchy());
+    let restore = agent_ui::terminal_restore_store::TerminalRestoreStore::try_global(cx);
     let Some(rows) = list.as_array_mut() else {
         return;
     };
@@ -491,6 +492,15 @@ pub fn annotate_agent_list(list: &mut serde_json::Value, cx: &App) {
         let Some(id) = row["id"].as_str().map(str::to_string) else {
             continue;
         };
+        // Append-only restore fields: the saved command and the stale flag.
+        let state = restore
+            .as_ref()
+            .map(|store| store.read(cx).state(&id))
+            .unwrap_or_default();
+        row["command"] = state
+            .init_command
+            .map_or(serde_json::Value::Null, Into::into);
+        row["stale"] = state.stale.into();
         let key = RowKey::Terminal(id);
         let (parent, section, depth) = match hierarchy {
             Some(h) => {
@@ -1576,6 +1586,40 @@ mod tests {
         assert_eq!(terminal_count(cx, &child_ws), 1);
         assert_eq!(terminal_count(cx, &parent_ws), 0);
         let _ = parent_window;
+    }
+
+    /// `--agent-list` rows carry the saved `command` and the `stale` flag
+    /// (append-only fields); a thread with no saved state is null/false.
+    #[gpui::test]
+    async fn test_agent_list_rows_carry_command_and_stale(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+        let mut list = json!([
+            { "id": "dead", "title": "d" },
+            { "id": "live", "title": "l" },
+            { "id": "plain", "title": "p" }
+        ]);
+        cx.update(|cx| {
+            let store = agent_ui::terminal_restore_store::TerminalRestoreStore::init(cx);
+            store.update(cx, |store, cx| {
+                let state =
+                    |command: &str, stale| agent_ui::terminal_restore_store::TerminalRestoreState {
+                        init_command: Some(command.to_string()),
+                        open: true,
+                        stale,
+                    };
+                store.set("dead", state("claude attach dead9999", true), cx);
+                store.set("live", state("claude attach aaaa1111", false), cx);
+            });
+            annotate_agent_list(&mut list, cx);
+        });
+        assert_eq!(list[0]["stale"], json!(true));
+        assert_eq!(list[0]["command"], json!("claude attach dead9999"));
+        assert_eq!(list[1]["stale"], json!(false));
+        assert_eq!(list[1]["command"], json!("claude attach aaaa1111"));
+        assert_eq!(list[2]["stale"], json!(false));
+        assert_eq!(list[2]["command"], json!(null));
+        // Existing fields are untouched (append-only).
+        assert_eq!(list[0]["title"], json!("d"));
     }
 
     fn displayed_workspace(

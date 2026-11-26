@@ -1,0 +1,232 @@
+//! CPZed: helpers for restoring terminal threads after a restart.
+//!
+//! A terminal thread started with `claude attach <id>` is stale when that
+//! background session no longer exists; restoring it must not silently list a
+//! dead thread as if it were live.
+
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// The target of a `claude attach <target>` command, if `command` is one.
+pub fn attach_target(command: &str) -> Option<&str> {
+    let mut words = command.split_whitespace();
+    let program = words.next()?;
+    let program = program.rsplit('/').next().unwrap_or(program);
+    if program != "claude" || words.next()? != "attach" {
+        return None;
+    }
+    let target = words.next()?;
+    (words.next().is_none()).then_some(target.trim_matches(|c| c == '"' || c == '\''))
+}
+
+/// Whether `target` names a live session in the output of
+/// `claude agents --json`: an exact (case-insensitive) match on `id`,
+/// `sessionId` or `name`, or, for a target of 6+ characters, an id prefix.
+/// `None` when the output is not the expected JSON, so unknown is never
+/// reported as stale.
+pub fn target_is_alive(agents_json: &str, target: &str) -> Option<bool> {
+    let agents: serde_json::Value = serde_json::from_str(agents_json).ok()?;
+    let agents = agents.as_array()?;
+    let target = target.to_lowercase();
+    Some(agents.iter().any(|agent| {
+        ["id", "sessionId", "name"].iter().any(|key| {
+            agent
+                .get(key)
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| {
+                    let value = value.to_lowercase();
+                    value == target
+                        || (*key != "name" && target.len() >= 6 && value.starts_with(&target))
+                })
+        })
+    }))
+}
+
+/// Runs `claude agents --json` through `shell` (a login shell, so the app's
+/// minimal GUI PATH still finds `claude`) and returns its stdout, or `None`
+/// if it could not be run or exited non-zero.
+/// How long `claude agents --json` may take before the answer is "unknown".
+const AGENTS_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Only ever called from a background thread (see `agents_json_fetcher`).
+#[allow(clippy::disallowed_methods)]
+pub fn agents_json(shell: &str, login: bool) -> Option<String> {
+    let mut command = Command::new(shell);
+    if login {
+        command.arg("-l");
+    }
+    // `exec` so killing the shell on timeout kills claude itself.
+    command.args(["-c", "exec claude agents --json"]);
+    run_with_timeout(command, AGENTS_TIMEOUT)
+}
+
+/// Runs `command`, returning its stdout if it exits 0 within `timeout`. On
+/// timeout the child is killed and the answer is `None` (unknown, never stale).
+#[allow(clippy::disallowed_methods)]
+fn run_with_timeout(mut command: Command, timeout: Duration) -> Option<String> {
+    use std::io::Read as _;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).ok().map(|_| out)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+        }
+    };
+    // On timeout the reader is left to finish on its own: a grandchild might
+    // still hold the pipe open and joining could hang.
+    let status = status.filter(|status| status.success())?;
+    reader.join().ok().flatten().filter(|_| status.success())
+}
+
+/// `true` when `command` is a `claude attach <target>` whose target is not in
+/// `agents_json`. Unknown (no JSON, not an attach command) is never stale.
+pub fn is_stale(command: &str, agents_json: Option<&str>) -> bool {
+    let Some(target) = attach_target(command) else {
+        return false;
+    };
+    agents_json
+        .and_then(|json| target_is_alive(json, target))
+        .is_some_and(|alive| !alive)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AGENTS_JSON: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: the canned `claude agents --json` output. Under `cfg(test)` the
+/// fetcher NEVER runs a shell or the real claude: it returns this (default
+/// `None`, i.e. unknown, so nothing is marked stale).
+#[cfg(test)]
+pub fn set_test_agents_json(json: Option<&str>) {
+    TEST_AGENTS_JSON.with(|cell| *cell.borrow_mut() = json.map(str::to_string));
+}
+
+/// A closure that fetches `claude agents --json` once (run it on a background
+/// thread). Capture it on the foreground: under test it carries the canned
+/// value and never spawns a process.
+pub fn agents_json_fetcher() -> impl FnOnce() -> Option<String> + Send + 'static {
+    #[cfg(test)]
+    {
+        let canned = TEST_AGENTS_JSON.with(|cell| cell.borrow().clone());
+        move || canned
+    }
+    #[cfg(not(test))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        move || agents_json(&shell, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AGENTS: &str =
+        r#"[{"id":"6fadf34c","sessionId":"6fadf34c-af80","name":"cpzed-reviewer"}]"#;
+
+    #[test]
+    fn parses_attach_commands_only() {
+        assert_eq!(attach_target("claude attach 6fadf34c"), Some("6fadf34c"));
+        assert_eq!(
+            attach_target("/opt/homebrew/bin/claude attach abc"),
+            Some("abc")
+        );
+        assert_eq!(attach_target("claude attach 'a b'"), None);
+        assert_eq!(attach_target("claude --resume x"), None);
+        assert_eq!(attach_target("ls attach 1"), None);
+        assert_eq!(attach_target("claude attach"), None);
+    }
+
+    #[test]
+    fn alive_matches_id_session_or_name() {
+        assert_eq!(target_is_alive(AGENTS, "6fadf34c"), Some(true));
+        assert_eq!(target_is_alive(AGENTS, "6fadf34c-af80"), Some(true));
+        assert_eq!(target_is_alive(AGENTS, "cpzed-reviewer"), Some(true));
+        // Names match exactly, not by substring; ids match by a long prefix.
+        assert_eq!(target_is_alive(AGENTS, "reviewer"), Some(false));
+        assert_eq!(target_is_alive(AGENTS, "c"), Some(false));
+        assert_eq!(target_is_alive(AGENTS, "6fadf3"), Some(true));
+        assert_eq!(target_is_alive(AGENTS, "6fad"), Some(false));
+        assert_eq!(target_is_alive(AGENTS, "deadbeef"), Some(false));
+        assert_eq!(target_is_alive("not json", "x"), None);
+    }
+
+    /// Runs a fake `claude` placed on a temp PATH; touches no real HOME.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // test-only, fake claude in a temp dir
+    fn stale_detection_with_fake_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, format!("#!/bin/sh\necho '{AGENTS}'\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", dir.path().display());
+        // SAFETY-free approach: run the check with PATH set on the shell via env.
+        let run = |command: &str| {
+            let target = attach_target(command).unwrap();
+            let output = Command::new("/bin/sh")
+                .args(["-c", "claude agents --json"])
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            let json = String::from_utf8_lossy(&output.stdout).into_owned();
+            !target_is_alive(&json, target).unwrap()
+        };
+        assert!(!run("claude attach 6fadf34c"));
+        assert!(run("claude attach deadbeef"));
+    }
+
+    #[test]
+    fn non_attach_and_unknown_are_never_stale() {
+        assert!(!is_stale("echo hi", Some(AGENTS)));
+        assert!(!is_stale("claude attach deadbeef", None));
+        assert!(!is_stale("claude attach deadbeef", Some("not json")));
+        assert!(is_stale("claude attach deadbeef", Some(AGENTS)));
+        assert!(!is_stale("claude attach 6fadf34c", Some(AGENTS)));
+    }
+
+    #[test]
+    fn test_fetcher_never_runs_a_shell() {
+        assert_eq!(agents_json_fetcher()(), None);
+        set_test_agents_json(Some("[]"));
+        assert_eq!(agents_json_fetcher()().as_deref(), Some("[]"));
+        set_test_agents_json(None);
+    }
+
+    /// A hung `claude` (fake, sleeps) is killed at the timeout and reported as
+    /// unknown (`None`), so it can neither block startup nor mark anything stale.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn hung_claude_times_out_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec claude agents --json"])
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()));
+        let started = Instant::now();
+        assert_eq!(run_with_timeout(command, Duration::from_millis(300)), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!is_stale("claude attach 6fadf34c", None));
+    }
+}
