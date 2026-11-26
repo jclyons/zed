@@ -279,6 +279,22 @@ mod tests {
         (dir, command, pid_file)
     }
 
+    /// The production argv: the shell `exec`s claude, so the timeout kill hits
+    /// claude itself and no orphan survives.
+    #[test]
+    fn agents_command_argv_execs_claude() {
+        let argv = |login| {
+            let command = agents_command("/bin/zsh", login);
+            assert_eq!(command.get_program(), "/bin/zsh");
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(argv(true), ["-l", "-c", "exec claude agents --json"]);
+        assert_eq!(argv(false), ["-c", "exec claude agents --json"]);
+    }
+
     #[test]
     fn poller_command_returns_the_fake_claude_stdout() {
         let (_dir, command, pid_file) =

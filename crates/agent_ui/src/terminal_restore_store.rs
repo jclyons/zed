@@ -536,7 +536,14 @@ mod tests {
         assert_eq!(set(cx, &["fg"]), 3, "replace notifies");
         assert_eq!(set(cx, &[]), 4, "clearing existing badges notifies");
         assert_eq!(set(cx, &[]), 4, "clearing nothing is a no-op");
-        store.read_with(cx, |store, _| assert!(store.badges("a").is_empty()));
+        // Clearing REMOVES the entry (not an empty list left behind), and
+        // clearing an id that never had badges adds none.
+        set(cx, &[]);
+        store.update(cx, |store, cx| store.set_badges("never", Vec::new(), cx));
+        store.read_with(cx, |store, _| {
+            assert!(!store.badges.contains_key("a"));
+            assert!(!store.badges.contains_key("never"));
+        });
         cx.run_until_parked();
         let reopened = cx.new(|cx| TerminalRestoreStore::new(db, cx));
         reopened.read_with(cx, |store, _| assert!(store.badges("a").is_empty()));

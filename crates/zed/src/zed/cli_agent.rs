@@ -2960,6 +2960,44 @@ mod tests {
         assert!(stored_badges(cx, &plain).is_empty());
     }
 
+    /// The app re-validates badges itself (it never trusts the CLI): an invalid
+    /// `--agent-new` is refused before any thread is created.
+    #[gpui::test]
+    async fn test_new_terminal_with_invalid_badges_is_refused_and_creates_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dirs, app_state, root, workspace) = project_with_window(cx, "new-bad-badge").await;
+        let before_ids = stored_ids(cx);
+        let before_count = terminal_count(cx, &workspace);
+        for bad in [
+            vec!["UPPER"],
+            vec!["thirteenchars"],
+            vec!["a", "b", "c", "d", "e"],
+        ] {
+            let sink = CapturingSink::default();
+            let mut async_cx = cx.to_async();
+            handle_new_agent_terminal_badged(
+                root.clone(),
+                None,
+                Some("bad".into()),
+                NoMatchBehavior::Error,
+                None,
+                None,
+                bad.iter().map(|b| b.to_string()).collect(),
+                app_state.clone(),
+                Timeouts::default(),
+                &sink,
+                &mut async_cx,
+            )
+            .await;
+            cx.run_until_parked();
+            let outcome = Outcome::from(&sink);
+            assert_ne!(outcome.status, 0, "{bad:?} must be refused: {outcome:?}");
+            assert_eq!(stored_ids(cx), before_ids, "{bad:?} created a thread entry");
+            assert_eq!(terminal_count(cx, &workspace), before_count, "{bad:?}");
+        }
+    }
+
     #[gpui::test]
     async fn test_close_by_id_removes_the_terminal_and_is_idempotent(cx: &mut TestAppContext) {
         let (_dirs, app_state, root, workspace) = project_with_window(cx, "close-id").await;

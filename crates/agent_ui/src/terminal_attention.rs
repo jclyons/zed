@@ -233,6 +233,17 @@ pub fn attach_targets(cx: &App) -> BTreeMap<String, String> {
 /// two at once (a caller that finds one running returns and reuses its result).
 pub async fn poll_once(this: &Entity<TerminalAttention>, cx: &mut gpui::AsyncApp) {
     let targets = cx.update(|cx| attach_targets(cx));
+    let fetch = agents_json_fetcher_with_timeout(POLL_TIMEOUT);
+    poll_targets(this, targets, fetch, cx).await;
+}
+
+/// [`poll_once`] with the targets and the fetch injected (the tests count fetches).
+async fn poll_targets(
+    this: &Entity<TerminalAttention>,
+    targets: BTreeMap<String, String>,
+    fetch: impl FnOnce() -> Option<String> + Send + 'static,
+    cx: &mut gpui::AsyncApp,
+) {
     if !should_poll(&targets) {
         cx.update(|cx| this.update(cx, |this, cx| this.apply(&targets, None, cx)));
         return;
@@ -240,7 +251,6 @@ pub async fn poll_once(this: &Entity<TerminalAttention>, cx: &mut gpui::AsyncApp
     if !cx.update(|cx| this.update(cx, |this, _| this.try_begin_poll())) {
         return;
     }
-    let fetch = cx.update(|_| agents_json_fetcher_with_timeout(POLL_TIMEOUT));
     let json = cx.background_executor().spawn(async move { fetch() }).await;
     cx.update(|cx| this.update(cx, |this, cx| this.apply(&targets, json.as_deref(), cx)));
 }
@@ -373,5 +383,103 @@ mod tests {
     fn no_attach_thread_means_no_subprocess() {
         assert!(!should_poll(&BTreeMap::new()));
         assert!(should_poll(&targets()));
+    }
+
+    #[test]
+    fn poll_timeout_is_three_seconds() {
+        assert_eq!(POLL_TIMEOUT, Duration::from_secs(3));
+        assert_eq!(POLL_INTERVAL, Duration::from_secs(5));
+    }
+
+    /// Valid JSON that is not an array is a FAILED poll (state kept), not a
+    /// good poll that finds every session missing.
+    #[gpui::test]
+    fn non_array_json_is_a_failure_not_a_good_poll(cx: &mut gpui::TestAppContext) {
+        let store = cx.update(|cx| TerminalAttention::init(cx));
+        store.update(cx, |store, cx| store.apply(&targets(), Some(JSON), cx));
+        for bad in ["{}", "5", "null", r#"{"agents":[]}"#] {
+            store.update(cx, |store, cx| store.apply(&targets(), Some(bad), cx));
+            store.read_with(cx, |store, _| {
+                assert_eq!(store.total_pending(), 1, "{bad} must keep the state");
+                assert!(store.thread("t1").is_some());
+            });
+            // A good poll resets the failure count between the bad ones.
+            store.update(cx, |store, cx| store.apply(&targets(), Some(JSON), cx));
+        }
+        // Three non-array results in a row drop the state like any failure.
+        for _ in 0..MAX_FAILURES {
+            store.update(cx, |store, cx| store.apply(&targets(), Some("{}"), cx));
+        }
+        store.read_with(cx, |store, _| assert_eq!(store.total_pending(), 0));
+    }
+
+    /// The header total is exactly the number of Blocked threads: not the thread
+    /// count, not the attached count, not the working count.
+    #[gpui::test]
+    fn total_pending_is_exactly_the_blocked_count(cx: &mut gpui::TestAppContext) {
+        let store = cx.update(|cx| TerminalAttention::init(cx));
+        let ids: BTreeMap<String, String> = [
+            ("t1", "aaaa1111"),
+            ("t2", "bbbb2222"),
+            ("t3", "cccc3333"),
+            ("t4", "dddd4444"),
+            ("t5", "gone0000"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        let json = |states: [&str; 4]| {
+            let ids = ["aaaa1111", "bbbb2222", "cccc3333", "dddd4444"];
+            let rows: Vec<String> = ids
+                .iter()
+                .zip(states)
+                .map(|(id, state)| format!(r#"{{"id":"{id}","state":"{state}"}}"#))
+                .collect();
+            format!("[{}]", rows.join(","))
+        };
+        let total = |cx: &mut gpui::TestAppContext, json: String| {
+            store.update(cx, |store, cx| store.apply(&ids, Some(&json), cx));
+            store.read_with(cx, |store, _| store.total_pending())
+        };
+        assert_eq!(total(cx, json(["working", "done", "weird", "working"])), 0);
+        assert_eq!(total(cx, json(["blocked", "working", "done", "weird"])), 1);
+        assert_eq!(
+            total(cx, json(["blocked", "blocked", "blocked", "done"])),
+            3
+        );
+        assert_eq!(
+            total(cx, json(["blocked", "blocked", "blocked", "blocked"])),
+            4
+        );
+    }
+
+    /// A second poll while one is in flight spawns nothing; once the first
+    /// result is applied the next poll fetches again.
+    #[gpui::test]
+    async fn poll_while_one_is_in_flight_spawns_no_fetch(cx: &mut gpui::TestAppContext) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = cx.update(|cx| TerminalAttention::init(cx));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let fetch = |fetches: &Arc<AtomicUsize>| {
+            let fetches = fetches.clone();
+            move || {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                Some(JSON.to_string())
+            }
+        };
+        let mut async_cx = cx.to_async();
+        // Someone else holds the slot: no fetch.
+        assert!(store.update(cx, |store, _| store.try_begin_poll()));
+        poll_targets(&store, targets(), fetch(&fetches), &mut async_cx).await;
+        assert_eq!(fetches.load(Ordering::SeqCst), 0);
+        // Their result lands and frees the slot: the next poll fetches once ...
+        store.update(cx, |store, cx| store.apply(&targets(), Some(JSON), cx));
+        poll_targets(&store, targets(), fetch(&fetches), &mut async_cx).await;
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        store.read_with(cx, |store, _| assert_eq!(store.total_pending(), 1));
+        // ... and no attach thread means no fetch at all.
+        poll_targets(&store, BTreeMap::new(), fetch(&fetches), &mut async_cx).await;
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
     }
 }
