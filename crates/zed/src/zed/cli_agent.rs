@@ -2819,9 +2819,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_agent_list_rows_carry_badges_open_attached_and_activity(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_agent_list_rows_carry_badges_open_attached_and_activity(cx: &mut TestAppContext) {
         let _app_state = init_test(cx);
         let mut list = json!([
             { "id": "a", "title": "a" },
@@ -2875,9 +2873,18 @@ mod tests {
         // A thread with no saved state at all.
         assert_eq!(list[2]["badges"], json!([]));
         assert_eq!(list[2]["open"], json!(false));
-        assert_eq!(list[2]["attached"], serde_json::Value::Null, "unknown is not false");
+        assert_eq!(
+            list[2]["attached"],
+            serde_json::Value::Null,
+            "unknown is not false"
+        );
         // No terminal timestamp is exposed: always null, never invented.
-        assert!(list.as_array().unwrap().iter().all(|row| row["last_activity_at"].is_null()));
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["last_activity_at"].is_null())
+        );
     }
 
     #[gpui::test]
@@ -2888,7 +2895,10 @@ mod tests {
 
         let outcome = set_badges(cx, &id, &["bg", "opus", "rc"]).await;
         assert_eq!(outcome.status, 0, "{outcome:?}");
-        assert_eq!(outcome.stdout.unwrap()["badges"], json!(["bg", "opus", "rc"]));
+        assert_eq!(
+            outcome.stdout.unwrap()["badges"],
+            json!(["bg", "opus", "rc"])
+        );
         assert_eq!(stored_badges(cx, &id), ["bg", "opus", "rc"]);
 
         // Replace (not merge), duplicates collapse.

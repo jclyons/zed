@@ -281,10 +281,14 @@ mod tests {
 
     #[test]
     fn poller_command_returns_the_fake_claude_stdout() {
-        let (_dir, command, pid_file) = fake_claude(r#"echo '[{"id":"aaaa1111","state":"blocked"}]'"#);
+        let (_dir, command, pid_file) =
+            fake_claude(r#"echo '[{"id":"aaaa1111","state":"blocked"}]'"#);
         let out = run_with_timeout(command, Duration::from_secs(5)).expect("stdout");
         assert_eq!(out.trim(), r#"[{"id":"aaaa1111","state":"blocked"}]"#);
-        assert!(pid_file.exists(), "the fake claude ran, with argv `agents --json`");
+        assert!(
+            pid_file.exists(),
+            "the fake claude ran, with argv `agents --json`"
+        );
     }
 
     #[test]

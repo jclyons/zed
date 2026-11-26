@@ -139,7 +139,10 @@ pub enum CliRequest {
     },
     /// `--agent-set-badges <id> a,b`: replace a thread's badges (empty
     /// clears). Appended last (index 10).
-    SetAgentBadges { id: String, badges: Vec<String> },
+    SetAgentBadges {
+        id: String,
+        badges: Vec<String>,
+    },
 }
 
 /// Most badges one thread can carry.

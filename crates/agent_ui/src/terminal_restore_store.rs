@@ -514,6 +514,34 @@ mod tests {
         });
     }
 
+    /// `set_badges` only persists and notifies on a real change: an identical
+    /// list and a clear of nothing are no-ops; a replace and a real clear are
+    /// not. Clearing removes the entry, so it is gone after a reopen.
+    #[gpui::test]
+    async fn test_set_badges_notifies_only_on_change(cx: &mut gpui::TestAppContext) {
+        let db = KeyValueStore::open_test_db("terminal_restore_badges_notify").await;
+        let store = cx.new(|cx| TerminalRestoreStore::new(db.clone(), cx));
+        let notified = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = notified.clone();
+        let _subscription =
+            cx.update(|cx| cx.observe(&store, move |_, _| counter.set(counter.get() + 1)));
+        let set = |cx: &mut gpui::TestAppContext, list: &[&str]| {
+            store.update(cx, |store, cx| store.set_badges("a", badges_of(list), cx));
+            cx.run_until_parked();
+            notified.get()
+        };
+        assert_eq!(set(cx, &["bg", "opus"]), 1, "new badges notify");
+        assert_eq!(set(cx, &["bg", "opus"]), 1, "identical list is a no-op");
+        assert_eq!(set(cx, &["opus", "bg"]), 2, "reordering is a change");
+        assert_eq!(set(cx, &["fg"]), 3, "replace notifies");
+        assert_eq!(set(cx, &[]), 4, "clearing existing badges notifies");
+        assert_eq!(set(cx, &[]), 4, "clearing nothing is a no-op");
+        store.read_with(cx, |store, _| assert!(store.badges("a").is_empty()));
+        cx.run_until_parked();
+        let reopened = cx.new(|cx| TerminalRestoreStore::new(db, cx));
+        reopened.read_with(cx, |store, _| assert!(store.badges("a").is_empty()));
+    }
+
     /// A badge-only thread is pruned with the others; kept ids keep theirs.
     #[gpui::test]
     async fn test_retain_ids_prunes_badges_too(cx: &mut gpui::TestAppContext) {

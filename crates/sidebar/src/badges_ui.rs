@@ -122,7 +122,11 @@ fn chip(text: SharedString, kind: ChipKind, cx: &App) -> AnyElement {
         .border_1()
         .border_color(accent.opacity(0.6))
         .bg(chip_fill(kind, colors))
-        .child(Label::new(text).size(LabelSize::XSmall).color(Color::Custom(accent)))
+        .child(
+            Label::new(text)
+                .size(LabelSize::XSmall)
+                .color(Color::Custom(accent)),
+        )
         .into_any_element()
 }
 
@@ -170,6 +174,22 @@ pub(crate) fn pending_badge(count: usize, cx: &App) -> Option<AnyElement> {
             .tooltip(Tooltip::text("waiting for your input"))
             .into_any_element(),
     )
+}
+
+/// Sum of blocked sessions over every attach thread: the sidebar header number.
+pub(crate) fn header_total(cx: &App) -> usize {
+    agent_ui::terminal_attention::TerminalAttention::try_global(cx)
+        .map_or(0, |attention| attention.read(cx).total_pending())
+}
+
+/// The sidebar header's red badge: [`header_total`], hidden at 0.
+pub(crate) fn header_pending(cx: &App) -> Option<AnyElement> {
+    pending_badge(header_total(cx), cx).map(|badge| {
+        div()
+            .debug_selector(|| "sidebar-header-pending".into())
+            .child(badge)
+            .into_any_element()
+    })
 }
 
 pub(crate) struct TrailingRow<'a> {
@@ -220,16 +240,18 @@ pub(crate) fn render_trailing(row: &TrailingRow<'_>, cx: &App) -> Option<AnyElem
     Some(
         h_flex()
             .gap_1()
-            .children(parts.into_iter().filter_map(|part| match part {
-                Part::Chip(text) => Some(chip(text.clone().into(), ChipKind::of(&text), cx)),
-                Part::ChildCount(count) => Some(child_count_chip(count, cx)),
-                Part::Pending(count) => pending_badge(count, cx),
-                Part::Glyph(glyph) => Some(
-                    Label::new(glyph)
-                        .size(LabelSize::Small)
-                        .color(Color::Custom(state_color(row.state, status, colors)))
-                        .into_any_element(),
-                ),
+            .children(parts.into_iter().filter_map(|part| {
+                match part {
+                    Part::Chip(text) => Some(chip(text.clone().into(), ChipKind::of(&text), cx)),
+                    Part::ChildCount(count) => Some(child_count_chip(count, cx)),
+                    Part::Pending(count) => pending_badge(count, cx),
+                    Part::Glyph(glyph) => Some(
+                        Label::new(glyph)
+                            .size(LabelSize::Small)
+                            .color(Color::Custom(state_color(row.state, status, colors)))
+                            .into_any_element(),
+                    ),
+                }
             }))
             .into_any_element(),
     )
@@ -260,13 +282,25 @@ mod tests {
     fn model_chips_differ_in_both_themes() {
         for (_name, colors, _) in themes() {
             let colors = &colors;
-            let all = [ChipKind::Opus, ChipKind::Sonnet, ChipKind::Fable, ChipKind::Haiku];
+            let all = [
+                ChipKind::Opus,
+                ChipKind::Sonnet,
+                ChipKind::Fable,
+                ChipKind::Haiku,
+            ];
             for (i, a) in all.iter().enumerate() {
                 for b in &all[i + 1..] {
-                    assert_ne!(chip_accent(*a, colors), chip_accent(*b, colors), "{a:?} vs {b:?}");
+                    assert_ne!(
+                        chip_accent(*a, colors),
+                        chip_accent(*b, colors),
+                        "{a:?} vs {b:?}"
+                    );
                 }
             }
-            assert_ne!(chip_accent(ChipKind::Bg, colors), chip_accent(ChipKind::Fg, colors));
+            assert_ne!(
+                chip_accent(ChipKind::Bg, colors),
+                chip_accent(ChipKind::Fg, colors)
+            );
         }
     }
 
@@ -284,7 +318,11 @@ mod tests {
                 ChipKind::Rc,
                 ChipKind::Other,
             ] {
-                let ratio = contrast(chip_accent(kind, colors), chip_fill(kind, colors), colors.panel_background);
+                let ratio = contrast(
+                    chip_accent(kind, colors),
+                    chip_fill(kind, colors),
+                    colors.panel_background,
+                );
                 assert!(ratio >= 3.0, "{name} {kind:?} contrast {ratio}");
             }
             // Red pending badge: its number over status.error.
@@ -292,7 +330,11 @@ mod tests {
             let ratio = contrast(text, fill, colors.panel_background);
             assert!(ratio >= 3.0, "{name} pending badge contrast {ratio}");
             // Child-count chip: text over element_selected.
-            let ratio = contrast(colors.text, colors.element_selected, colors.panel_background);
+            let ratio = contrast(
+                colors.text,
+                colors.element_selected,
+                colors.panel_background,
+            );
             assert!(ratio >= 3.0, "{name} child count contrast {ratio}");
         }
     }
@@ -301,17 +343,32 @@ mod tests {
     fn state_colors_follow_the_status_mapping() {
         for (_, colors, status) in themes() {
             let (colors, status) = (&colors, &status);
-            assert_eq!(state_color(Some(SessionState::Working), status, colors), status.info);
-            assert_eq!(state_color(Some(SessionState::Blocked), status, colors), status.warning);
-            assert_eq!(state_color(Some(SessionState::Done), status, colors), status.success);
-            assert_eq!(state_color(Some(SessionState::Other), status, colors), colors.text_muted);
+            assert_eq!(
+                state_color(Some(SessionState::Working), status, colors),
+                status.info
+            );
+            assert_eq!(
+                state_color(Some(SessionState::Blocked), status, colors),
+                status.warning
+            );
+            assert_eq!(
+                state_color(Some(SessionState::Done), status, colors),
+                status.success
+            );
+            assert_eq!(
+                state_color(Some(SessionState::Other), status, colors),
+                colors.text_muted
+            );
             assert_eq!(state_color(None, status, colors), colors.text_muted);
         }
     }
 
     #[test]
     fn badges_are_capped_and_blanks_dropped() {
-        let many: Vec<String> = ["a", "", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
+        let many: Vec<String> = ["a", "", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(visible_badges(&many), ["a", "b", "c", "d"]);
         assert!(visible_badges(&[]).is_empty());
     }
@@ -331,7 +388,12 @@ mod tests {
         assert!((contrast(white, black, white) - r).abs() < 0.01);
     }
 
-    fn row<'a>(badges: &'a [String], child_count: usize, pending: usize, glyph: Option<&str>) -> TrailingRow<'a> {
+    fn row<'a>(
+        badges: &'a [String],
+        child_count: usize,
+        pending: usize,
+        glyph: Option<&str>,
+    ) -> TrailingRow<'a> {
         TrailingRow {
             badges,
             pending,
@@ -362,7 +424,11 @@ mod tests {
     fn child_count_is_hidden_at_zero_and_exact_for_one_and_many() {
         for (count, expected) in [(0, false), (1, true), (7, true)] {
             let parts = row(&[], count, 0, None).parts();
-            assert_eq!(parts.contains(&Part::ChildCount(count)), expected, "{count}");
+            assert_eq!(
+                parts.contains(&Part::ChildCount(count)),
+                expected,
+                "{count}"
+            );
             assert_eq!(parts.is_empty(), !expected);
         }
     }

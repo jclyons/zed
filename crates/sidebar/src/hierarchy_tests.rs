@@ -1710,7 +1710,9 @@ async fn test_child_count_is_direct_children_only(cx: &mut TestAppContext) {
     edit(&mut cx, |store, cx| {
         store.set_parent(&key(c1), Some(&key(parent)), cx).unwrap();
         store.set_parent(&key(c2), Some(&key(parent)), cx).unwrap();
-        store.set_parent(&key(grandchild), Some(&key(c1)), cx).unwrap();
+        store
+            .set_parent(&key(grandchild), Some(&key(c1)), cx)
+            .unwrap();
         store
             .set_parent(&key(only_child), Some(&key(one_child_parent)), cx)
             .unwrap();
@@ -1718,8 +1720,16 @@ async fn test_child_count_is_direct_children_only(cx: &mut TestAppContext) {
     refresh(&sidebar, &mut cx);
     let counts = |sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext| {
         sidebar.read_with(cx, |sidebar, _| {
-            [parent, c1, c2, grandchild, lone, one_child_parent, only_child]
-                .map(|id| sidebar.hierarchy.row_layout[&key(id)].child_count)
+            [
+                parent,
+                c1,
+                c2,
+                grandchild,
+                lone,
+                one_child_parent,
+                only_child,
+            ]
+            .map(|id| sidebar.hierarchy.row_layout[&key(id)].child_count)
         })
     };
     // parent: 2 direct (c1, c2), not 3; c1: 1; leaves and lone: 0; p1: 1.
@@ -1767,4 +1777,53 @@ async fn test_status_glyph_is_stripped_from_the_displayed_title_only(cx: &mut Te
         assert_eq!(glyph.as_ref(), "✳");
         assert_eq!(title.as_ref(), "Implement badges");
     });
+}
+
+/// The header total is the number of blocked sessions over all attach threads
+/// (not 0, not 1, not the thread count); the red badge is hidden at 0 and drawn
+/// in the header otherwise.
+#[gpui::test]
+async fn test_header_total_counts_blocked_sessions_and_renders(cx: &mut TestAppContext) {
+    use agent_ui::terminal_attention::TerminalAttention;
+    use std::collections::BTreeMap;
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    add_terminal(&mut cx, "one", "/project-a", 10);
+    refresh(&sidebar, &mut cx);
+    let attention = cx.update(|_, cx| TerminalAttention::init(cx));
+    let targets: BTreeMap<String, String> =
+        [("t1", "aaaa1111"), ("t2", "bbbb2222"), ("t3", "cccc3333")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+    let json = |a: &str, b: &str, c: &str| {
+        format!(
+            r#"[{{"id":"aaaa1111","state":"{a}"}},{{"id":"bbbb2222","state":"{b}"}},{{"id":"cccc3333","state":"{c}"}}]"#
+        )
+    };
+    let total = |cx: &mut VisualTestContext| cx.update(|_, cx| badges_ui::header_total(cx));
+
+    // Nothing blocked: 0, and no header badge.
+    attention.update(&mut cx, |a, cx| {
+        a.apply(&targets, Some(&json("working", "done", "working")), cx)
+    });
+    refresh(&sidebar, &mut cx);
+    assert_eq!(total(&mut cx), 0);
+    assert!(cx.debug_bounds("sidebar-header-pending").is_none());
+
+    // Two of three blocked: exactly 2, and the badge is drawn.
+    attention.update(&mut cx, |a, cx| {
+        a.apply(&targets, Some(&json("blocked", "working", "blocked")), cx)
+    });
+    refresh(&sidebar, &mut cx);
+    assert_eq!(total(&mut cx), 2);
+    assert!(cx.debug_bounds("sidebar-header-pending").is_some());
+
+    // One blocked.
+    attention.update(&mut cx, |a, cx| {
+        a.apply(&targets, Some(&json("done", "blocked", "done")), cx)
+    });
+    refresh(&sidebar, &mut cx);
+    assert_eq!(total(&mut cx), 1);
 }

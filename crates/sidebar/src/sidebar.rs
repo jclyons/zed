@@ -6891,8 +6891,9 @@ impl Sidebar {
             .unwrap_or_default();
         let attention = TerminalAttention::try_global(cx)
             .and_then(|attention| attention.read(cx).thread(&terminal_key_string));
-        let pending = TerminalAttention::try_global(cx)
-            .map_or(0, |attention| attention.read(cx).pending_count(&terminal_key_string));
+        let pending = TerminalAttention::try_global(cx).map_or(0, |attention| {
+            attention.read(cx).pending_count(&terminal_key_string)
+        });
         let child_count = self
             .hierarchy
             .row_layout
@@ -7720,11 +7721,7 @@ impl Sidebar {
                             ),
                     )
                     .child(self.render_filter_input(cx))
-                    .children(badges_ui::pending_badge(
-                        TerminalAttention::try_global(cx)
-                            .map_or(0, |attention| attention.read(cx).total_pending()),
-                        cx,
-                    ))
+                    .children(badges_ui::header_pending(cx))
                     .child(
                         h_flex()
                             .gap_1()

@@ -121,10 +121,7 @@ impl TerminalAttention {
 
     /// Sum over all threads: the sidebar header total.
     pub fn total_pending(&self) -> usize {
-        self.threads
-            .keys()
-            .map(|id| self.pending_count(id))
-            .sum()
+        self.threads.keys().map(|id| self.pending_count(id)).sum()
     }
 
     /// Claims the single poll slot. `false`: a poll is already running, so the
@@ -171,12 +168,21 @@ impl TerminalAttention {
                 for (id, target) in targets {
                     match find_session(json, target) {
                         Some(Some(state)) => {
-                            next.insert(id.clone(), ThreadAttention { attached: true, state });
+                            next.insert(
+                                id.clone(),
+                                ThreadAttention {
+                                    attached: true,
+                                    state,
+                                },
+                            );
                         }
                         Some(None) => {
                             next.insert(
                                 id.clone(),
-                                ThreadAttention { attached: false, state: SessionState::Other },
+                                ThreadAttention {
+                                    attached: false,
+                                    state: SessionState::Other,
+                                },
                             );
                         }
                         None => {}
@@ -235,10 +241,7 @@ pub async fn poll_once(this: &Entity<TerminalAttention>, cx: &mut gpui::AsyncApp
         return;
     }
     let fetch = cx.update(|_| agents_json_fetcher_with_timeout(POLL_TIMEOUT));
-    let json = cx
-        .background_executor()
-        .spawn(async move { fetch() })
-        .await;
+    let json = cx.background_executor().spawn(async move { fetch() }).await;
     cx.update(|cx| this.update(cx, |this, cx| this.apply(&targets, json.as_deref(), cx)));
 }
 
@@ -267,10 +270,22 @@ mod tests {
 
     #[test]
     fn find_session_maps_states_and_missing() {
-        assert_eq!(find_session(JSON, "aaaa1111"), Some(Some(SessionState::Blocked)));
-        assert_eq!(find_session(JSON, "BBBB2222"), Some(Some(SessionState::Working)));
-        assert_eq!(find_session(JSON, "cccc3333"), Some(Some(SessionState::Done)));
-        assert_eq!(find_session(JSON, "dddd4444"), Some(Some(SessionState::Other)));
+        assert_eq!(
+            find_session(JSON, "aaaa1111"),
+            Some(Some(SessionState::Blocked))
+        );
+        assert_eq!(
+            find_session(JSON, "BBBB2222"),
+            Some(Some(SessionState::Working))
+        );
+        assert_eq!(
+            find_session(JSON, "cccc3333"),
+            Some(Some(SessionState::Done))
+        );
+        assert_eq!(
+            find_session(JSON, "dddd4444"),
+            Some(Some(SessionState::Other))
+        );
         assert_eq!(find_session(JSON, "w1"), Some(Some(SessionState::Blocked)));
         assert_eq!(find_session(JSON, "gone0000"), Some(None));
         // A short prefix never matches by id prefix.
@@ -299,11 +314,17 @@ mod tests {
             assert_eq!(store.total_pending(), 1);
             assert_eq!(
                 store.thread("t2"),
-                Some(ThreadAttention { attached: true, state: SessionState::Working })
+                Some(ThreadAttention {
+                    attached: true,
+                    state: SessionState::Working
+                })
             );
             assert_eq!(
                 store.thread("t3"),
-                Some(ThreadAttention { attached: false, state: SessionState::Other })
+                Some(ThreadAttention {
+                    attached: false,
+                    state: SessionState::Other
+                })
             );
         });
         // Two blocked sessions: the header total is the sum.
