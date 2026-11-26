@@ -291,12 +291,17 @@ mod tests {
     fn poller_command_kills_a_hung_claude_at_the_timeout() {
         let (_dir, command, pid_file) = fake_claude("exec sleep 30");
         let started = Instant::now();
-        assert_eq!(run_with_timeout(command, Duration::from_millis(400)), None);
+        // Long enough for a loaded machine to start the fake before the kill.
+        assert_eq!(run_with_timeout(command, Duration::from_secs(2)), None);
         let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
-        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
         // The process is gone, not leaked.
-        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let wait = Instant::now();
+        while !pid_file.exists() && wait.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let pid = std::fs::read_to_string(&pid_file).expect("the fake claude started");
         #[allow(clippy::disallowed_methods)]
         let alive = Command::new("kill")
             .args(["-0", pid.trim()])

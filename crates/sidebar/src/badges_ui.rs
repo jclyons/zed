@@ -144,23 +144,28 @@ fn child_count_chip(count: usize, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// Text and fill of the red pending badge.
+pub(crate) fn pending_colors(colors: &ThemeColors, status: &StatusColors) -> (Hsla, Hsla) {
+    (colors.editor_foreground, status.error)
+}
+
 /// Red numeric badge (hidden at 0).
 pub(crate) fn pending_badge(count: usize, cx: &App) -> Option<AnyElement> {
     if count == 0 {
         return None;
     }
-    let status = cx.theme().status();
+    let (text, fill) = pending_colors(cx.theme().colors(), cx.theme().status());
     Some(
         div()
             .id("pending-input")
             .px_1p5()
             .rounded_full()
             .min_w(px(16.))
-            .bg(status.error)
+            .bg(fill)
             .child(
                 Label::new(count.to_string())
                     .size(LabelSize::XSmall)
-                    .color(Color::Custom(cx.theme().colors().editor_foreground)),
+                    .color(Color::Custom(text)),
             )
             .tooltip(Tooltip::text("waiting for your input"))
             .into_any_element(),
@@ -267,7 +272,7 @@ mod tests {
 
     #[test]
     fn chip_text_is_readable_in_light_and_dark() {
-        for (name, colors, _) in themes() {
+        for (name, colors, status) in themes() {
             let colors = &colors;
             for kind in [
                 ChipKind::Bg,
@@ -282,6 +287,10 @@ mod tests {
                 let ratio = contrast(chip_accent(kind, colors), chip_fill(kind, colors), colors.panel_background);
                 assert!(ratio >= 3.0, "{name} {kind:?} contrast {ratio}");
             }
+            // Red pending badge: its number over status.error.
+            let (text, fill) = pending_colors(colors, &status);
+            let ratio = contrast(text, fill, colors.panel_background);
+            assert!(ratio >= 3.0, "{name} pending badge contrast {ratio}");
             // Child-count chip: text over element_selected.
             let ratio = contrast(colors.text, colors.element_selected, colors.panel_background);
             assert!(ratio >= 3.0, "{name} child count contrast {ratio}");

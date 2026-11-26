@@ -608,8 +608,9 @@ pub fn annotate_agent_list(list: &mut serde_json::Value, cx: &App) {
         row["open"] = state.open.into();
         row["attached"] = agent_ui::terminal_attention::TerminalAttention::try_global(cx)
             .and_then(|attention| attention.read(cx).thread(&id))
-            .is_some_and(|thread| thread.attached)
-            .into();
+            // null: unknown (not a `claude attach` thread, or no poll result
+            // yet), distinct from false (polled, the session is gone).
+            .map_or(serde_json::Value::Null, |thread| thread.attached.into());
         row["last_activity_at"] = serde_json::Value::Null;
         let key = RowKey::Terminal(id);
         let (parent, section, depth) = match hierarchy {
@@ -2874,7 +2875,7 @@ mod tests {
         // A thread with no saved state at all.
         assert_eq!(list[2]["badges"], json!([]));
         assert_eq!(list[2]["open"], json!(false));
-        assert_eq!(list[2]["attached"], json!(false));
+        assert_eq!(list[2]["attached"], serde_json::Value::Null, "unknown is not false");
         // No terminal timestamp is exposed: always null, never invented.
         assert!(list.as_array().unwrap().iter().all(|row| row["last_activity_at"].is_null()));
     }

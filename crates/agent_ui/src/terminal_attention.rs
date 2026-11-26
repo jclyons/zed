@@ -8,7 +8,7 @@
 //! failure (the badge just disappears).
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext as _, Context, Entity, Global};
 
@@ -18,6 +18,13 @@ use crate::terminal_thread_metadata_store::TerminalThreadMetadataStore;
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub const POLL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Consecutive failed polls (CLI error, timeout, garbage) before the last
+/// known state is dropped: a transient failure keeps the badges, a dead CLI
+/// does not leave a red badge up forever.
+pub const MAX_FAILURES: u8 = 3;
+/// A poll "in flight" for longer than this is presumed lost (its task was
+/// dropped) and no longer blocks the next one.
+const IN_FLIGHT_STALE: Duration = Duration::from_secs(15);
 
 /// A session's state as `claude agents --json` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +85,10 @@ impl Global for GlobalTerminalAttention {}
 #[derive(Default)]
 pub struct TerminalAttention {
     threads: BTreeMap<String, ThreadAttention>,
+    /// When the running poll started: the single in-flight guard shared by the
+    /// 5 s loop and `--agent-list`, so at most one subprocess runs at a time.
+    in_flight: Option<Instant>,
+    failures: u8,
 }
 
 impl TerminalAttention {
@@ -116,46 +127,74 @@ impl TerminalAttention {
             .sum()
     }
 
-    /// Applies one poll result. `targets` maps terminal id to its attach
-    /// target; `agents_json` is `None` when the CLI failed or timed out,
-    /// which clears everything (fail quiet: no badge rather than a stale one).
+    /// Claims the single poll slot. `false`: a poll is already running, so the
+    /// caller reuses the last result instead of spawning another subprocess.
+    pub fn try_begin_poll(&mut self) -> bool {
+        match self.in_flight {
+            Some(started) if started.elapsed() < IN_FLIGHT_STALE => false,
+            _ => {
+                self.in_flight = Some(Instant::now());
+                true
+            }
+        }
+    }
+
+    /// Applies one poll result and releases the poll slot. `targets` maps
+    /// terminal id to its attach target. `agents_json` is `None` (CLI failed or
+    /// timed out) or not a JSON array: a failure. A failure keeps the previous
+    /// state, until [`MAX_FAILURES`] in a row drop it (fail quiet).
     pub fn apply(
         &mut self,
         targets: &BTreeMap<String, String>,
         agents_json: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        let mut next = BTreeMap::new();
-        if let Some(json) = agents_json {
-            for (id, target) in targets {
-                match find_session(json, target) {
-                    Some(Some(state)) => {
-                        next.insert(
-                            id.clone(),
-                            ThreadAttention {
-                                attached: true,
-                                state,
-                            },
-                        );
-                    }
-                    Some(None) => {
-                        next.insert(
-                            id.clone(),
-                            ThreadAttention {
-                                attached: false,
-                                state: SessionState::Other,
-                            },
-                        );
-                    }
-                    None => {}
-                }
+        self.in_flight = None;
+        let json = agents_json.filter(|json| {
+            serde_json::from_str::<serde_json::Value>(json).is_ok_and(|value| value.is_array())
+        });
+        let next = match json {
+            _ if targets.is_empty() => {
+                self.failures = 0;
+                BTreeMap::new()
             }
-        }
+            None => {
+                self.failures = self.failures.saturating_add(1);
+                if self.failures < MAX_FAILURES {
+                    return;
+                }
+                BTreeMap::new()
+            }
+            Some(json) => {
+                self.failures = 0;
+                let mut next = BTreeMap::new();
+                for (id, target) in targets {
+                    match find_session(json, target) {
+                        Some(Some(state)) => {
+                            next.insert(id.clone(), ThreadAttention { attached: true, state });
+                        }
+                        Some(None) => {
+                            next.insert(
+                                id.clone(),
+                                ThreadAttention { attached: false, state: SessionState::Other },
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                next
+            }
+        };
         if next != self.threads {
             self.threads = next;
             cx.notify();
         }
     }
+}
+
+/// `false` when there is no `claude attach` thread: then no subprocess at all.
+pub fn should_poll(targets: &BTreeMap<String, String>) -> bool {
+    !targets.is_empty()
 }
 
 /// Terminal ids (of threads that still exist) whose saved command is
@@ -184,11 +223,15 @@ pub fn attach_targets(cx: &App) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// One poll: no subprocess at all when there is no attach thread.
+/// One poll: no subprocess at all when there is no attach thread, and never
+/// two at once (a caller that finds one running returns and reuses its result).
 pub async fn poll_once(this: &Entity<TerminalAttention>, cx: &mut gpui::AsyncApp) {
     let targets = cx.update(|cx| attach_targets(cx));
-    if targets.is_empty() {
+    if !should_poll(&targets) {
         cx.update(|cx| this.update(cx, |this, cx| this.apply(&targets, None, cx)));
+        return;
+    }
+    if !cx.update(|cx| this.update(cx, |this, _| this.try_begin_poll())) {
         return;
     }
     let fetch = cx.update(|_| agents_json_fetcher_with_timeout(POLL_TIMEOUT));
@@ -267,14 +310,47 @@ mod tests {
         let two = JSON.replace(r#""working""#, r#""blocked""#);
         store.update(cx, |store, cx| store.apply(&targets(), Some(&two), cx));
         store.read_with(cx, |store, _| assert_eq!(store.total_pending(), 2));
-        // CLI failure / timeout (None) or garbage: no badge at all.
+        // A transient failure (None or garbage) KEEPS the last known state ...
+        store.update(cx, |store, cx| store.apply(&targets(), None, cx));
+        store.update(cx, |store, cx| store.apply(&targets(), Some("garbage"), cx));
+        store.read_with(cx, |store, _| assert_eq!(store.total_pending(), 2));
+        // ... a good poll resets the failure count ...
+        store.update(cx, |store, cx| store.apply(&targets(), Some(JSON), cx));
+        store.update(cx, |store, cx| store.apply(&targets(), None, cx));
+        store.update(cx, |store, cx| store.apply(&targets(), None, cx));
+        store.read_with(cx, |store, _| assert_eq!(store.total_pending(), 1));
+        // ... and MAX_FAILURES in a row drop it (fail quiet).
         store.update(cx, |store, cx| store.apply(&targets(), None, cx));
         store.read_with(cx, |store, _| {
             assert_eq!(store.total_pending(), 0);
             assert!(store.thread("t1").is_none());
         });
+        // No attach thread at all clears immediately.
         store.update(cx, |store, cx| store.apply(&targets(), Some(JSON), cx));
-        store.update(cx, |store, cx| store.apply(&targets(), Some("garbage"), cx));
+        store.update(cx, |store, cx| store.apply(&BTreeMap::new(), None, cx));
         store.read_with(cx, |store, _| assert_eq!(store.total_pending(), 0));
+    }
+
+    /// One subprocess at a time: the poll slot is single, released by `apply`,
+    /// and a lost poll does not block forever.
+    #[gpui::test]
+    fn poll_slot_is_single_and_released_by_apply(cx: &mut gpui::TestAppContext) {
+        let store = cx.update(|cx| TerminalAttention::init(cx));
+        store.update(cx, |store, _| {
+            assert!(store.try_begin_poll());
+            assert!(!store.try_begin_poll(), "a second poll must not start");
+        });
+        store.update(cx, |store, cx| store.apply(&targets(), Some(JSON), cx));
+        store.update(cx, |store, _| {
+            assert!(store.try_begin_poll(), "apply releases the slot");
+            store.in_flight = Some(Instant::now() - IN_FLIGHT_STALE - Duration::from_secs(1));
+            assert!(store.try_begin_poll(), "a lost poll is presumed dead");
+        });
+    }
+
+    #[test]
+    fn no_attach_thread_means_no_subprocess() {
+        assert!(!should_poll(&BTreeMap::new()));
+        assert!(should_poll(&targets()));
     }
 }
