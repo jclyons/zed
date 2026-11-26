@@ -57,13 +57,20 @@ pub fn agents_json(shell: &str, login: bool) -> Option<String> {
 /// [`agents_json`] with an explicit timeout (the 5 s attention poll uses 3 s).
 #[allow(clippy::disallowed_methods)]
 pub fn agents_json_with_timeout(shell: &str, login: bool, timeout: Duration) -> Option<String> {
+    run_with_timeout(agents_command(shell, login), timeout)
+}
+
+/// The exact command the poller runs. Split out so tests can run the REAL
+/// argv against a fake `claude` (PATH and HOME set on the returned command).
+#[allow(clippy::disallowed_methods)]
+fn agents_command(shell: &str, login: bool) -> Command {
     let mut command = Command::new(shell);
     if login {
         command.arg("-l");
     }
     // `exec` so killing the shell on timeout kills claude itself.
     command.args(["-c", "exec claude agents --json"]);
-    run_with_timeout(command, timeout)
+    command
 }
 
 /// Runs `command`, returning its stdout if it exits 0 within `timeout`. On
@@ -242,5 +249,89 @@ mod tests {
         assert_eq!(run_with_timeout(command, Duration::from_millis(300)), None);
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!is_stale("claude attach 6fadf34c", None));
+    }
+
+    /// A fake `claude` in a temp dir (with a temp HOME), first on PATH. It
+    /// rejects any argv other than `agents --json`, records its pid, then runs
+    /// `body`. Returns the production command, plus the pid file.
+    #[allow(clippy::disallowed_methods)]
+    fn fake_claude(body: &str) -> (tempfile::TempDir, Command, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "#!/bin/sh\n[ \"$1 $2\" = \"agents --json\" ] || exit 64\necho $$ > '{}'\n{body}\n",
+            pid_file.display()
+        );
+        let bin = bin_dir.join("claude");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Not a login shell: that would source the real profile and PATH.
+        let mut command = agents_command("/bin/sh", false);
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+        (dir, command, pid_file)
+    }
+
+    #[test]
+    fn poller_command_returns_the_fake_claude_stdout() {
+        let (_dir, command, pid_file) = fake_claude(r#"echo '[{"id":"aaaa1111","state":"blocked"}]'"#);
+        let out = run_with_timeout(command, Duration::from_secs(5)).expect("stdout");
+        assert_eq!(out.trim(), r#"[{"id":"aaaa1111","state":"blocked"}]"#);
+        assert!(pid_file.exists(), "the fake claude ran, with argv `agents --json`");
+    }
+
+    #[test]
+    fn poller_command_kills_a_hung_claude_at_the_timeout() {
+        let (_dir, command, pid_file) = fake_claude("exec sleep 30");
+        let started = Instant::now();
+        assert_eq!(run_with_timeout(command, Duration::from_millis(400)), None);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        // The process is gone, not leaked.
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        #[allow(clippy::disallowed_methods)]
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "hung claude {pid} was left running");
+    }
+
+    #[test]
+    fn poller_command_nonzero_exit_is_unknown() {
+        let (_dir, command, _) = fake_claude("echo '[]'; exit 3");
+        assert_eq!(run_with_timeout(command, Duration::from_secs(5)), None);
+    }
+
+    #[test]
+    fn poller_command_with_claude_not_found_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = agents_command("/bin/sh", false);
+        command
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", dir.path()); // an empty dir: no `claude`
+        assert_eq!(run_with_timeout(command, Duration::from_secs(5)), None);
+    }
+
+    /// Garbage on stdout is returned as-is (the poller's parser then reports
+    /// "unknown"): it never marks anything stale or blocked.
+    #[test]
+    fn poller_command_garbage_output_parses_to_unknown() {
+        let (_dir, command, _) = fake_claude("echo 'this is not json'");
+        let out = run_with_timeout(command, Duration::from_secs(5)).expect("stdout");
+        assert_eq!(out.trim(), "this is not json");
+        assert_eq!(target_is_alive(&out, "aaaa1111"), None);
+        assert!(!is_stale("claude attach aaaa1111", Some(&out)));
     }
 }
