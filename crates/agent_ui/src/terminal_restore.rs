@@ -51,13 +51,19 @@ const AGENTS_TIMEOUT: Duration = Duration::from_secs(5);
 // Only ever called from a background thread (see `agents_json_fetcher`).
 #[allow(clippy::disallowed_methods)]
 pub fn agents_json(shell: &str, login: bool) -> Option<String> {
+    agents_json_with_timeout(shell, login, AGENTS_TIMEOUT)
+}
+
+/// [`agents_json`] with an explicit timeout (the 5 s attention poll uses 3 s).
+#[allow(clippy::disallowed_methods)]
+pub fn agents_json_with_timeout(shell: &str, login: bool, timeout: Duration) -> Option<String> {
     let mut command = Command::new(shell);
     if login {
         command.arg("-l");
     }
     // `exec` so killing the shell on timeout kills claude itself.
     command.args(["-c", "exec claude agents --json"]);
-    run_with_timeout(command, AGENTS_TIMEOUT)
+    run_with_timeout(command, timeout)
 }
 
 /// Runs `command`, returning its stdout if it exits 0 within `timeout`. On
@@ -122,15 +128,23 @@ pub fn set_test_agents_json(json: Option<&str>) {
 /// thread). Capture it on the foreground: under test it carries the canned
 /// value and never spawns a process.
 pub fn agents_json_fetcher() -> impl FnOnce() -> Option<String> + Send + 'static {
+    agents_json_fetcher_with_timeout(AGENTS_TIMEOUT)
+}
+
+/// [`agents_json_fetcher`] with an explicit timeout.
+pub fn agents_json_fetcher_with_timeout(
+    timeout: Duration,
+) -> impl FnOnce() -> Option<String> + Send + 'static {
     #[cfg(test)]
     {
+        let _ = timeout;
         let canned = TEST_AGENTS_JSON.with(|cell| cell.borrow().clone());
         move || canned
     }
     #[cfg(not(test))]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        move || agents_json(&shell, true)
+        move || agents_json_with_timeout(&shell, true, timeout)
     }
 }
 

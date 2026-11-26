@@ -61,6 +61,8 @@ pub enum Slot {
         key: RowKey,
         depth: usize,
         has_children: bool,
+        /// DIRECT children only (not descendants), shown as the child-count chip.
+        child_count: usize,
         collapsed: bool,
         /// Rolled up over the row's descendants (not the row itself).
         rollup: Rollup,
@@ -131,6 +133,7 @@ pub fn arrange_rows(input: &ArrangeInput) -> Vec<Slot> {
                 key: info.key.clone(),
                 depth: 0,
                 has_children: false,
+                child_count: 0,
                 collapsed: false,
                 rollup: Rollup::default(),
                 foreign_project: false,
@@ -290,6 +293,7 @@ pub fn arrange_rows(input: &ArrangeInput) -> Vec<Slot> {
                 key: infos[i].key.clone(),
                 depth,
                 has_children,
+                child_count: children[i].len(),
                 collapsed,
                 rollup: agg[i],
                 foreign_project: !in_group(i),

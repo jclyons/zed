@@ -41,6 +41,10 @@ pub struct TerminalRestoreState {
 struct Blob {
     version: u32,
     threads: BTreeMap<String, TerminalRestoreState>,
+    /// Sidebar chips per terminal id (`--badge` / `--agent-set-badges`). A
+    /// separate map so `set` of the restore state never touches them.
+    #[serde(default)]
+    badges: BTreeMap<String, Vec<String>>,
 }
 
 struct GlobalTerminalRestoreStore(Entity<TerminalRestoreStore>);
@@ -49,6 +53,7 @@ impl Global for GlobalTerminalRestoreStore {}
 
 pub struct TerminalRestoreStore {
     threads: BTreeMap<String, TerminalRestoreState>,
+    badges: BTreeMap<String, Vec<String>>,
     db: KeyValueStore,
     write_task: Option<Task<()>>,
     /// A newer build wrote the blob: never write, so a rollback cannot wipe it.
@@ -76,25 +81,25 @@ impl TerminalRestoreStore {
 
     fn new(db: KeyValueStore, cx: &mut Context<Self>) -> Self {
         let mut read_only = false;
-        let threads = match db.scoped(KVP_SCOPE).read(KVP_KEY) {
-            Ok(None) => BTreeMap::new(),
+        let (threads, badges) = match db.scoped(KVP_SCOPE).read(KVP_KEY) {
+            Ok(None) => Default::default(),
             Ok(Some(raw)) => match serde_json::from_str::<Blob>(&raw) {
-                Ok(blob) if blob.version <= VERSION => blob.threads,
+                Ok(blob) if blob.version <= VERSION => (blob.threads, blob.badges),
                 Ok(_) => {
                     read_only = true;
-                    BTreeMap::new()
+                    Default::default()
                 }
                 Err(error) => {
                     log::warn!(
                         "cpzed terminal restore: unreadable state ({error}); starting empty"
                     );
-                    BTreeMap::new()
+                    Default::default()
                 }
             },
             Err(error) => {
                 log::error!("cpzed terminal restore: could not read state ({error:#})");
                 read_only = true;
-                BTreeMap::new()
+                Default::default()
             }
         };
         // Let a pending write land before the app quits.
@@ -109,6 +114,7 @@ impl TerminalRestoreStore {
         .detach();
         Self {
             threads,
+            badges,
             db,
             write_task: None,
             read_only,
@@ -118,6 +124,33 @@ impl TerminalRestoreStore {
 
     pub fn state(&self, terminal_id: &str) -> TerminalRestoreState {
         self.threads.get(terminal_id).cloned().unwrap_or_default()
+    }
+
+    /// A thread's badges, in display order (empty when none).
+    pub fn badges(&self, terminal_id: &str) -> Vec<String> {
+        self.badges.get(terminal_id).cloned().unwrap_or_default()
+    }
+
+    /// Replaces a thread's badges; an empty list removes the entry. The
+    /// caller validates with `cli::validate_badges`.
+    pub fn set_badges(&mut self, terminal_id: &str, badges: Vec<String>, cx: &mut Context<Self>) {
+        let changed = if badges.is_empty() {
+            self.badges.remove(terminal_id).is_some()
+        } else if self.badges.get(terminal_id) == Some(&badges) {
+            false
+        } else {
+            self.badges.insert(terminal_id.to_string(), badges);
+            true
+        };
+        if changed {
+            self.schedule_write(cx);
+            cx.notify();
+        }
+    }
+
+    /// Every thread with saved state (id, state), for the attention poller.
+    pub fn states(&self) -> impl Iterator<Item = (&String, &TerminalRestoreState)> {
+        self.threads.iter()
     }
 
     pub fn has_state(&self, terminal_id: &str) -> bool {
@@ -139,9 +172,10 @@ impl TerminalRestoreStore {
         if keep.is_empty() {
             return;
         }
-        let before = self.threads.len();
+        let before = self.threads.len() + self.badges.len();
         self.threads.retain(|id, _| keep.contains(id));
-        if self.threads.len() != before {
+        self.badges.retain(|id, _| keep.contains(id));
+        if self.threads.len() + self.badges.len() != before {
             self.schedule_write(cx);
         }
     }
@@ -181,6 +215,7 @@ impl TerminalRestoreStore {
         let blob = Blob {
             version: VERSION,
             threads: self.threads.clone(),
+            badges: self.badges.clone(),
         };
         let Some(json) = serde_json::to_string(&blob).log_err() else {
             return;
@@ -441,5 +476,75 @@ mod tests {
                 .update(cx, |store, _| store.claim_for_restore(rows, None))
                 .is_empty()
         );
+    }
+
+    fn badges_of(list: &[&str]) -> Vec<String> {
+        list.iter().map(|b| b.to_string()).collect()
+    }
+
+    /// Badges round-trip through the KVP db, replace, clear, and survive a
+    /// `set` of the restore state (the persist-on-refresh path).
+    #[gpui::test]
+    async fn test_badges_set_clear_and_survive_state_set(cx: &mut gpui::TestAppContext) {
+        let db = KeyValueStore::open_test_db("terminal_restore_badges").await;
+        let store = cx.new(|cx| TerminalRestoreStore::new(db.clone(), cx));
+        store.update(cx, |store, cx| {
+            store.set_badges("a", badges_of(&["bg", "opus", "rc"]), cx);
+            // Refreshing the restore state must not clobber the badges.
+            store.set("a", open_state(), cx);
+            store.set_badges("b", badges_of(&["fg"]), cx);
+        });
+        cx.run_until_parked();
+        let reopened = cx.new(|cx| TerminalRestoreStore::new(db.clone(), cx));
+        reopened.read_with(cx, |store, _| {
+            assert_eq!(store.badges("a"), badges_of(&["bg", "opus", "rc"]));
+            assert_eq!(store.badges("b"), badges_of(&["fg"]));
+            assert!(store.badges("none").is_empty());
+        });
+        // Replace, then clear with an empty list.
+        reopened.update(cx, |store, cx| {
+            store.set_badges("a", badges_of(&["haiku"]), cx);
+            store.set_badges("b", Vec::new(), cx);
+        });
+        cx.run_until_parked();
+        let again = cx.new(|cx| TerminalRestoreStore::new(db, cx));
+        again.read_with(cx, |store, _| {
+            assert_eq!(store.badges("a"), badges_of(&["haiku"]));
+            assert!(store.badges("b").is_empty());
+        });
+    }
+
+    /// A badge-only thread is pruned with the others; kept ids keep theirs.
+    #[gpui::test]
+    async fn test_retain_ids_prunes_badges_too(cx: &mut gpui::TestAppContext) {
+        let db = KeyValueStore::open_test_db("terminal_restore_badges_retain").await;
+        let store = cx.new(|cx| TerminalRestoreStore::new(db.clone(), cx));
+        store.update(cx, |store, cx| {
+            store.set_badges("keep", badges_of(&["bg"]), cx);
+            store.set_badges("drop", badges_of(&["bg"]), cx);
+            store.retain_ids(&HashSet::from(["keep".to_string()]), cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.badges("keep"), badges_of(&["bg"]));
+            assert!(store.badges("drop").is_empty());
+        });
+    }
+
+    /// A blob written before badges existed (no `badges` key) still loads.
+    #[gpui::test]
+    async fn test_old_blob_without_badges_loads(cx: &mut gpui::TestAppContext) {
+        let db = KeyValueStore::open_test_db("terminal_restore_old_blob").await;
+        db.scoped(KVP_SCOPE)
+            .write(
+                KVP_KEY.to_string(),
+                r#"{"version":1,"threads":{"x":{"open":true}}}"#.to_string(),
+            )
+            .await
+            .unwrap();
+        let store = cx.new(|cx| TerminalRestoreStore::new(db, cx));
+        store.read_with(cx, |store, _| {
+            assert!(store.state("x").open);
+            assert!(store.badges("x").is_empty());
+        });
     }
 }

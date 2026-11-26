@@ -723,6 +723,12 @@ pub async fn handle_cli_request(
                     // empty list for a store that failed to load.
                     let reload_task = cx.update(|cx| store.read(cx).reload_task());
                     reload_task.await;
+                    // Fresh `attached` flags (3 s bounded, background, quiet).
+                    if let Some(attention) = cx.update(|cx| {
+                        agent_ui::terminal_attention::TerminalAttention::try_global(cx)
+                    }) {
+                        agent_ui::terminal_attention::poll_once(&attention, cx).await;
+                    }
                     let list = cx.update(|cx| {
                         let mut list = store.read(cx).list_json_if_loaded();
                         if let Some(list) = list.as_mut() {
@@ -766,6 +772,7 @@ pub async fn handle_cli_request(
                 on_no_match,
                 None,
                 None,
+                Vec::new(),
                 app_state,
                 responses.as_ref(),
                 cx,
@@ -795,11 +802,39 @@ pub async fn handle_cli_request(
                 on_no_match,
                 parent,
                 section,
+                Vec::new(),
                 app_state,
                 responses.as_ref(),
                 cx,
             )
             .await;
+        }
+        CliRequest::NewAgentTerminalBadged {
+            cwd,
+            command,
+            title,
+            on_no_match,
+            parent,
+            section,
+            badges,
+        } => {
+            crate::zed::cli_agent::handle_new_agent_terminal(
+                cwd,
+                command,
+                title,
+                on_no_match,
+                parent,
+                section,
+                badges,
+                app_state,
+                responses.as_ref(),
+                cx,
+            )
+            .await;
+        }
+        CliRequest::SetAgentBadges { id, badges } => {
+            crate::zed::cli_agent::handle_set_agent_badges(id, badges, responses.as_ref(), cx)
+                .await;
         }
         CliRequest::UpdateAgentThread {
             id,

@@ -43,6 +43,8 @@ pub struct ThreadItem {
     custom_icon_from_external_svg: Option<SharedString>,
     title: SharedString,
     title_slot: Option<AnyElement>,
+    /// CPZed: chips / status glyph drawn at the right edge of the title row.
+    title_trailing: Option<AnyElement>,
     title_label_color: Option<Color>,
     title_generating: bool,
     highlight_positions: Vec<usize>,
@@ -77,6 +79,7 @@ impl ThreadItem {
             custom_icon_from_external_svg: None,
             title: title.into(),
             title_slot: None,
+            title_trailing: None,
             title_label_color: None,
             title_generating: false,
             highlight_positions: Vec::new(),
@@ -145,6 +148,12 @@ impl ThreadItem {
 
     pub fn title_generating(mut self, generating: bool) -> Self {
         self.title_generating = generating;
+        self
+    }
+
+    /// CPZed: element shown right of the title (badge chips, status glyph).
+    pub fn title_trailing(mut self, element: impl IntoElement) -> Self {
+        self.title_trailing = Some(element.into_any_element());
         self
     }
 
@@ -455,6 +464,9 @@ impl RenderOnce for ThreadItem {
                             .child(icon)
                             .child(title_label),
                     )
+                    .when_some(self.title_trailing, |this, trailing| {
+                        this.child(h_flex().flex_none().gap_1().child(trailing))
+                    })
                     .when(self.is_truncated && opaque_window, |this| {
                         this.child(gradient_overlay)
                     })
