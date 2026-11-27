@@ -278,6 +278,19 @@ impl RenderOnce for ThreadItem {
             .gradient_stop(0.7)
             .group_name("thread-item");
 
+        // With a trailing row (CPZed badges, status glyph) the fade must sit at
+        // the right edge of the title area, not of the whole row, otherwise it
+        // paints over the trailing chips and clips them.
+        let has_trailing = self.title_trailing.is_some();
+        let mut gradient_overlay = Some(gradient_overlay);
+        let content_gradient = if has_trailing && self.is_truncated && opaque_window {
+            gradient_overlay
+                .take()
+                .map(|gradient| gradient.right(px(0.0)))
+        } else {
+            None
+        };
+
         let separator_color = Color::Custom(color.text_muted.opacity(0.4));
         let dot_separator = || {
             Label::new("•")
@@ -458,24 +471,28 @@ impl RenderOnce for ThreadItem {
                     .child(
                         h_flex()
                             .id("content")
+                            .relative()
                             .min_w_0()
                             .flex_1()
                             .gap_1p5()
                             .child(icon)
-                            .child(title_label),
+                            .child(title_label)
+                            .children(content_gradient),
                     )
                     .when_some(self.title_trailing, |this, trailing| {
                         this.child(h_flex().flex_none().gap_1().child(trailing))
                     })
                     .when(self.is_truncated && opaque_window, |this| {
-                        this.child(gradient_overlay)
+                        this.children(gradient_overlay)
                     })
                     .when(self.hovered, |this| {
                         this.when_some(self.action_slot, |this, slot| {
                             this.child(
                                 h_flex()
                                     .relative()
-                                    .when(opaque_window, |this| {
+                                    // The slot sits after the trailing row, so its fade
+                                    // would wash the chips out; skip it then.
+                                    .when(opaque_window && !has_trailing, |this| {
                                         this.child(
                                             GradientFade::new(base_bg, hover_bg, active_bg)
                                                 .width(px(120.0))

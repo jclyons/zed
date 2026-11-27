@@ -563,7 +563,9 @@ impl Sidebar {
         };
 
         let rollup_text = if collapsed {
-            rollup_label(&layout.rollup, true)
+            // The count is already the chip in the row's trailing area; keep
+            // only running/waiting here.
+            rollup_label(&layout.rollup, false)
         } else {
             String::new()
         };
