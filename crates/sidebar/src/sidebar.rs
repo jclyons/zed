@@ -1,3 +1,4 @@
+mod badges_ui;
 mod hierarchy_dnd;
 mod hierarchy_ui;
 mod thread_switcher;
@@ -7,6 +8,8 @@ use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::v2::schema as acp;
 use agent_settings::{AgentSettings, THREADS_LIST_MAX_WIDTH, THREADS_LIST_MIN_WIDTH};
+use agent_ui::terminal_attention::TerminalAttention;
+use agent_ui::terminal_restore_store::TerminalRestoreStore;
 use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
@@ -1023,6 +1026,13 @@ impl Sidebar {
             },
         )
         .detach();
+
+        // CPZed badges: repaint when badges or pending-input state change.
+        let attention = TerminalAttention::init(cx);
+        cx.observe(&attention, |_, _, cx| cx.notify()).detach();
+        if let Some(restore) = TerminalRestoreStore::try_global(cx) {
+            cx.observe(&restore, |_, _, cx| cx.notify()).detach();
+        }
 
         let channels_with_threads = channels_with_threads(cx);
         cx.spawn(async move |this, cx| {
@@ -6873,10 +6883,37 @@ impl Sidebar {
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
 
+        // CPZed badges: chips, pending-input badge, child count, and the status
+        // glyph moved from the title's left to the right edge.
+        let terminal_key_string = terminal.metadata.terminal_id.to_key_string();
+        let badges = TerminalRestoreStore::try_global(cx)
+            .map(|store| store.read(cx).badges(&terminal_key_string))
+            .unwrap_or_default();
+        let attention = TerminalAttention::try_global(cx)
+            .and_then(|attention| attention.read(cx).thread(&terminal_key_string));
+        let pending = TerminalAttention::try_global(cx).map_or(0, |attention| {
+            attention.read(cx).pending_count(&terminal_key_string)
+        });
+        let child_count = self
+            .hierarchy
+            .row_layout
+            .get(&hierarchy_ui::terminal_key(terminal.metadata.terminal_id))
+            .map_or(0, |layout| layout.child_count);
+        let trailing = badges_ui::render_trailing(
+            &badges_ui::TrailingRow {
+                badges: &badges,
+                pending,
+                child_count,
+                glyph: icon_char,
+                state: attention.map(|attention| attention.state),
+            },
+            cx,
+        );
+
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
             .icon(IconName::Terminal)
-            .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
+            .when_some(trailing, |this, trailing| this.title_trailing(trailing))
             .worktrees(worktrees)
             .timestamp(timestamp)
             .notified(terminal.has_notification)
@@ -7684,6 +7721,7 @@ impl Sidebar {
                             ),
                     )
                     .child(self.render_filter_input(cx))
+                    .children(badges_ui::header_pending(cx))
                     .child(
                         h_flex()
                             .gap_1()

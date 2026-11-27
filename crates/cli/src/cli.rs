@@ -124,6 +124,57 @@ pub enum CliRequest {
         /// the section if missing (`--section`).
         section: Option<String>,
     },
+    /// `--agent-new` with `--badge`. A separate, appended variant (index 9):
+    /// the CLI sends it only when at least one badge is given, so plain
+    /// `--agent-new` / `--parent` keep working against an older app.
+    NewAgentTerminalBadged {
+        cwd: PathBuf,
+        command: Option<String>,
+        title: Option<String>,
+        on_no_match: NoMatchBehavior,
+        parent: Option<String>,
+        section: Option<String>,
+        /// Already validated by [`validate_badges`] in the CLI and again in the app.
+        badges: Vec<String>,
+    },
+    /// `--agent-set-badges <id> a,b`: replace a thread's badges (empty
+    /// clears). Appended last (index 10).
+    SetAgentBadges {
+        id: String,
+        badges: Vec<String>,
+    },
+}
+
+/// Most badges one thread can carry.
+pub const MAX_BADGES: usize = 4;
+/// Longest badge text, in characters.
+pub const MAX_BADGE_LEN: usize = 12;
+
+/// Validates and normalizes a badge list: at most [`MAX_BADGES`] distinct
+/// entries (repeats are dropped, order kept), each 1..=[`MAX_BADGE_LEN`]
+/// characters of `[a-z0-9-]`. Shared by the CLI and the app so neither
+/// trusts the other.
+pub fn validate_badges(badges: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for badge in badges {
+        if badge.is_empty()
+            || badge.chars().count() > MAX_BADGE_LEN
+            || !badge
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(format!(
+                "invalid badge {badge:?}: use 1-{MAX_BADGE_LEN} characters of a-z, 0-9 and '-'"
+            ));
+        }
+        if !out.contains(badge) {
+            out.push(badge.clone());
+        }
+    }
+    if out.len() > MAX_BADGES {
+        return Err(format!("at most {MAX_BADGES} badges per thread"));
+    }
+    Ok(out)
 }
 
 /// A requested change of a thread's parent.
@@ -358,6 +409,77 @@ mod tests {
             bincode::deserialize::<CliRequest>(&bytes).unwrap(),
             CliRequest::RenameAgentThread { id, title } if id == "i" && title == "t"
         ));
+    }
+
+    /// BADGES' variants are appended after S2's (7, 8): 9 and 10, with golden
+    /// bytes and a bincode round trip.
+    #[test]
+    fn badge_variants_are_appended_with_stable_wire_bytes() {
+        let badged = CliRequest::NewAgentTerminalBadged {
+            cwd: PathBuf::from("/x"),
+            command: None,
+            title: None,
+            on_no_match: NoMatchBehavior::Error,
+            parent: None,
+            section: None,
+            badges: vec!["bg".into(), "rc".into()],
+        };
+        let mut expected = 9u32.to_le_bytes().to_vec();
+        expected.extend(bincode_string("/x"));
+        expected.push(0); // command: None
+        expected.push(0); // title: None
+        expected.extend(0u32.to_le_bytes()); // NoMatchBehavior::Error
+        expected.push(0); // parent: None
+        expected.push(0); // section: None
+        expected.extend(2u64.to_le_bytes()); // badges.len()
+        expected.extend(bincode_string("bg"));
+        expected.extend(bincode_string("rc"));
+        let bytes = bincode::serialize(&badged).unwrap();
+        assert_eq!(bytes, expected);
+        assert!(matches!(
+            bincode::deserialize::<CliRequest>(&bytes).unwrap(),
+            CliRequest::NewAgentTerminalBadged { badges, .. } if badges == ["bg", "rc"]
+        ));
+
+        let set = CliRequest::SetAgentBadges {
+            id: "i".into(),
+            badges: vec![],
+        };
+        let mut expected = 10u32.to_le_bytes().to_vec();
+        expected.extend(bincode_string("i"));
+        expected.extend(0u64.to_le_bytes());
+        let bytes = bincode::serialize(&set).unwrap();
+        assert_eq!(bytes, expected);
+        assert!(matches!(
+            bincode::deserialize::<CliRequest>(&bytes).unwrap(),
+            CliRequest::SetAgentBadges { id, badges } if id == "i" && badges.is_empty()
+        ));
+        // The earlier appended variants did not move.
+        let update = CliRequest::UpdateAgentThread {
+            id: String::new(),
+            parent: None,
+            section: None,
+        };
+        assert_eq!(variant_index(&update), 7);
+    }
+
+    #[test]
+    fn validate_badges_rules() {
+        let v = |items: &[&str]| {
+            validate_badges(&items.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(v(&[]).unwrap(), Vec::<String>::new());
+        assert_eq!(v(&["bg", "opus", "rc", "x-1"]).unwrap().len(), 4);
+        // Repeats collapse, so four distinct + a repeat is fine.
+        assert_eq!(v(&["bg", "bg", "rc"]).unwrap(), ["bg", "rc"]);
+        assert!(v(&["a", "b", "c", "d", "e"]).is_err());
+        assert!(v(&[""]).is_err());
+        assert!(v(&["BG"]).is_err());
+        assert!(v(&["a b"]).is_err());
+        assert!(v(&["a,b"]).is_err());
+        assert!(v(&["abcdefghijkl"]).is_ok()); // exactly 12
+        assert!(v(&["abcdefghijklm"]).is_err()); // 13
+        assert!(v(&["é"]).is_err());
     }
 
     #[test]

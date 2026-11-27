@@ -1692,3 +1692,138 @@ async fn test_starting_a_drag_clears_a_stale_preview(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// Child-count chip data: DIRECT children only (0, 1, N), the same collapsed or
+/// expanded, and a grandchild never counts toward its grandparent.
+#[gpui::test]
+async fn test_child_count_is_direct_children_only(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let parent = add_terminal(&mut cx, "parent", "/project-a", 10);
+    let c1 = add_terminal(&mut cx, "c1", "/project-a", 20);
+    let c2 = add_terminal(&mut cx, "c2", "/project-a", 30);
+    let grandchild = add_terminal(&mut cx, "g1", "/project-a", 40);
+    let lone = add_terminal(&mut cx, "lone", "/project-a", 50);
+    let one_child_parent = add_terminal(&mut cx, "p1", "/project-a", 60);
+    let only_child = add_terminal(&mut cx, "oc", "/project-a", 70);
+    edit(&mut cx, |store, cx| {
+        store.set_parent(&key(c1), Some(&key(parent)), cx).unwrap();
+        store.set_parent(&key(c2), Some(&key(parent)), cx).unwrap();
+        store
+            .set_parent(&key(grandchild), Some(&key(c1)), cx)
+            .unwrap();
+        store
+            .set_parent(&key(only_child), Some(&key(one_child_parent)), cx)
+            .unwrap();
+    });
+    refresh(&sidebar, &mut cx);
+    let counts = |sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext| {
+        sidebar.read_with(cx, |sidebar, _| {
+            [
+                parent,
+                c1,
+                c2,
+                grandchild,
+                lone,
+                one_child_parent,
+                only_child,
+            ]
+            .map(|id| sidebar.hierarchy.row_layout[&key(id)].child_count)
+        })
+    };
+    // parent: 2 direct (c1, c2), not 3; c1: 1; leaves and lone: 0; p1: 1.
+    assert_eq!(counts(&sidebar, &mut cx), [2, 1, 0, 0, 0, 1, 0]);
+
+    // Collapsing the parent keeps its count (the row still shows "2").
+    edit(&mut cx, |store, cx| {
+        store.set_row_collapsed(&key(parent), true, cx).ok();
+    });
+    refresh(&sidebar, &mut cx);
+    sidebar.read_with(&cx, |sidebar, _| {
+        let layout = &sidebar.hierarchy.row_layout[&key(parent)];
+        assert!(layout.collapsed);
+        assert_eq!(layout.child_count, 2);
+        // The rollup counts every hidden descendant; the chip does not.
+        assert_eq!(layout.rollup.count, 3);
+    });
+}
+
+/// The glyph set by claude leads the STORED title; the row strips it for display
+/// only (it is drawn at the right), and the stored title is unchanged.
+#[gpui::test]
+async fn test_status_glyph_is_stripped_from_the_displayed_title_only(cx: &mut TestAppContext) {
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    let id = add_terminal(&mut cx, "✳ Implement badges", "/project-a", 10);
+    refresh(&sidebar, &mut cx);
+    sidebar.read_with(&cx, |sidebar, _| {
+        let terminal = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == id => {
+                    Some(terminal)
+                }
+                _ => None,
+            })
+            .expect("terminal row");
+        let stored = terminal.metadata.display_title();
+        assert_eq!(stored.as_ref(), "✳ Implement badges");
+        let (glyph, title, _) =
+            crate::split_leading_icon_char(&stored, &terminal.highlight_positions).unwrap();
+        assert_eq!(glyph.as_ref(), "✳");
+        assert_eq!(title.as_ref(), "Implement badges");
+    });
+}
+
+/// The header total is the number of blocked sessions over all attach threads
+/// (not 0, not 1, not the thread count); the red badge is hidden at 0 and drawn
+/// in the header otherwise.
+#[gpui::test]
+async fn test_header_total_counts_blocked_sessions_and_renders(cx: &mut TestAppContext) {
+    use agent_ui::terminal_attention::TerminalAttention;
+    use std::collections::BTreeMap;
+    init(cx);
+    let fs = new_fs(cx).await;
+    let (_mw, sidebar, mut cx) = open_window(cx, &fs).await;
+    add_terminal(&mut cx, "one", "/project-a", 10);
+    refresh(&sidebar, &mut cx);
+    let attention = cx.update(|_, cx| TerminalAttention::init(cx));
+    let targets: BTreeMap<String, String> =
+        [("t1", "aaaa1111"), ("t2", "bbbb2222"), ("t3", "cccc3333")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+    let json = |a: &str, b: &str, c: &str| {
+        format!(
+            r#"[{{"id":"aaaa1111","state":"{a}"}},{{"id":"bbbb2222","state":"{b}"}},{{"id":"cccc3333","state":"{c}"}}]"#
+        )
+    };
+    let total = |cx: &mut VisualTestContext| cx.update(|_, cx| badges_ui::header_total(cx));
+
+    // Nothing blocked: 0, and no header badge.
+    attention.update(&mut cx, |a, cx| {
+        a.apply(&targets, Some(&json("working", "done", "working")), cx)
+    });
+    refresh(&sidebar, &mut cx);
+    assert_eq!(total(&mut cx), 0);
+    assert!(cx.debug_bounds("sidebar-header-pending").is_none());
+
+    // Two of three blocked: exactly 2, and the badge is drawn.
+    attention.update(&mut cx, |a, cx| {
+        a.apply(&targets, Some(&json("blocked", "working", "blocked")), cx)
+    });
+    refresh(&sidebar, &mut cx);
+    assert_eq!(total(&mut cx), 2);
+    assert!(cx.debug_bounds("sidebar-header-pending").is_some());
+
+    // One blocked.
+    attention.update(&mut cx, |a, cx| {
+        a.apply(&targets, Some(&json("done", "blocked", "done")), cx)
+    });
+    refresh(&sidebar, &mut cx);
+    assert_eq!(total(&mut cx), 1);
+}

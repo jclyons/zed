@@ -190,6 +190,20 @@ struct Args {
         conflicts_with_all = ["paths_with_position", "agent_list", "agent_new", "debug_state", "diff", "agent_close", "agent_rename", "agent_set_parent"]
     )]
     agent_set_section: Option<Vec<String>>,
+    /// Badge for the new terminal thread, shown as a chip in the sidebar
+    /// (requires --agent-new; repeatable, at most 4): bg, fg, opus, sonnet,
+    /// fable, haiku, rc, or any 1-12 characters of a-z, 0-9 and '-'.
+    #[arg(long, requires = "agent_new", value_name = "BADGE")]
+    badge: Vec<String>,
+    /// Replace a terminal thread's badges: `--agent-set-badges <ID> a,b`.
+    /// An empty list (`""`) clears them.
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["ID", "BADGES"],
+        conflicts_with_all = ["paths_with_position", "agent_list", "agent_new", "debug_state", "diff", "agent_close", "agent_rename", "agent_set_parent", "agent_set_section"]
+    )]
+    agent_set_badges: Option<Vec<String>>,
     /// Command to type into the new terminal thread (requires --agent-new).
     #[arg(long, requires = "agent_new", value_name = "CMD")]
     command: Option<String>,
@@ -375,6 +389,7 @@ fn build_agent_new_request(
     new_window: bool,
     parent: Option<String>,
     section: Option<String>,
+    badges: Vec<String>,
 ) -> CliRequest {
     let on_no_match = if new_window {
         cli::NoMatchBehavior::NewWindow
@@ -386,7 +401,17 @@ fn build_agent_new_request(
     // Plain `--agent-new` keeps sending the original variant so it works against
     // an app that predates --parent/--section; the new fields need the new variant
     // (an old app rejects it instead of silently dropping the placement).
-    if parent.is_none() && section.is_none() {
+    if !badges.is_empty() {
+        CliRequest::NewAgentTerminalBadged {
+            cwd,
+            command,
+            title,
+            on_no_match,
+            parent,
+            section,
+            badges,
+        }
+    } else if parent.is_none() && section.is_none() {
         CliRequest::NewAgentTerminal {
             cwd,
             command,
@@ -403,6 +428,27 @@ fn build_agent_new_request(
             section,
         }
     }
+}
+
+/// `--agent-set-badges <id> a,b`: `a,b` is comma-separated; empty clears.
+fn build_set_badges_request(args: &Args) -> Result<Option<CliRequest>> {
+    let Some(values) = &args.agent_set_badges else {
+        return Ok(None);
+    };
+    let [id, list] = values.as_slice() else {
+        anyhow::bail!("--agent-set-badges takes <ID> <BADGES>");
+    };
+    let items: Vec<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    let badges = cli::validate_badges(&items).map_err(anyhow::Error::msg)?;
+    Ok(Some(CliRequest::SetAgentBadges {
+        id: id.clone(),
+        badges,
+    }))
 }
 
 /// `none` (exactly) clears; anything else sets.
@@ -582,6 +628,7 @@ mod tests {
             n,
             None,
             None,
+            vec![],
         ) {
             CliRequest::NewAgentTerminal { on_no_match, .. } => on_no_match,
             _ => unreachable!(),
@@ -589,6 +636,61 @@ mod tests {
         assert_eq!(map(false, false), cli::NoMatchBehavior::Error);
         assert_eq!(map(true, false), cli::NoMatchBehavior::OpenProject);
         assert_eq!(map(false, true), cli::NoMatchBehavior::NewWindow);
+    }
+
+    #[test]
+    fn badge_flags_parse_and_pick_the_badged_variant() {
+        let args = parse(&["--agent-new", "--badge", "bg", "--badge", "opus"]).unwrap();
+        assert_eq!(args.badge, ["bg", "opus"]);
+        // --badge needs --agent-new.
+        assert!(parse(&["--badge", "bg"]).is_err());
+        let built = build_agent_new_request(
+            "/a".into(),
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            cli::validate_badges(&args.badge).unwrap(),
+        );
+        assert!(matches!(
+            built,
+            CliRequest::NewAgentTerminalBadged { badges, .. } if badges == ["bg", "opus"]
+        ));
+        // Parent + badges still carries the parent in the badged variant.
+        assert!(matches!(
+            build_agent_new_request(
+                "/a".into(), None, None, false, false,
+                Some("p".into()), None, vec!["rc".into()]
+            ),
+            CliRequest::NewAgentTerminalBadged { parent: Some(p), .. } if p == "p"
+        ));
+    }
+
+    #[test]
+    fn agent_set_badges_flag() {
+        let req = |list: &str| {
+            let args = parse(&["--agent-set-badges", "abc", list]).unwrap();
+            build_set_badges_request(&args)
+        };
+        match req("bg, opus,rc").unwrap().unwrap() {
+            CliRequest::SetAgentBadges { id, badges } => {
+                assert_eq!(id, "abc");
+                assert_eq!(badges, ["bg", "opus", "rc"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match req("").unwrap().unwrap() {
+            CliRequest::SetAgentBadges { badges, .. } => assert!(badges.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+        assert!(req("BAD").is_err());
+        assert!(req("a,b,c,d,e").is_err());
+        assert!(parse(&["--agent-set-badges", "abc"]).is_err());
+        assert!(parse(&["--agent-set-badges", "a", "b", "--agent-list"]).is_err());
+        assert!(parse(&["--agent-set-badges", "a", "b", "--agent-new"]).is_err());
+        assert!(parse(&["--agent-set-badges", "a", "b", "some/path"]).is_err());
     }
 
     #[test]
@@ -602,6 +704,7 @@ mod tests {
                 false,
                 parent.map(Into::into),
                 section.map(Into::into),
+                vec![],
             )
         };
         assert!(matches!(
@@ -1013,12 +1116,16 @@ fn run() -> Result<()> {
             args.new_window,
             args.parent.clone(),
             args.section.clone(),
+            cli::validate_badges(&args.badge).map_err(anyhow::Error::msg)?,
         ))
     } else {
         None
     };
 
-    let agent_manage_request = build_agent_manage_request(&args)?;
+    let agent_manage_request = match build_set_badges_request(&args)? {
+        Some(request) => Some(request),
+        None => build_agent_manage_request(&args)?,
+    };
     let agent_update_request = build_update_request(
         args.agent_set_parent.as_deref(),
         args.agent_set_section.as_deref(),
@@ -1068,7 +1175,10 @@ fn run() -> Result<()> {
                     || agent_update_request.is_some()
                     || matches!(
                         &agent_new_request,
-                        Some(CliRequest::NewAgentTerminalIn { .. })
+                        Some(
+                            CliRequest::NewAgentTerminalIn { .. }
+                                | CliRequest::NewAgentTerminalBadged { .. }
+                        )
                     );
                 tx.send(if args.debug_state {
                     CliRequest::DebugState

@@ -22,6 +22,7 @@ mod model_search;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+pub mod terminal_attention;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_restore;
@@ -688,6 +689,8 @@ pub fn init(
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
     terminal_restore_store::TerminalRestoreStore::init(cx);
+    #[cfg(not(any(test, feature = "test-support")))]
+    terminal_attention::start_polling(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);

@@ -109,17 +109,19 @@ pub async fn handle_new_agent_terminal(
     on_no_match: NoMatchBehavior,
     parent: Option<String>,
     section: Option<String>,
+    badges: Vec<String>,
     app_state: Arc<AppState>,
     responses: &dyn CliResponseSink,
     cx: &mut AsyncApp,
 ) {
-    handle_new_agent_terminal_with_timeouts(
+    handle_new_agent_terminal_badged(
         cwd,
         command,
         title,
         on_no_match,
         parent,
         section,
+        badges,
         app_state,
         Timeouts::default(),
         responses,
@@ -140,6 +142,35 @@ pub async fn handle_new_agent_terminal_with_timeouts(
     responses: &dyn CliResponseSink,
     cx: &mut AsyncApp,
 ) {
+    handle_new_agent_terminal_badged(
+        cwd,
+        command,
+        title,
+        on_no_match,
+        parent,
+        section,
+        Vec::new(),
+        app_state,
+        timeouts,
+        responses,
+        cx,
+    )
+    .await
+}
+
+pub async fn handle_new_agent_terminal_badged(
+    cwd: PathBuf,
+    command: Option<String>,
+    title: Option<String>,
+    on_no_match: NoMatchBehavior,
+    parent: Option<String>,
+    section: Option<String>,
+    badges: Vec<String>,
+    app_state: Arc<AppState>,
+    timeouts: Timeouts,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
     // Never hold the spawn lock when replying: the reply can block on IPC.
     let outcome = run(
         cwd,
@@ -148,6 +179,7 @@ pub async fn handle_new_agent_terminal_with_timeouts(
         on_no_match,
         parent,
         section,
+        badges,
         app_state,
         timeouts,
         cx,
@@ -177,10 +209,14 @@ async fn run(
     on_no_match: NoMatchBehavior,
     parent: Option<String>,
     section: Option<String>,
+    badges: Vec<String>,
     app_state: Arc<AppState>,
     timeouts: Timeouts,
     cx: &mut AsyncApp,
 ) -> Result<String, Failure> {
+    // Re-validate: the app never trusts the CLI, and a bad badge must not
+    // leave a stray thread behind.
+    let badges = cli::validate_badges(&badges).map_err(Failure::internal)?;
     // The command is typed into the shell verbatim; a newline would run
     // several commands (and an embedded CR can submit early). Reject.
     if let Some(command) = &command
@@ -237,6 +273,20 @@ async fn run(
     let (terminal_id, mut reply) =
         spawn_and_confirm(&target, &panel, cwd, command, title, timeouts, cx).await?;
     drop(_guard);
+
+    if !badges.is_empty() {
+        let metadata = cx.update(|cx| TerminalThreadMetadataStore::try_global(cx));
+        let id = terminal_id.to_string();
+        let applied = apply_badges(metadata.as_ref(), &id, badges.clone(), timeouts, cx).await;
+        if let Err(mut failure) = applied {
+            failure.message = format!(
+                "{} (the terminal thread {id} was created, but without badges)",
+                failure.message
+            );
+            return Err(failure);
+        }
+        reply["badges"] = badges.into();
+    }
 
     if let Some(store) = hierarchy {
         let id = terminal_id.to_string();
@@ -361,6 +411,52 @@ async fn find_terminal(
             .find(|metadata| metadata.terminal_id.to_string() == id)
             .map(group_key)
     }))
+}
+
+/// Stores `badges` on the terminal thread `id` (waits, bounded, for the
+/// metadata store and for the thread's row to exist).
+async fn apply_badges(
+    store: Option<&Entity<TerminalThreadMetadataStore>>,
+    id: &str,
+    badges: Vec<String>,
+    timeouts: Timeouts,
+    cx: &mut AsyncApp,
+) -> Result<(), Failure> {
+    // The thread must exist; the badges themselves live in the fork-owned
+    // restore store, not in the upstream metadata table.
+    find_terminal(store, id, timeouts, cx)
+        .await?
+        .ok_or_else(|| Failure::new(EXIT_NO_MATCH, format!("unknown thread id: {id}")))?;
+    let restore = cx.update(|cx| agent_ui::terminal_restore_store::TerminalRestoreStore::init(cx));
+    cx.update(|cx| restore.update(cx, |restore, cx| restore.set_badges(id, badges, cx)));
+    Ok(())
+}
+
+/// `--agent-set-badges <id> a,b`.
+pub async fn handle_set_agent_badges(
+    id: String,
+    badges: Vec<String>,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    handle_set_agent_badges_with_timeouts(id, badges, Timeouts::default(), responses, cx).await
+}
+
+pub async fn handle_set_agent_badges_with_timeouts(
+    id: String,
+    badges: Vec<String>,
+    timeouts: Timeouts,
+    responses: &dyn CliResponseSink,
+    cx: &mut AsyncApp,
+) {
+    let outcome = async {
+        let badges = cli::validate_badges(&badges).map_err(Failure::internal)?;
+        let store = cx.update(|cx| TerminalThreadMetadataStore::try_global(cx));
+        apply_badges(store.as_ref(), &id, badges.clone(), timeouts, cx).await?;
+        Ok::<_, Failure>(serde_json::json!({ "id": id, "badges": badges }).to_string())
+    }
+    .await;
+    send_outcome(outcome, responses).await;
 }
 
 /// `--agent-set-parent` / `--agent-set-section`.
@@ -501,6 +597,21 @@ pub fn annotate_agent_list(list: &mut serde_json::Value, cx: &App) {
             .init_command
             .map_or(serde_json::Value::Null, Into::into);
         row["stale"] = state.stale.into();
+        // BADGES (append-only): chips, whether the thread is open, whether
+        // its `claude attach` session is alive, and the last terminal output
+        // time (null: the terminal exposes no such timestamp).
+        row["badges"] = restore
+            .as_ref()
+            .map(|store| store.read(cx).badges(&id))
+            .unwrap_or_default()
+            .into();
+        row["open"] = state.open.into();
+        row["attached"] = agent_ui::terminal_attention::TerminalAttention::try_global(cx)
+            .and_then(|attention| attention.read(cx).thread(&id))
+            // null: unknown (not a `claude attach` thread, or no poll result
+            // yet), distinct from false (polled, the session is gone).
+            .map_or(serde_json::Value::Null, |thread| thread.attached.into());
+        row["last_activity_at"] = serde_json::Value::Null;
         let key = RowKey::Terminal(id);
         let (parent, section, depth) = match hierarchy {
             Some(h) => {
@@ -2683,6 +2794,208 @@ mod tests {
         insert_dirs(&app_state, &root, json!({})).await;
         let (_window, workspace) = open_window(cx, &app_state, &root).await;
         (dirs, app_state, root, workspace)
+    }
+
+    async fn set_badges(cx: &mut TestAppContext, id: &str, badges: &[&str]) -> Outcome {
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        handle_set_agent_badges_with_timeouts(
+            id.to_string(),
+            badges.iter().map(|b| b.to_string()).collect(),
+            Timeouts::default(),
+            &sink,
+            &mut async_cx,
+        )
+        .await;
+        Outcome::from(&sink)
+    }
+
+    fn stored_badges(cx: &mut TestAppContext, id: &str) -> Vec<String> {
+        cx.update(|cx| {
+            agent_ui::terminal_restore_store::TerminalRestoreStore::init(cx)
+                .read(cx)
+                .badges(id)
+        })
+    }
+
+    #[gpui::test]
+    async fn test_agent_list_rows_carry_badges_open_attached_and_activity(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+        let mut list = json!([
+            { "id": "a", "title": "a" },
+            { "id": "b", "title": "b" },
+            { "id": "c", "title": "c" }
+        ]);
+        cx.update(|cx| {
+            let store = agent_ui::terminal_restore_store::TerminalRestoreStore::init(cx);
+            store.update(cx, |store, cx| {
+                store.set(
+                    "a",
+                    agent_ui::terminal_restore_store::TerminalRestoreState {
+                        init_command: Some("claude attach aaaa1111".into()),
+                        open: true,
+                        stale: false,
+                    },
+                    cx,
+                );
+                store.set_badges("a", vec!["bg".into(), "opus".into()], cx);
+                store.set(
+                    "b",
+                    agent_ui::terminal_restore_store::TerminalRestoreState {
+                        init_command: Some("claude attach bbbb2222".into()),
+                        open: false,
+                        stale: false,
+                    },
+                    cx,
+                );
+            });
+            let attention = agent_ui::terminal_attention::TerminalAttention::init(cx);
+            let targets = [("a", "aaaa1111"), ("b", "bbbb2222")]
+                .into_iter()
+                .map(|(i, t)| (i.to_string(), t.to_string()))
+                .collect();
+            // Only session aaaa1111 is alive.
+            attention.update(cx, |attention, cx| {
+                attention.apply(
+                    &targets,
+                    Some(r#"[{"id":"aaaa1111","state":"working"}]"#),
+                    cx,
+                )
+            });
+            annotate_agent_list(&mut list, cx);
+        });
+        assert_eq!(list[0]["badges"], json!(["bg", "opus"]));
+        assert_eq!(list[0]["open"], json!(true));
+        assert_eq!(list[0]["attached"], json!(true));
+        assert_eq!(list[1]["badges"], json!([]));
+        assert_eq!(list[1]["open"], json!(false));
+        assert_eq!(list[1]["attached"], json!(false));
+        // A thread with no saved state at all.
+        assert_eq!(list[2]["badges"], json!([]));
+        assert_eq!(list[2]["open"], json!(false));
+        assert_eq!(
+            list[2]["attached"],
+            serde_json::Value::Null,
+            "unknown is not false"
+        );
+        // No terminal timestamp is exposed: always null, never invented.
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["last_activity_at"].is_null())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_set_badges_replaces_clears_and_rejects_bad_input(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, _workspace) = project_with_window(cx, "set-badges").await;
+        let id = new_terminal(cx, &app_state, &root, Some("t")).await;
+        cx.run_until_parked();
+
+        let outcome = set_badges(cx, &id, &["bg", "opus", "rc"]).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert_eq!(
+            outcome.stdout.unwrap()["badges"],
+            json!(["bg", "opus", "rc"])
+        );
+        assert_eq!(stored_badges(cx, &id), ["bg", "opus", "rc"]);
+
+        // Replace (not merge), duplicates collapse.
+        let outcome = set_badges(cx, &id, &["fg", "fg"]).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert_eq!(stored_badges(cx, &id), ["fg"]);
+
+        // Invalid input is refused and leaves the badges alone.
+        for bad in [
+            vec!["UPPER"],
+            vec!["has space"],
+            vec!["thirteenchars"],
+            vec!["a", "b", "c", "d", "e"],
+        ] {
+            let outcome = set_badges(cx, &id, &bad).await;
+            assert_ne!(outcome.status, 0, "{bad:?} must be refused");
+            assert_eq!(stored_badges(cx, &id), ["fg"], "{bad:?}");
+        }
+
+        // Unknown id: exit 3, nothing stored for it.
+        let outcome = set_badges(cx, "00000000-0000-0000-0000-000000000000", &["bg"]).await;
+        assert_eq!(outcome.status, EXIT_NO_MATCH, "{outcome:?}");
+        assert!(stored_badges(cx, "00000000-0000-0000-0000-000000000000").is_empty());
+
+        // Empty clears.
+        let outcome = set_badges(cx, &id, &[]).await;
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        assert!(stored_badges(cx, &id).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_new_terminal_with_badges_stores_and_replies_them(cx: &mut TestAppContext) {
+        let (_dirs, app_state, root, _workspace) = project_with_window(cx, "new-badged").await;
+        let sink = CapturingSink::default();
+        let mut async_cx = cx.to_async();
+        handle_new_agent_terminal_badged(
+            root.clone(),
+            None,
+            Some("badged".into()),
+            NoMatchBehavior::Error,
+            None,
+            None,
+            vec!["bg".into(), "sonnet".into(), "rc".into()],
+            app_state.clone(),
+            Timeouts::default(),
+            &sink,
+            &mut async_cx,
+        )
+        .await;
+        let outcome = Outcome::from(&sink);
+        assert_eq!(outcome.status, 0, "{outcome:?}");
+        let reply = outcome.stdout.unwrap();
+        assert_eq!(reply["badges"], json!(["bg", "sonnet", "rc"]));
+        let id = reply["id"].as_str().unwrap().to_string();
+        assert_eq!(stored_badges(cx, &id), ["bg", "sonnet", "rc"]);
+
+        // A plain create carries no badges key and stores none.
+        let plain = new_terminal(cx, &app_state, &root, Some("plain")).await;
+        assert!(stored_badges(cx, &plain).is_empty());
+    }
+
+    /// The app re-validates badges itself (it never trusts the CLI): an invalid
+    /// `--agent-new` is refused before any thread is created.
+    #[gpui::test]
+    async fn test_new_terminal_with_invalid_badges_is_refused_and_creates_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dirs, app_state, root, workspace) = project_with_window(cx, "new-bad-badge").await;
+        let before_ids = stored_ids(cx);
+        let before_count = terminal_count(cx, &workspace);
+        for bad in [
+            vec!["UPPER"],
+            vec!["thirteenchars"],
+            vec!["a", "b", "c", "d", "e"],
+        ] {
+            let sink = CapturingSink::default();
+            let mut async_cx = cx.to_async();
+            handle_new_agent_terminal_badged(
+                root.clone(),
+                None,
+                Some("bad".into()),
+                NoMatchBehavior::Error,
+                None,
+                None,
+                bad.iter().map(|b| b.to_string()).collect(),
+                app_state.clone(),
+                Timeouts::default(),
+                &sink,
+                &mut async_cx,
+            )
+            .await;
+            cx.run_until_parked();
+            let outcome = Outcome::from(&sink);
+            assert_ne!(outcome.status, 0, "{bad:?} must be refused: {outcome:?}");
+            assert_eq!(stored_ids(cx), before_ids, "{bad:?} created a thread entry");
+            assert_eq!(terminal_count(cx, &workspace), before_count, "{bad:?}");
+        }
     }
 
     #[gpui::test]

@@ -29,6 +29,8 @@ pub(crate) struct RowLayout {
     pub depth: usize,
     pub in_section: bool,
     pub has_children: bool,
+    /// Direct children only (child-count chip).
+    pub child_count: usize,
     pub collapsed: bool,
     pub rollup: Rollup,
     /// The row's own project name, when it is shown under a parent of another project (D1).
@@ -272,6 +274,7 @@ pub(crate) fn arrange_deferred(
                     key,
                     depth,
                     has_children,
+                    child_count,
                     collapsed,
                     rollup,
                     foreign_project,
@@ -289,6 +292,7 @@ pub(crate) fn arrange_deferred(
                             depth,
                             in_section,
                             has_children,
+                            child_count,
                             collapsed,
                             rollup,
                             foreign_project: foreign_project.then(|| project_name(&own_group)),
