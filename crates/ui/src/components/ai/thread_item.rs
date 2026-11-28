@@ -251,6 +251,22 @@ impl ThreadItem {
     }
 }
 
+/// Fade at the right edge of the title area: used when a trailing row exists,
+/// so the fade never paints over the trailing chips.
+fn title_edge_fade(is_truncated: bool, opaque_window: bool, has_trailing: bool) -> bool {
+    is_truncated && opaque_window && has_trailing
+}
+
+/// Fade at the right edge of the whole row: only without a trailing row.
+fn row_edge_fade(is_truncated: bool, opaque_window: bool, has_trailing: bool) -> bool {
+    is_truncated && opaque_window && !has_trailing
+}
+
+/// Fade behind the hover action slot: skipped when a trailing row sits before it.
+fn hover_fade(opaque_window: bool, has_trailing: bool) -> bool {
+    opaque_window && !has_trailing
+}
+
 impl RenderOnce for ThreadItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = cx.theme().colors();
@@ -277,6 +293,16 @@ impl RenderOnce for ThreadItem {
             .right(px(-10.0))
             .gradient_stop(0.7)
             .group_name("thread-item");
+
+        // With a trailing row (CPZed badges, status glyph) the fade must sit at
+        // the right edge of the title area, not of the whole row, otherwise it
+        // paints over the trailing chips and clips them.
+        let has_trailing = self.title_trailing.is_some();
+        let mut gradient_overlay = Some(gradient_overlay);
+        let content_gradient = title_edge_fade(self.is_truncated, opaque_window, has_trailing)
+            .then(|| gradient_overlay.take())
+            .flatten()
+            .map(|gradient| gradient.right(px(0.0)));
 
         let separator_color = Color::Custom(color.text_muted.opacity(0.4));
         let dot_separator = || {
@@ -458,24 +484,29 @@ impl RenderOnce for ThreadItem {
                     .child(
                         h_flex()
                             .id("content")
+                            .relative()
                             .min_w_0()
                             .flex_1()
                             .gap_1p5()
                             .child(icon)
-                            .child(title_label),
+                            .child(title_label)
+                            .children(content_gradient),
                     )
                     .when_some(self.title_trailing, |this, trailing| {
                         this.child(h_flex().flex_none().gap_1().child(trailing))
                     })
-                    .when(self.is_truncated && opaque_window, |this| {
-                        this.child(gradient_overlay)
-                    })
+                    .when(
+                        row_edge_fade(self.is_truncated, opaque_window, has_trailing),
+                        |this| this.children(gradient_overlay),
+                    )
                     .when(self.hovered, |this| {
                         this.when_some(self.action_slot, |this, slot| {
                             this.child(
                                 h_flex()
                                     .relative()
-                                    .when(opaque_window, |this| {
+                                    // The slot sits after the trailing row, so its fade
+                                    // would wash the chips out; skip it then.
+                                    .when(hover_fade(opaque_window, has_trailing), |this| {
                                         this.child(
                                             GradientFade::new(base_bg, hover_bg, active_bg)
                                                 .width(px(120.0))
@@ -999,6 +1030,42 @@ impl Component for ThreadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fades_never_cover_a_trailing_row() {
+        for is_truncated in [false, true] {
+            for opaque in [false, true] {
+                // With a trailing row: no row-wide fade, no hover fade; the
+                // title-edge fade only when truncated and opaque.
+                assert!(!row_edge_fade(is_truncated, opaque, true));
+                assert!(!hover_fade(opaque, true));
+                assert_eq!(
+                    title_edge_fade(is_truncated, opaque, true),
+                    is_truncated && opaque
+                );
+                // Without one: the original behavior, and never two fades.
+                assert!(!title_edge_fade(is_truncated, opaque, false));
+                assert_eq!(
+                    row_edge_fade(is_truncated, opaque, false),
+                    is_truncated && opaque
+                );
+                assert_eq!(hover_fade(opaque, false), opaque);
+            }
+        }
+    }
+
+    #[test]
+    fn exactly_one_title_fade_when_truncated_and_opaque() {
+        for has_trailing in [false, true] {
+            assert!(
+                title_edge_fade(true, true, has_trailing) ^ row_edge_fade(true, true, has_trailing)
+            );
+            // Not truncated (caller-set, e.g. rename editor): no fade at all.
+            assert!(!title_edge_fade(false, true, has_trailing));
+            assert!(!row_edge_fade(false, true, has_trailing));
+        }
+    }
+
     use gpui::{Background, Modifiers, TestAppContext, VisualTestContext, point};
 
     #[gpui::test]

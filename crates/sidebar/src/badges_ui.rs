@@ -438,4 +438,22 @@ mod tests {
         assert!(row(&[], 0, 0, None).parts().is_empty());
         assert_eq!(row(&[], 0, 3, None).parts(), [Part::Pending(3)]);
     }
+
+    #[test]
+    fn worst_case_trailing_row_is_bounded_and_keeps_every_part() {
+        // The title area truncates before the trailing row (the row is
+        // `flex_none` and the fades never cover it), so the widest row must
+        // stay bounded: 4 chips + child count + pending + glyph.
+        let badges: Vec<String> = (0..9).map(|i| format!("chip{i}-12chars")).collect();
+        let parts = row(&badges, 3, 2, Some("✳")).parts();
+        assert_eq!(parts.len(), 7);
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| matches!(part, Part::Chip(_)))
+                .count(),
+            4
+        );
+        assert!(matches!(parts.last(), Some(Part::Glyph(_))));
+    }
 }

@@ -333,6 +333,16 @@ pub(crate) fn depth_badge(layout: &RowLayout) -> Option<usize> {
     (layout.depth > MAX_INDENT_DEPTH).then_some(layout.depth)
 }
 
+/// Rollup text beside a row: running/waiting only. The child count is already
+/// the chip in the row's trailing area, so no "+N" here.
+fn row_rollup_text(rollup: &Rollup, collapsed: bool) -> String {
+    if collapsed {
+        rollup_label(rollup, false)
+    } else {
+        String::new()
+    }
+}
+
 fn rollup_label(rollup: &Rollup, include_count: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     if include_count {
@@ -562,11 +572,7 @@ impl Sidebar {
             div().w(px(INDENT_STEP + 4.)).into_any_element()
         };
 
-        let rollup_text = if collapsed {
-            rollup_label(&layout.rollup, true)
-        } else {
-            String::new()
-        };
+        let rollup_text = row_rollup_text(&layout.rollup, collapsed);
 
         h_flex()
             .w_full()
@@ -1179,5 +1185,42 @@ impl Sidebar {
                     })
                     .ok();
             })
+    }
+}
+
+#[cfg(test)]
+mod rollup_text_tests {
+    use super::*;
+
+    fn rollup() -> Rollup {
+        Rollup {
+            running: 2,
+            waiting: 1,
+            notified: false,
+            count: 5,
+        }
+    }
+
+    #[test]
+    fn collapsed_row_text_has_no_plus_count() {
+        let text = row_rollup_text(&rollup(), true);
+        assert!(!text.contains("+5") && !text.contains('+'), "{text}");
+        assert_eq!(text, "2 running · 1 waiting");
+        assert_eq!(
+            row_rollup_text(
+                &Rollup {
+                    count: 5,
+                    ..Rollup::default()
+                },
+                true
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn expanded_row_has_no_rollup_text_and_sections_keep_the_count() {
+        assert_eq!(row_rollup_text(&rollup(), false), "");
+        assert!(rollup_label(&rollup(), true).starts_with("+5"));
     }
 }
